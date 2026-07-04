@@ -1,6 +1,7 @@
 const terminalEl = document.getElementById('terminal');
 const form = document.getElementById('commandForm');
 const input = document.getElementById('commandInput');
+const smartInputToggle = document.getElementById('smartInputToggle');
 const statusCard = document.getElementById('statusCard');
 const statusText = document.getElementById('statusText');
 const sessionText = document.getElementById('sessionText');
@@ -62,8 +63,18 @@ let connectionSerial = 0;
 let intentionalDetach = false;
 let refreshTimer = null;
 let blockFilter = '';
+let smartInputEnabled = localStorage.getItem('warpish_smart_input') !== 'off';
+let commandHistory = [];
+let commandHistoryIndex = 0;
 let bidiReaderEnabled = localStorage.getItem('warpish_bidi_reader') !== 'off';
 let bidiReaderUpdatePending = false;
+
+try {
+  commandHistory = JSON.parse(localStorage.getItem('warpish_command_history') || '[]').filter(Boolean);
+} catch {
+  commandHistory = [];
+}
+commandHistoryIndex = commandHistory.length;
 
 const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
@@ -136,6 +147,192 @@ function applyBidiMode() {
   if (bidiToggleButton) bidiToggleButton.textContent = `Bidi reader: ${bidiReaderEnabled ? 'on' : 'off'}`;
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
   if (bidiReaderEnabled) scheduleBidiReaderUpdate();
+}
+
+function applySmartInputMode() {
+  document.body.classList.toggle('smart-input-mode', smartInputEnabled);
+  if (smartInputToggle) smartInputToggle.textContent = `Smart input: ${smartInputEnabled ? 'on' : 'off'}`;
+  if (smartInputEnabled) focusPreferredInput();
+}
+
+function focusPreferredInput({ select = false } = {}) {
+  if (smartInputEnabled) {
+    input.focus();
+    if (select) input.select();
+    return;
+  }
+  term.focus();
+}
+
+function saveCommandHistory() {
+  localStorage.setItem('warpish_command_history', JSON.stringify(commandHistory.slice(-200)));
+}
+
+function rememberCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed) return;
+  commandHistory = commandHistory.filter((item) => item !== trimmed);
+  commandHistory.push(trimmed);
+  commandHistory = commandHistory.slice(-200);
+  commandHistoryIndex = commandHistory.length;
+  saveCommandHistory();
+}
+
+function setInputValueAtCursor(text) {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  input.value = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
+  const cursor = start + text.length;
+  input.setSelectionRange(cursor, cursor);
+}
+
+function deleteInputBackward() {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? input.value.length;
+  if (start !== end) {
+    input.value = `${input.value.slice(0, start)}${input.value.slice(end)}`;
+    input.setSelectionRange(start, start);
+    return true;
+  }
+  if (start <= 0) return false;
+  const chars = Array.from(input.value);
+  const before = Array.from(input.value.slice(0, start));
+  before.pop();
+  const nextValue = `${before.join('')}${input.value.slice(start)}`;
+  input.value = nextValue;
+  const cursor = before.join('').length;
+  input.setSelectionRange(cursor, cursor);
+  return chars.length !== Array.from(nextValue).length;
+}
+
+function deleteInputWordBackward() {
+  const end = input.selectionEnd ?? input.value.length;
+  let start = input.selectionStart ?? end;
+  if (start !== end) {
+    input.value = `${input.value.slice(0, start)}${input.value.slice(end)}`;
+    input.setSelectionRange(start, start);
+    return true;
+  }
+  start = input.value.slice(0, end).replace(/\s+$/, '').replace(/\S+$/, '').length;
+  input.value = `${input.value.slice(0, start)}${input.value.slice(end)}`;
+  input.setSelectionRange(start, start);
+  return true;
+}
+
+function isPrintableTerminalData(data) {
+  return Boolean(data) && !/[\x00-\x1f\x7f\x80-\x9f]/u.test(data);
+}
+
+function submitCommand(command) {
+  const trimmed = command.trim();
+  if (!trimmed) return;
+  rememberCommand(trimmed);
+  sendRaw(`${trimmed}\r`);
+  input.value = '';
+  focusPreferredInput();
+  setTimeout(() => {
+    refreshSessions().catch(console.error);
+    loadBlocks().catch(console.error);
+  }, 1200);
+}
+
+function handleTerminalInput(data) {
+  if (!smartInputEnabled) {
+    sendRaw(data);
+    return;
+  }
+
+  if (data === '\r') {
+    if (input.value.trim()) submitCommand(input.value);
+    else sendRaw(data);
+    return;
+  }
+
+  if (data === '\x7f') {
+    if (!deleteInputBackward()) sendRaw(data);
+    focusPreferredInput();
+    return;
+  }
+
+  if (data === '\x15') {
+    if (input.value) input.value = '';
+    else sendRaw(data);
+    focusPreferredInput();
+    return;
+  }
+
+  if (data === '\x17') {
+    if (input.value) deleteInputWordBackward();
+    else sendRaw(data);
+    focusPreferredInput();
+    return;
+  }
+
+  const pasted = unwrapBracketedPaste(data);
+  if (pasted !== null) {
+    focusPreferredInput();
+    pasteIntoInput(pasted);
+    return;
+  }
+
+  if (isPrintableTerminalData(data)) {
+    if (data === '\t') {
+      sendRaw(data);
+      return;
+    }
+
+    focusPreferredInput();
+    setInputValueAtCursor(data);
+    return;
+  }
+
+  sendRaw(data);
+}
+
+function navigateHistory(offset) {
+  if (!smartInputEnabled || !commandHistory.length) return;
+  const target = commandHistoryIndex + offset;
+
+  if (offset < 0 && commandHistoryIndex > 0) {
+    commandHistoryIndex = target;
+  } else if (offset > 0 && commandHistoryIndex < commandHistory.length) {
+    commandHistoryIndex = target;
+  } else {
+    return;
+  }
+
+  if (commandHistoryIndex < 0) commandHistoryIndex = 0;
+  if (commandHistoryIndex > commandHistory.length) commandHistoryIndex = commandHistory.length;
+
+  const value = commandHistory[commandHistoryIndex] ?? '';
+  input.value = value;
+  const pos = value.length;
+  input.setSelectionRange(pos, pos);
+  focusPreferredInput();
+}
+
+function pasteIntoInput(raw) {
+  if (!smartInputEnabled) {
+    sendRaw(raw);
+    return;
+  }
+
+  const multiline = raw.includes('\r') || raw.includes('\n');
+  const normalized = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  if (multiline) {
+    const singleLine = normalized.replace(/\n+/g, ' ; ');
+    setInputValueAtCursor(singleLine);
+    return;
+  }
+
+  setInputValueAtCursor(normalized);
+}
+function unwrapBracketedPaste(data) {
+  const prefix = '\x1b[200~';
+  const suffix = '\x1b[201~';
+  if (!data.startsWith(prefix) || !data.endsWith(suffix)) return null;
+  return data.slice(prefix.length, -suffix.length);
 }
 
 function getCookie(name) {
@@ -334,7 +531,7 @@ function renderBlocks() {
     rerun.disabled = !block.command || !activeSession()?.alive;
     rerun.addEventListener('click', () => {
       sendRaw(`${block.command}\r`);
-      term.focus();
+      focusPreferredInput();
     });
     const copyCommand = document.createElement('button');
     copyCommand.textContent = 'Copy cmd';
@@ -426,7 +623,7 @@ function connectToSession(sessionId) {
     setStatus('ok', 'connected', `${session.title} • tmux resumable`);
     const { cols, rows } = currentDims();
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-    term.focus();
+    focusPreferredInput();
   });
 
   ws.addEventListener('message', (event) => {
@@ -491,7 +688,7 @@ function sendRaw(data) {
   ws.send(JSON.stringify({ type: 'input', data }));
 }
 
-term.onData((data) => sendRaw(data));
+term.onData((data) => handleTerminalInput(data));
 term.onResize(({ cols, rows }) => {
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
@@ -508,26 +705,11 @@ resizeObserver.observe(terminalEl);
 
 form.addEventListener('submit', (event) => {
   event.preventDefault();
-  const command = input.value.trim();
-  if (!command) return;
-  sendRaw(`${command}\r`);
-  input.value = '';
-  term.focus();
-  setTimeout(() => {
-    refreshSessions().catch(console.error);
-    loadBlocks().catch(console.error);
-  }, 1200);
+  submitCommand(input.value);
 });
 
 document.querySelectorAll('[data-send]').forEach((button) => {
-  button.addEventListener('click', () => {
-    sendRaw(`${button.dataset.send}\r`);
-    term.focus();
-    setTimeout(() => {
-      refreshSessions().catch(console.error);
-      loadBlocks().catch(console.error);
-    }, 1200);
-  });
+  button.addEventListener('click', () => submitCommand(button.dataset.send));
 });
 
 newSessionButton.addEventListener('click', async () => {
@@ -572,6 +754,50 @@ bidiToggleButton.addEventListener('click', () => {
   applyBidiMode();
 });
 
+smartInputToggle && smartInputToggle.addEventListener('click', () => {
+  smartInputEnabled = !smartInputEnabled;
+  localStorage.setItem('warpish_smart_input', smartInputEnabled ? 'on' : 'off');
+  commandHistoryIndex = commandHistory.length;
+  applySmartInputMode();
+});
+
+window.addEventListener('keydown', (event) => {
+  if (!smartInputEnabled) return;
+  if (event.target === input) {
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      navigateHistory(-1);
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      navigateHistory(1);
+      return;
+    }
+    if (event.key === 'Escape') {
+      input.value = '';
+      commandHistoryIndex = commandHistory.length;
+      focusPreferredInput();
+      return;
+    }
+    return;
+  }
+
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    focusPreferredInput();
+    navigateHistory(-1);
+    return;
+  }
+
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    focusPreferredInput();
+    navigateHistory(1);
+    return;
+  }
+});
+
 detachSessionButton.addEventListener('click', () => {
   disconnectCurrent({ quiet: true });
   setStatus('warn', 'detached', 'click sidebar session to continue');
@@ -595,12 +821,12 @@ killSessionButton.addEventListener('click', async () => {
 window.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
     event.preventDefault();
-    input.focus();
-    input.select();
+    focusPreferredInput({ select: true });
   }
 });
 
 applyBidiMode();
+applySmartInputMode();
 
 refreshSessions({ createIfEmpty: true }).catch((error) => {
   setStatus('bad', 'startup failed', error.message);

@@ -52,7 +52,10 @@
         <section class="composer-card">
           <div class="composer-head">
             <span>Command composer</span>
-            <small>⌘K quick line → bidi-safe input for Persian + English</small>
+            <div class="composer-tools">
+              <small>Type anywhere → bidi-safe command line</small>
+              <button id="smartInputToggle" type="button" class="smart-input-toggle" title="When on, printable terminal typing goes to the bidi-safe composer first.">Smart input: on</button>
+            </div>
           </div>
           <form id="commandForm" class="composer">
             <input id="commandInput" autocomplete="off" spellcheck="false" dir="auto" placeholder="Type a command, e.g. echo 'سلام Mostafa'" />

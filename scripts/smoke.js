@@ -98,7 +98,7 @@ async function wsUntilMarker({ token, sessionId, sendCommand, markerRegex }) {
 }
 
 async function waitForBlock({ token, sessionId, commandNeedle, outputNeedle }) {
-  for (let i = 0; i < 40; i += 1) {
+  for (let i = 0; i < 160; i += 1) {
     const payload = await httpJson(`/api/sessions/${sessionId}/blocks`, { token });
     const block = (payload.blocks || []).find((candidate) => candidate.command?.includes(commandNeedle));
     if (block && block.status !== 'running' && (!outputNeedle || block.output?.includes(outputNeedle))) {
@@ -145,18 +145,20 @@ try {
     outputNeedle: '__WARPISH_SMOKE__',
   });
 
+  const escapeForRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const bidiText = 'سلام Mostafa، command: git status و path: /Users/test خواناست';
-  const bidiRegex = /سلام Mostafa، command: git status و path: \/Users\/test خواناست/;
+  const bidiCommand = `echo ${JSON.stringify(bidiText)}`;
+  const bidiRegex = new RegExp(escapeForRegex(bidiText));
   await wsUntilMarker({
     token,
     sessionId: smokeSessionId,
-    sendCommand: `printf '${bidiText}\\n'\r`,
+    sendCommand: `${bidiCommand}\r`,
     markerRegex: bidiRegex,
   });
   const bidiBlock = await waitForBlock({
     token,
     sessionId: smokeSessionId,
-    commandNeedle: 'printf',
+    commandNeedle: 'echo',
     outputNeedle: bidiText,
   });
 

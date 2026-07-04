@@ -210,6 +210,7 @@ function normalizeBlock(block) {
 }
 
 function getBlocks(sessionId) {
+  reconcileEventFile(sessionId);
   const meta = readMetadata();
   const record = meta.sessions?.[sessionId];
   return Array.isArray(record?.blocks) ? record.blocks.map(normalizeBlock).slice().reverse() : [];
@@ -220,6 +221,9 @@ function upsertBlockStart(sessionId, marker) {
   const record = ensureSessionRecord(meta, sessionId);
   const id = marker.id || `${sessionId}-${Date.now()}`;
   let block = record.blocks.find((candidate) => candidate.id === id);
+  if (block && block.status !== 'running' && block.endedAt) {
+    return normalizeBlock(block);
+  }
   const alreadyRunning = block?.status === 'running';
   if (!block) {
     block = { id, output: '' };
@@ -285,6 +289,22 @@ function handleBlockMarker(sessionId, payload) {
 function eventFileForSession(sessionId) {
   const meta = readMetadata();
   return meta.sessions?.[sessionId]?.eventFile || path.join(EVENTS_DIR, `${sessionId}.events`);
+}
+
+function reconcileEventFile(sessionId, onBlockEvent = () => {}) {
+  const file = eventFileForSession(sessionId);
+  let text = '';
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return;
+  }
+
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    const event = handleBlockMarker(sessionId, line.trim());
+    if (event?.block) onBlockEvent(event);
+  }
 }
 
 function createEventReader(sessionId, onBlockEvent) {

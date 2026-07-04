@@ -250,6 +250,25 @@ button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
   margin: 0 2px 10px;
 }
 .composer-head span { color: var(--text); font-weight: 700; }
+.composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.smart-input-toggle {
+  border-color: rgba(34, 211, 238, 0.3);
+  font-size: 12px;
+  padding: 6px 10px;
+}
+body.smart-input-mode .smart-input-toggle {
+  background: linear-gradient(135deg, rgba(139, 92, 246, 0.9), rgba(34, 211, 238, 0.75));
+  color: #fdfcff;
+  border-color: transparent;
+}
+body.smart-input-mode #commandInput {
+  border-color: rgba(139, 92, 246, 0.75);
+  box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.15);
+}
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

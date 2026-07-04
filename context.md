@@ -19,7 +19,9 @@ Implemented capabilities:
   - recent output preview,
   - click-to-reattach behavior.
 - Command composer and quick actions that send commands to the selected live session.
+- Command composer has Smart Input mode (toggle button) that routes printable terminal keystrokes into the composer first.
 - Bidi-safe Persian/English command input using `dir="auto"` and `unicode-bidi: plaintext`.
+- Smart input keeps command history (localStorage), supports Ctrl/Cmd+K focus, and ArrowUp/ArrowDown history recall.
 - Live Persian/English reader panel that mirrors recent terminal lines in normal HTML with per-line RTL/LTR direction detection.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
@@ -95,6 +97,8 @@ This avoids block output being polluted by unrelated redraws or repeated termina
 Terminal grids and tmux redraws are not a reliable place to solve every Unicode bidirectional edge case. The app now uses a layered approach:
 
 - the command composer is a normal browser input with `dir="auto"` and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable while typing;
+- Smart Input mode is default-on and routes printable terminal typing into that composer first, with a visible toggle for direct xterm workflows;
+- command history is persisted in `localStorage` and can be recalled with ArrowUp/ArrowDown;
 - terminal rows get a CSS bidi hint when Bidi mode is enabled;
 - a live Bidi reader mirrors recent xterm buffer lines into normal HTML, detects each line's first strong RTL/LTR character, and sets per-line direction;
 - command blocks and sidebar previews also use bidi plaintext styling and direction detection.
@@ -128,6 +132,7 @@ Browser QA also verified:
 - session sidebar renders,
 - new session creation works,
 - command composer executes in the real shell,
+- Smart Input submit, focus retention, and ArrowUp history recall were verified in browser DOM evidence,
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
@@ -138,6 +143,7 @@ Browser QA also verified:
 - This is not a full Warp clone; it implements the core local workflow primitives first.
 - Command-block output is a preview, not a perfect structured transcript for every possible full-screen/TUI command.
 - The Bidi reader solves readability for normal text output and command input; full-screen TUIs can still bypass this because they paint their own terminal grid.
+- Smart Input improves normal command typing, but direct raw xterm typing should be used for interactive TUIs or unusual key sequences.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.
 - No GitHub remote is configured yet unless one is added later.
