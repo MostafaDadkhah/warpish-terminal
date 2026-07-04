@@ -60,6 +60,30 @@ function httpJson(pathname, { method = 'GET', token, body } = {}) {
   });
 }
 
+function httpText(pathname, { token } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: pathname,
+      method: 'GET',
+      headers: token ? { 'x-warpish-token': token } : {},
+    }, (res) => {
+      let text = '';
+      res.on('data', (chunk) => { text += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`HTTP ${res.statusCode}: ${text}`));
+          return;
+        }
+        resolve(text);
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 async function wsUntilMarker({ token, sessionId, sendCommand, markerRegex }) {
   const wsUrl = new URL('/ws', tokenUrl);
   wsUrl.protocol = 'ws:';
@@ -115,6 +139,16 @@ try {
   const parsed = new URL(tokenUrl);
   const token = parsed.searchParams.get('token');
   const health = await httpJson('/healthz');
+  const indexHtml = await httpText('/', { token });
+  const appJs = await httpText('/app.js', { token });
+  const terminalFirstUiVerified = indexHtml.includes('passthroughToggle')
+    && indexHtml.includes('inputModeHint')
+    && appJs.includes('terminal-first-mode')
+    && appJs.includes('Raw passthrough')
+    && !appJs.includes('isAlternateBufferActive');
+  if (!terminalFirstUiVerified) {
+    throw new Error('terminal-first/raw-passthrough UI source verification failed');
+  }
   const created = await httpJson('/api/sessions', {
     method: 'POST',
     token,
@@ -171,6 +205,7 @@ try {
     createdSession: smokeSessionId,
     resumeVerified: Boolean(listedSession?.alive),
     sidebarPreviewHasMarker: Boolean(listedSession?.preview?.includes('__WARPISH_SMOKE__')),
+    terminalFirstUiVerified,
     blockVerified: block.status === 'success' && block.output.includes('__WARPISH_SMOKE__'),
     blockCommand: block.command,
     blockStatus: block.status,

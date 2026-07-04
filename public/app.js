@@ -2,6 +2,8 @@ const terminalEl = document.getElementById('terminal');
 const form = document.getElementById('commandForm');
 const input = document.getElementById('commandInput');
 const smartInputToggle = document.getElementById('smartInputToggle');
+const passthroughToggle = document.getElementById('passthroughToggle');
+const inputModeHint = document.getElementById('inputModeHint');
 const statusCard = document.getElementById('statusCard');
 const statusText = document.getElementById('statusText');
 const sessionText = document.getElementById('sessionText');
@@ -64,6 +66,8 @@ let intentionalDetach = false;
 let refreshTimer = null;
 let blockFilter = '';
 let smartInputEnabled = localStorage.getItem('warpish_smart_input') !== 'off';
+let manualRawInputEnabled = localStorage.getItem('warpish_raw_input') === 'on';
+let autoRawInputReason = '';
 let commandHistory = [];
 let commandHistoryIndex = 0;
 let bidiReaderEnabled = localStorage.getItem('warpish_bidi_reader') !== 'off';
@@ -149,19 +153,58 @@ function applyBidiMode() {
   if (bidiReaderEnabled) scheduleBidiReaderUpdate();
 }
 
-function applySmartInputMode() {
-  document.body.classList.toggle('smart-input-mode', smartInputEnabled);
-  if (smartInputToggle) smartInputToggle.textContent = `Smart input: ${smartInputEnabled ? 'on' : 'off'}`;
-  if (smartInputEnabled) focusPreferredInput();
+function isRawInputActive() {
+  return !smartInputEnabled || manualRawInputEnabled || Boolean(autoRawInputReason);
 }
 
-function focusPreferredInput({ select = false } = {}) {
-  if (smartInputEnabled) {
-    input.focus();
-    if (select) input.select();
+function inputModeDescription() {
+  if (!smartInputEnabled) return 'Raw terminal input — Smart Input is off.';
+  if (manualRawInputEnabled) return 'Raw passthrough is on — keys go directly to the shell/TUI.';
+  if (autoRawInputReason) return `Auto raw passthrough — ${autoRawInputReason}.`;
+  return 'Terminal-first Smart Input — focus stays in xterm, printable keys stage in the bidi-safe composer.';
+}
+
+function applySmartInputMode() {
+  const rawActive = isRawInputActive();
+  document.body.classList.toggle('smart-input-mode', smartInputEnabled);
+  document.body.classList.toggle('terminal-first-mode', smartInputEnabled && !rawActive);
+  document.body.classList.toggle('raw-input-mode', rawActive);
+  if (smartInputToggle) smartInputToggle.textContent = `Smart input: ${smartInputEnabled ? 'on' : 'off'}`;
+  if (passthroughToggle) {
+    passthroughToggle.textContent = manualRawInputEnabled
+      ? 'Raw passthrough: on'
+      : autoRawInputReason
+        ? 'Raw passthrough: auto'
+        : 'Raw passthrough: off';
+  }
+  if (inputModeHint) inputModeHint.textContent = inputModeDescription();
+  term.focus();
+}
+
+function focusCommandInput({ select = false } = {}) {
+  input.focus();
+  if (select) input.select();
+}
+
+function focusPreferredInput({ select = false, forceInput = false } = {}) {
+  if (forceInput || select) {
+    focusCommandInput({ select });
     return;
   }
   term.focus();
+}
+
+function setAutoRawInput(reason = '') {
+  autoRawInputReason = reason;
+  applySmartInputMode();
+}
+
+function clearAutoRawInput(reason = '') {
+  if (!autoRawInputReason) return;
+  if (!reason || autoRawInputReason.includes(reason) || reason === 'block-end') {
+    autoRawInputReason = '';
+    applySmartInputMode();
+  }
 }
 
 function saveCommandHistory() {
@@ -223,12 +266,33 @@ function isPrintableTerminalData(data) {
   return Boolean(data) && !/[\x00-\x1f\x7f\x80-\x9f]/u.test(data);
 }
 
+function interactiveCommandName(command) {
+  const normalized = command
+    .trim()
+    .replace(/^(?:command|exec|sudo)\s+/, '')
+    .replace(/^env\s+(?:\S+=\S+\s+)+/, '');
+  return normalized.split(/\s+/)[0] || '';
+}
+
+function shouldAutoRawCommand(command) {
+  const normalized = command
+    .trim()
+    .replace(/^(?:command|exec|sudo)\s+/, '')
+    .replace(/^env\s+(?:\S+=\S+\s+)+/, '');
+  return /^(?:vim?|nvim|nano|emacs|less|more|man|top|htop|btop|ssh|sftp|ftp|python3?|ipython|node|irb|pry|mysql|psql|sqlite3|redis-cli|mongosh)\b/.test(normalized)
+    || /^(?:docker|kubectl)\s+exec\b.*(?:^|\s)-(?:i|t|it|ti)\b/.test(normalized);
+}
+
 function submitCommand(command) {
   const trimmed = command.trim();
   if (!trimmed) return;
   rememberCommand(trimmed);
+  const interactiveName = interactiveCommandName(trimmed);
+  if (shouldAutoRawCommand(trimmed)) setAutoRawInput(`running ${interactiveName || 'interactive command'}`);
+  else clearAutoRawInput();
   sendRaw(`${trimmed}\r`);
   input.value = '';
+  input.setSelectionRange(0, 0);
   focusPreferredInput();
   setTimeout(() => {
     refreshSessions().catch(console.error);
@@ -236,8 +300,19 @@ function submitCommand(command) {
   }, 1200);
 }
 
+function setInputCursor(position) {
+  const next = Math.max(0, Math.min(input.value.length, position));
+  input.setSelectionRange(next, next);
+}
+
+function moveInputCursor(delta) {
+  const current = input.selectionStart ?? input.value.length;
+  setInputCursor(current + delta);
+}
+
 function handleTerminalInput(data) {
-  if (!smartInputEnabled) {
+  applySmartInputMode();
+  if (isRawInputActive()) {
     sendRaw(data);
     return;
   }
@@ -245,6 +320,52 @@ function handleTerminalInput(data) {
   if (data === '\r') {
     if (input.value.trim()) submitCommand(input.value);
     else sendRaw(data);
+    return;
+  }
+
+  if (data === '\x1b') {
+    if (input.value) {
+      input.value = '';
+      input.setSelectionRange(0, 0);
+      commandHistoryIndex = commandHistory.length;
+      focusPreferredInput();
+    } else {
+      sendRaw(data);
+    }
+    return;
+  }
+
+  if (data === '\x1b[A') {
+    navigateHistory(-1);
+    return;
+  }
+
+  if (data === '\x1b[B') {
+    navigateHistory(1);
+    return;
+  }
+
+  if (data === '\x1b[D') {
+    moveInputCursor(-1);
+    focusPreferredInput();
+    return;
+  }
+
+  if (data === '\x1b[C') {
+    moveInputCursor(1);
+    focusPreferredInput();
+    return;
+  }
+
+  if (data === '\x01') {
+    setInputCursor(0);
+    focusPreferredInput();
+    return;
+  }
+
+  if (data === '\x05') {
+    setInputCursor(input.value.length);
+    focusPreferredInput();
     return;
   }
 
@@ -257,6 +378,7 @@ function handleTerminalInput(data) {
   if (data === '\x15') {
     if (input.value) input.value = '';
     else sendRaw(data);
+    input.setSelectionRange(0, 0);
     focusPreferredInput();
     return;
   }
@@ -268,21 +390,28 @@ function handleTerminalInput(data) {
     return;
   }
 
+  if (data === '\t') {
+    if (input.value) {
+      setAutoRawInput('shell completion / line editing');
+      sendRaw(`${input.value}\t`);
+      input.value = '';
+      input.setSelectionRange(0, 0);
+    } else {
+      sendRaw(data);
+    }
+    return;
+  }
+
   const pasted = unwrapBracketedPaste(data);
   if (pasted !== null) {
-    focusPreferredInput();
     pasteIntoInput(pasted);
+    focusPreferredInput();
     return;
   }
 
   if (isPrintableTerminalData(data)) {
-    if (data === '\t') {
-      sendRaw(data);
-      return;
-    }
-
-    focusPreferredInput();
     setInputValueAtCursor(data);
+    focusPreferredInput();
     return;
   }
 
@@ -290,7 +419,7 @@ function handleTerminalInput(data) {
 }
 
 function navigateHistory(offset) {
-  if (!smartInputEnabled || !commandHistory.length) return;
+  if (!smartInputEnabled || isRawInputActive() || !commandHistory.length) return;
   const target = commandHistoryIndex + offset;
 
   if (offset < 0 && commandHistoryIndex > 0) {
@@ -651,6 +780,7 @@ function connectToSession(sessionId) {
       if (!intentionalDetach) setStatus('bad', 'detached', 'session still exists in sidebar');
     } else if (['block-start', 'block-update', 'block-end'].includes(msg.type)) {
       upsertBlock(msg.block);
+      if (msg.type === 'block-end') clearAutoRawInput('block-end');
     }
   });
 
@@ -702,6 +832,7 @@ const resizeObserver = new ResizeObserver(() => {
   }
 });
 resizeObserver.observe(terminalEl);
+terminalEl.addEventListener('pointerdown', () => setTimeout(() => term.focus(), 0));
 
 form.addEventListener('submit', (event) => {
   event.preventDefault();
@@ -758,11 +889,20 @@ smartInputToggle && smartInputToggle.addEventListener('click', () => {
   smartInputEnabled = !smartInputEnabled;
   localStorage.setItem('warpish_smart_input', smartInputEnabled ? 'on' : 'off');
   commandHistoryIndex = commandHistory.length;
+  if (smartInputEnabled) manualRawInputEnabled = false;
+  localStorage.setItem('warpish_raw_input', manualRawInputEnabled ? 'on' : 'off');
+  applySmartInputMode();
+});
+
+passthroughToggle && passthroughToggle.addEventListener('click', () => {
+  manualRawInputEnabled = !manualRawInputEnabled;
+  if (manualRawInputEnabled) autoRawInputReason = '';
+  localStorage.setItem('warpish_raw_input', manualRawInputEnabled ? 'on' : 'off');
   applySmartInputMode();
 });
 
 window.addEventListener('keydown', (event) => {
-  if (!smartInputEnabled) return;
+  if (!smartInputEnabled || isRawInputActive()) return;
   if (event.target === input) {
     if (event.key === 'ArrowUp') {
       event.preventDefault();
@@ -821,9 +961,12 @@ killSessionButton.addEventListener('click', async () => {
 window.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
     event.preventDefault();
-    focusPreferredInput({ select: true });
+    focusPreferredInput({ select: true, forceInput: true });
   }
 });
+
+input.addEventListener('focus', () => document.body.classList.add('composer-focused'));
+input.addEventListener('blur', () => document.body.classList.remove('composer-focused'));
 
 applyBidiMode();
 applySmartInputMode();

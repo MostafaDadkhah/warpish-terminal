@@ -117,7 +117,8 @@ zsh -n scripts/warpish-shell-integration.zsh
 ### Persian/English bidi readability
 
 - The command composer must keep `dir="auto"` and `unicode-bidi: plaintext` so mixed Persian/English input remains readable while typing.
-- Smart Input mode should remain available and default-on; it routes printable terminal typing into the composer and keeps localStorage-backed command history usable for quick recalls.
+- Smart Input mode should remain available and default-on; it keeps xterm focused, routes printable terminal typing into the composer, and keeps localStorage-backed command history usable for quick recalls.
+- Raw passthrough must remain available for direct terminal/TUI workflows; common interactive command names should auto-enable it where feasible, but do not use tmux/xterm alternate-screen state alone as a signal because tmux itself may use alternate screen.
 - Keep the Bidi reader enabled by default; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
 - Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
@@ -173,7 +174,8 @@ Then open the app in Chrome and verify at least:
 - reload/reattach preserves terminal output,
 - command blocks render and rerun works,
 - Bidi reader renders Persian/English mixed text in readable order,
-- Smart Input submit/focus/history behavior works,
+- Smart Input terminal-first submit/focus/history behavior works,
+- raw passthrough toggle and direct terminal mode remain usable,
 - browser console has no JavaScript errors.
 
 For docs-only changes, at minimum verify:

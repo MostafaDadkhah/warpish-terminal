@@ -8,7 +8,7 @@ What it does:
 - Click a live session to continue it; create a new terminal with `+ New terminal`.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
 - Adds Warp-style command blocks for new sessions: command, output, status, exit code, duration, copy, search, and rerun.
-- Adds a Persian/English Bidi reader and Smart Input mode for command typing (smart composer + history + direction-aware layout), so mixed RTL/LTR text stays readable and practical to type.
+- Adds a Persian/English Bidi reader and terminal-first Smart Input mode for command typing (xterm keeps focus, printable keys stage in a bidi-safe composer, history recall, and raw passthrough for TUIs), so mixed RTL/LTR text stays readable and practical to type.
 - Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
 
 Requirements already present on this Mac:
