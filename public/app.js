@@ -12,6 +12,9 @@ const newSessionButton = document.getElementById('newSession');
 const refreshSessionsButton = document.getElementById('refreshSessions');
 const renameSessionButton = document.getElementById('renameSession');
 const copySelection = document.getElementById('copySelection');
+const bidiToggleButton = document.getElementById('bidiToggle');
+const bidiReader = document.getElementById('bidiReader');
+const bidiReaderLines = document.getElementById('bidiReaderLines');
 const detachSessionButton = document.getElementById('detachSession');
 const killSessionButton = document.getElementById('killSession');
 const blockList = document.getElementById('blockList');
@@ -59,6 +62,81 @@ let connectionSerial = 0;
 let intentionalDetach = false;
 let refreshTimer = null;
 let blockFilter = '';
+let bidiReaderEnabled = localStorage.getItem('warpish_bidi_reader') !== 'off';
+let bidiReaderUpdatePending = false;
+
+const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
+const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
+const BIDI_READER_MAX_LINES = 80;
+
+function bidiDirection(text = '') {
+  const firstStrong = String(text).match(STRONG_CHAR_RE)?.[0] || '';
+  return RTL_CHAR_RE.test(firstStrong) ? 'rtl' : 'ltr';
+}
+
+function applyBidiText(element, text, { className = 'bidi-plain' } = {}) {
+  if (!element) return;
+  element.textContent = text;
+  element.dir = bidiDirection(text);
+  element.classList.add(className);
+}
+
+function getReadableTerminalLines(limit = BIDI_READER_MAX_LINES) {
+  const buffer = term.buffer?.active;
+  if (!buffer) return [];
+  const end = Math.min(buffer.length, buffer.baseY + term.rows);
+  const start = Math.max(0, end - limit * 2);
+  const lines = [];
+
+  for (let i = start; i < end; i += 1) {
+    const line = buffer.getLine(i);
+    if (!line) continue;
+    const text = line.translateToString(true).trimEnd();
+    if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
+    else lines.push(text);
+  }
+
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return lines.slice(-limit);
+}
+
+function renderBidiReader() {
+  if (!bidiReaderLines) return;
+  bidiReaderLines.innerHTML = '';
+  const lines = getReadableTerminalLines();
+  if (!lines.length) {
+    const empty = document.createElement('div');
+    empty.className = 'bidi-line empty-state';
+    empty.textContent = 'Run a command with Persian + English text to see the readable mirror here.';
+    bidiReaderLines.appendChild(empty);
+    return;
+  }
+
+  for (const line of lines) {
+    const row = document.createElement('div');
+    row.className = `bidi-line ${bidiDirection(line)}`;
+    row.dir = bidiDirection(line);
+    row.textContent = line || ' ';
+    bidiReaderLines.appendChild(row);
+  }
+  bidiReaderLines.scrollTop = bidiReaderLines.scrollHeight;
+}
+
+function scheduleBidiReaderUpdate() {
+  if (!bidiReaderEnabled || bidiReaderUpdatePending) return;
+  bidiReaderUpdatePending = true;
+  requestAnimationFrame(() => {
+    bidiReaderUpdatePending = false;
+    renderBidiReader();
+  });
+}
+
+function applyBidiMode() {
+  document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
+  if (bidiToggleButton) bidiToggleButton.textContent = `Bidi reader: ${bidiReaderEnabled ? 'on' : 'off'}`;
+  if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
+  if (bidiReaderEnabled) scheduleBidiReaderUpdate();
+}
 
 function getCookie(name) {
   return document.cookie
@@ -174,7 +252,8 @@ function renderSessions() {
 
     const preview = document.createElement('div');
     preview.className = 'session-preview';
-    preview.textContent = session.preview || (session.alive ? 'fresh terminal — no output yet' : 'no saved preview');
+    const previewText = session.preview || (session.alive ? 'fresh terminal — no output yet' : 'no saved preview');
+    applyBidiText(preview, previewText);
 
     button.append(title, meta, preview);
     button.addEventListener('click', () => connectToSession(session.id));
@@ -227,7 +306,7 @@ function renderBlocks() {
 
     const command = document.createElement('div');
     command.className = 'block-command';
-    command.textContent = `$ ${block.command || '(unknown command)'}`;
+    applyBidiText(command, `$ ${block.command || '(unknown command)'}`);
 
     const meta = document.createElement('div');
     meta.className = 'block-meta';
@@ -245,7 +324,8 @@ function renderBlocks() {
 
     const output = document.createElement('pre');
     output.className = 'block-output';
-    output.textContent = (block.output || '').trim() || (block.status === 'running' ? 'Waiting for output…' : 'No output.');
+    const outputText = (block.output || '').trim() || (block.status === 'running' ? 'Waiting for output…' : 'No output.');
+    applyBidiText(output, outputText);
 
     const actions = document.createElement('div');
     actions.className = 'block-actions';
@@ -335,6 +415,7 @@ function connectToSession(sessionId) {
   renderBlocks();
   loadBlocks(sessionId).catch(console.error);
   term.reset();
+  scheduleBidiReaderUpdate();
   setStatus('warn', 'attaching…', session.title);
 
   ws = new WebSocket(socketUrl(sessionId));
@@ -351,7 +432,7 @@ function connectToSession(sessionId) {
   ws.addEventListener('message', (event) => {
     if (serial !== connectionSerial) return;
     if (event.data instanceof ArrayBuffer) {
-      term.write(new Uint8Array(event.data));
+      term.write(new Uint8Array(event.data), scheduleBidiReaderUpdate);
       return;
     }
 
@@ -359,7 +440,7 @@ function connectToSession(sessionId) {
     try {
       msg = JSON.parse(event.data);
     } catch {
-      term.write(event.data);
+      term.write(event.data, scheduleBidiReaderUpdate);
       return;
     }
 
@@ -368,6 +449,7 @@ function connectToSession(sessionId) {
     } else if (msg.type === 'server-error') {
       setStatus('bad', 'error', msg.message || 'server error');
       term.writeln(`\r\n\x1b[31m${msg.message || 'server error'}\x1b[0m`);
+      scheduleBidiReaderUpdate();
     } else if (msg.type === 'detached') {
       if (!intentionalDetach) setStatus('bad', 'detached', 'session still exists in sidebar');
     } else if (['block-start', 'block-update', 'block-end'].includes(msg.type)) {
@@ -398,6 +480,7 @@ function connectToSession(sessionId) {
 function sendRaw(data) {
   if (!currentSessionId) {
     term.writeln('\r\n\x1b[31mNo session selected. Create or select a terminal first.\x1b[0m');
+    scheduleBidiReaderUpdate();
     return;
   }
   if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -483,6 +566,12 @@ copySelection.addEventListener('click', async () => {
   await navigator.clipboard.writeText(text);
 });
 
+bidiToggleButton.addEventListener('click', () => {
+  bidiReaderEnabled = !bidiReaderEnabled;
+  localStorage.setItem('warpish_bidi_reader', bidiReaderEnabled ? 'on' : 'off');
+  applyBidiMode();
+});
+
 detachSessionButton.addEventListener('click', () => {
   disconnectCurrent({ quiet: true });
   setStatus('warn', 'detached', 'click sidebar session to continue');
@@ -498,6 +587,7 @@ killSessionButton.addEventListener('click', async () => {
   blocks = [];
   renderBlocks();
   term.reset();
+  scheduleBidiReaderUpdate();
   setStatus('warn', 'session killed', 'create or choose another session');
   await refreshSessions({ createIfEmpty: true });
 });
@@ -510,9 +600,12 @@ window.addEventListener('keydown', (event) => {
   }
 });
 
+applyBidiMode();
+
 refreshSessions({ createIfEmpty: true }).catch((error) => {
   setStatus('bad', 'startup failed', error.message);
   term.writeln(`\x1b[31mStartup failed: ${error.message}\x1b[0m`);
+  scheduleBidiReaderUpdate();
 });
 
 refreshTimer = setInterval(() => {

@@ -144,6 +144,22 @@ try {
     commandNeedle: 'echo __WARPISH_SMOKE__',
     outputNeedle: '__WARPISH_SMOKE__',
   });
+
+  const bidiText = 'سلام Mostafa، command: git status و path: /Users/test خواناست';
+  const bidiRegex = /سلام Mostafa، command: git status و path: \/Users\/test خواناست/;
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `printf '${bidiText}\\n'\r`,
+    markerRegex: bidiRegex,
+  });
+  const bidiBlock = await waitForBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: 'printf',
+    outputNeedle: bidiText,
+  });
+
   const listed = await httpJson('/api/sessions', { token });
   const listedSession = listed.sessions.find((session) => session.id === smokeSessionId);
 
@@ -156,6 +172,8 @@ try {
     blockVerified: block.status === 'success' && block.output.includes('__WARPISH_SMOKE__'),
     blockCommand: block.command,
     blockStatus: block.status,
+    bidiBlockVerified: bidiBlock.status === 'success' && bidiBlock.output.includes(bidiText),
+    bidiBlockOutput: bidiBlock.output,
     marker,
   }, null, 2));
 } finally {

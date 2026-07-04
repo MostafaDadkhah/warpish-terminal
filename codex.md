@@ -114,6 +114,14 @@ zsh -n scripts/warpish-shell-integration.zsh
 
 ## Critical behavior to preserve
 
+### Persian/English bidi readability
+
+- The command composer must keep `dir="auto"` and `unicode-bidi: plaintext` so mixed Persian/English input remains readable while typing.
+- Keep the Bidi reader enabled by default; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
+- Preserve bidi styling on sidebar previews, block commands, and block outputs.
+- Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
+- If changing xterm rendering or terminal layout, verify a line like `سلام Mostafa، command: git status و path: /Users/test خواناست` appears in the Bidi reader and command block output with `dir="rtl"` and `unicode-bidi: plaintext`.
+
 ### Sessions
 
 - A browser reload or WebSocket close must detach only the current attach process.
@@ -163,6 +171,7 @@ Then open the app in Chrome and verify at least:
 - composer command runs in the terminal,
 - reload/reattach preserves terminal output,
 - command blocks render and rerun works,
+- Bidi reader renders Persian/English mixed text in readable order,
 - browser console has no JavaScript errors.
 
 For docs-only changes, at minimum verify:
@@ -193,3 +202,4 @@ git diff --cached --stat
 - Shell integration must not modify global user startup files.
 - tmux capture/output boundaries are tricky; full-screen/TUI apps may not produce useful command block previews.
 - Browser screenshot tooling may fail in constrained local environments; use DOM/console/API evidence as fallback.
+- Unicode bidi is visual, not just data correctness: backend output can be correct while terminal rendering is unreadable. Verify the browser reader/styles too.

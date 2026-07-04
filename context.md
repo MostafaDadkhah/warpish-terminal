@@ -19,6 +19,8 @@ Implemented capabilities:
   - recent output preview,
   - click-to-reattach behavior.
 - Command composer and quick actions that send commands to the selected live session.
+- Bidi-safe Persian/English command input using `dir="auto"` and `unicode-bidi: plaintext`.
+- Live Persian/English reader panel that mirrors recent terminal lines in normal HTML with per-line RTL/LTR direction detection.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
   - command text,
@@ -88,11 +90,22 @@ Attached tmux panes can replay/redraw screen content, and raw WebSocket data is 
 
 This avoids block output being polluted by unrelated redraws or repeated terminal history.
 
-### 4. Security defaults are intentionally local
+### 4. Persian/English readability is handled outside the raw terminal grid
+
+Terminal grids and tmux redraws are not a reliable place to solve every Unicode bidirectional edge case. The app now uses a layered approach:
+
+- the command composer is a normal browser input with `dir="auto"` and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable while typing;
+- terminal rows get a CSS bidi hint when Bidi mode is enabled;
+- a live Bidi reader mirrors recent xterm buffer lines into normal HTML, detects each line's first strong RTL/LTR character, and sets per-line direction;
+- command blocks and sidebar previews also use bidi plaintext styling and direction detection.
+
+This is especially important for Hermes/Persian output, where raw terminal ordering can be unreadable when English paths, commands, and Persian prose are mixed.
+
+### 5. Security defaults are intentionally local
 
 The app binds to `127.0.0.1` by default and requires a random local token. Do not expose it publicly as plain HTTP. If remote/mobile access is added later, put it behind an authenticated private network or gateway with stronger auth/TLS/allowlisting.
 
-### 5. Git hygiene
+### 6. Git hygiene
 
 The repository tracks source, docs, scripts, and lockfiles only. It must not track local runtime state, terminal history, generated tokens, logs, or `node_modules`.
 
@@ -118,11 +131,13 @@ Browser QA also verified:
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
+- Bidi reader rendered a mixed Persian/English line with RTL direction and `unicode-bidi: plaintext` while command blocks stored the same text cleanly.
 
 ## Current limitations / future work
 
 - This is not a full Warp clone; it implements the core local workflow primitives first.
 - Command-block output is a preview, not a perfect structured transcript for every possible full-screen/TUI command.
+- The Bidi reader solves readability for normal text output and command input; full-screen TUIs can still bypass this because they paint their own terminal grid.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.
 - No GitHub remote is configured yet unless one is added later.
