@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# runtime/local state
+.auth-token
+.server.pid
+.warpish/
+*.log
+
+# macOS/editor cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# npm/debug output
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# temp/build artifacts
+coverage/
+dist/
+build/
+.tmp/
+tmp/

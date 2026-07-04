@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Warpish Terminal</title>
+    <link rel="stylesheet" href="/vendor/xterm.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-layout">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div>
+            <p class="eyebrow">LOCAL MAC PTY</p>
+            <h1>Warpish</h1>
+          </div>
+          <span class="brand-dot"></span>
+        </div>
+
+        <button id="newSession" class="new-session">+ New terminal</button>
+
+        <div class="sidebar-section-head">
+          <span>Session history</span>
+          <button id="refreshSessions" title="Refresh session list">↻</button>
+        </div>
+
+        <div id="sessionList" class="session-list" aria-label="Terminal sessions"></div>
+
+        <div class="sidebar-footer">
+          <span>Resumable via tmux</span>
+          <span>localhost + token auth</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">CHROME UI • REAL macOS TERMINAL</p>
+            <h2 id="sessionTitle">Terminal</h2>
+            <p id="sessionMeta" class="subtitle">Choose or create a terminal session.</p>
+          </div>
+          <div class="status-card" id="statusCard">
+            <span class="dot" id="statusDot"></span>
+            <div>
+              <strong id="statusText">loading…</strong>
+              <small id="sessionText">tmux session manager</small>
+            </div>
+          </div>
+        </header>
+
+        <section class="composer-card">
+          <div class="composer-head">
+            <span>Command composer</span>
+            <small>⌘K quick line → sends to selected resumable session</small>
+          </div>
+          <form id="commandForm" class="composer">
+            <input id="commandInput" autocomplete="off" spellcheck="false" placeholder="Type a command, e.g. pwd && whoami" />
+            <button type="submit">Run ↵</button>
+          </form>
+          <div class="quick-actions" aria-label="Quick commands">
+            <button data-send="pwd">pwd</button>
+            <button data-send="whoami && hostname">whoami</button>
+            <button data-send="ls -la">ls -la</button>
+            <button data-send="git status --short">git status</button>
+            <button data-send="clear">clear</button>
+          </div>
+        </section>
+
+        <section class="terminal-grid">
+          <section class="terminal-card">
+            <div class="terminal-toolbar">
+              <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
+              <div class="terminal-title" id="terminalTitle">No session attached</div>
+              <div class="toolbar-actions">
+                <button id="renameSession" title="Rename selected session">Rename</button>
+                <button id="copySelection" title="Copy selected terminal text">Copy</button>
+                <button id="detachSession" title="Detach from this session; tmux keeps it alive">Detach</button>
+                <button id="killSession" class="danger" title="Kill selected tmux session">Kill session</button>
+              </div>
+            </div>
+            <div id="terminal"></div>
+          </section>
+
+          <aside class="blocks-card">
+            <div class="blocks-head">
+              <div>
+                <span>Command blocks</span>
+                <small id="blocksCount">0 blocks</small>
+              </div>
+              <button id="refreshBlocks" title="Refresh command blocks">↻</button>
+            </div>
+            <input id="blockSearch" autocomplete="off" spellcheck="false" placeholder="Search blocks…" />
+            <div id="blockList" class="block-list" aria-label="Command blocks"></div>
+          </aside>
+        </section>
+
+        <footer>
+          <span>Click a sidebar session to continue exactly where it was.</span>
+          <span>Real terminal access: commands can modify/delete files.</span>
+        </footer>
+      </main>
+    </div>
+
+    <script src="/vendor/xterm.js"></script>
+    <script src="/vendor/fit.js"></script>
+    <script src="/vendor/web-links.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
