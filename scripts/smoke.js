@@ -143,8 +143,9 @@ try {
   const appJs = await httpText('/app.js', { token });
   const terminalFirstUiVerified = indexHtml.includes('passthroughToggle')
     && indexHtml.includes('inputModeHint')
-    && appJs.includes('terminal-first-mode')
-    && appJs.includes('Raw passthrough')
+    && appJs.includes('direct-terminal-mode')
+    && appJs.includes('warpish_direct_terminal')
+    && appJs.includes('Direct terminal input')
     && !appJs.includes('isAlternateBufferActive');
   if (!terminalFirstUiVerified) {
     throw new Error('terminal-first/raw-passthrough UI source verification failed');

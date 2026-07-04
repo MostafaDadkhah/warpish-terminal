@@ -116,9 +116,10 @@ zsh -n scripts/warpish-shell-integration.zsh
 
 ### Persian/English bidi readability
 
-- The command composer must keep `dir="auto"` and `unicode-bidi: plaintext` so mixed Persian/English input remains readable while typing.
-- Smart Input mode should remain available and default-on; it keeps xterm focused, routes printable terminal typing into the composer, and keeps localStorage-backed command history usable for quick recalls.
-- Raw passthrough must remain available for direct terminal/TUI workflows; common interactive command names should auto-enable it where feasible, but do not use tmux/xterm alternate-screen state alone as a signal because tmux itself may use alternate screen.
+- Direct xterm typing must remain the default for ordinary commands: typing `hermes chat` in the terminal should echo at the shell prompt, not in the top composer.
+- The command composer must keep `dir="auto"` and `unicode-bidi: plaintext` so mixed Persian/English input remains readable when the user explicitly focuses it.
+- Cmd/Ctrl+K should focus/select the composer; ArrowUp/ArrowDown history should work while the composer is focused.
+- Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
 - Keep the Bidi reader enabled by default; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
 - Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
@@ -174,8 +175,8 @@ Then open the app in Chrome and verify at least:
 - reload/reattach preserves terminal output,
 - command blocks render and rerun works,
 - Bidi reader renders Persian/English mixed text in readable order,
-- Smart Input terminal-first submit/focus/history behavior works,
-- raw passthrough toggle and direct terminal mode remain usable,
+- direct xterm typing of `hermes chat` echoes at the terminal prompt rather than appearing in the top composer,
+- command composer submit/focus/history behavior works,
 - browser console has no JavaScript errors.
 
 For docs-only changes, at minimum verify:
@@ -207,4 +208,4 @@ git diff --cached --stat
 - tmux capture/output boundaries are tricky; full-screen/TUI apps may not produce useful command block previews.
 - Browser screenshot tooling may fail in constrained local environments; use DOM/console/API evidence as fallback.
 - Unicode bidi is visual, not just data correctness: backend output can be correct while terminal rendering is unreadable. Verify the browser reader/styles too.
-- Keep Smart Input enabled by default, but ensure the visible toggle still allows direct terminal typing for interactive programs.
+- Keep direct terminal typing as the default. The visible toggle must allow composer-capture mode only as an opt-in, not as the default typing path.

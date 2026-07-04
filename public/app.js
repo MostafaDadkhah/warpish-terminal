@@ -66,7 +66,7 @@ let intentionalDetach = false;
 let refreshTimer = null;
 let blockFilter = '';
 let smartInputEnabled = localStorage.getItem('warpish_smart_input') !== 'off';
-let manualRawInputEnabled = localStorage.getItem('warpish_raw_input') === 'on';
+let directTerminalEnabled = localStorage.getItem('warpish_direct_terminal') !== 'off';
 let autoRawInputReason = '';
 let commandHistory = [];
 let commandHistoryIndex = 0;
@@ -154,28 +154,30 @@ function applyBidiMode() {
 }
 
 function isRawInputActive() {
-  return !smartInputEnabled || manualRawInputEnabled || Boolean(autoRawInputReason);
+  return !smartInputEnabled || directTerminalEnabled || Boolean(autoRawInputReason);
 }
 
 function inputModeDescription() {
-  if (!smartInputEnabled) return 'Raw terminal input — Smart Input is off.';
-  if (manualRawInputEnabled) return 'Raw passthrough is on — keys go directly to the shell/TUI.';
-  if (autoRawInputReason) return `Auto raw passthrough — ${autoRawInputReason}.`;
-  return 'Terminal-first Smart Input — focus stays in xterm, printable keys stage in the bidi-safe composer.';
+  if (!smartInputEnabled) return 'Direct terminal input — Smart composer is off.';
+  if (directTerminalEnabled) return 'Direct terminal input — type at the prompt; use Cmd/Ctrl+K for the bidi composer.';
+  if (autoRawInputReason) return `Auto direct terminal input — ${autoRawInputReason}.`;
+  return 'Composer capture — printable terminal keys stage in the bidi-safe composer.';
 }
 
 function applySmartInputMode() {
   const rawActive = isRawInputActive();
   document.body.classList.toggle('smart-input-mode', smartInputEnabled);
-  document.body.classList.toggle('terminal-first-mode', smartInputEnabled && !rawActive);
-  document.body.classList.toggle('raw-input-mode', rawActive);
-  if (smartInputToggle) smartInputToggle.textContent = `Smart input: ${smartInputEnabled ? 'on' : 'off'}`;
+  document.body.classList.toggle('direct-terminal-mode', directTerminalEnabled || !smartInputEnabled);
+  document.body.classList.toggle('terminal-first-mode', smartInputEnabled);
+  document.body.classList.toggle('composer-capture-mode', smartInputEnabled && !rawActive);
+  document.body.classList.toggle('raw-input-mode', rawActive && !directTerminalEnabled);
+  if (smartInputToggle) smartInputToggle.textContent = `Bidi composer: ${smartInputEnabled ? 'on' : 'off'}`;
   if (passthroughToggle) {
-    passthroughToggle.textContent = manualRawInputEnabled
-      ? 'Raw passthrough: on'
+    passthroughToggle.textContent = directTerminalEnabled
+      ? 'Direct terminal: on'
       : autoRawInputReason
-        ? 'Raw passthrough: auto'
-        : 'Raw passthrough: off';
+        ? 'Direct terminal: auto'
+        : 'Direct terminal: off';
   }
   if (inputModeHint) inputModeHint.textContent = inputModeDescription();
   term.focus();
@@ -419,7 +421,8 @@ function handleTerminalInput(data) {
 }
 
 function navigateHistory(offset) {
-  if (!smartInputEnabled || isRawInputActive() || !commandHistory.length) return;
+  const composerFocused = document.activeElement === input;
+  if (!smartInputEnabled || (!composerFocused && isRawInputActive()) || !commandHistory.length) return;
   const target = commandHistoryIndex + offset;
 
   if (offset < 0 && commandHistoryIndex > 0) {
@@ -889,20 +892,20 @@ smartInputToggle && smartInputToggle.addEventListener('click', () => {
   smartInputEnabled = !smartInputEnabled;
   localStorage.setItem('warpish_smart_input', smartInputEnabled ? 'on' : 'off');
   commandHistoryIndex = commandHistory.length;
-  if (smartInputEnabled) manualRawInputEnabled = false;
-  localStorage.setItem('warpish_raw_input', manualRawInputEnabled ? 'on' : 'off');
+  if (!smartInputEnabled) directTerminalEnabled = true;
+  localStorage.setItem('warpish_direct_terminal', directTerminalEnabled ? 'on' : 'off');
   applySmartInputMode();
 });
 
 passthroughToggle && passthroughToggle.addEventListener('click', () => {
-  manualRawInputEnabled = !manualRawInputEnabled;
-  if (manualRawInputEnabled) autoRawInputReason = '';
-  localStorage.setItem('warpish_raw_input', manualRawInputEnabled ? 'on' : 'off');
+  directTerminalEnabled = !directTerminalEnabled;
+  if (directTerminalEnabled) autoRawInputReason = '';
+  localStorage.setItem('warpish_direct_terminal', directTerminalEnabled ? 'on' : 'off');
   applySmartInputMode();
 });
 
 window.addEventListener('keydown', (event) => {
-  if (!smartInputEnabled || isRawInputActive()) return;
+  if (!smartInputEnabled) return;
   if (event.target === input) {
     if (event.key === 'ArrowUp') {
       event.preventDefault();
@@ -922,6 +925,8 @@ window.addEventListener('keydown', (event) => {
     }
     return;
   }
+
+  if (isRawInputActive()) return;
 
   if (event.key === 'ArrowUp') {
     event.preventDefault();

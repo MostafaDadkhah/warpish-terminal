@@ -53,9 +53,9 @@
           <div class="composer-head">
             <span>Command composer</span>
             <div class="composer-tools">
-              <small id="inputModeHint">Terminal-first Smart Input</small>
-              <button id="smartInputToggle" type="button" class="smart-input-toggle" title="When on, printable terminal typing stages in the bidi-safe composer while terminal focus stays active.">Smart input: on</button>
-              <button id="passthroughToggle" type="button" class="passthrough-toggle" title="Force direct raw terminal input for vim/top/ssh/full-screen programs.">Raw passthrough: off</button>
+              <small id="inputModeHint">Direct terminal input</small>
+              <button id="smartInputToggle" type="button" class="smart-input-toggle" title="Bidi-safe command composer for Persian/English input; use Cmd/Ctrl+K to focus it.">Bidi composer: on</button>
+              <button id="passthroughToggle" type="button" class="passthrough-toggle" title="When on, typing in xterm goes directly to the shell prompt. Turn off only to capture terminal typing into the composer.">Direct terminal: on</button>
             </div>
           </div>
           <form id="commandForm" class="composer">

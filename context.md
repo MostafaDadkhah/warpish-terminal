@@ -19,10 +19,8 @@ Implemented capabilities:
   - recent output preview,
   - click-to-reattach behavior.
 - Command composer and quick actions that send commands to the selected live session.
-- Command composer has terminal-first Smart Input mode (toggle button) that keeps xterm focused while routing printable keystrokes into the composer first.
-- Smart Input has raw passthrough support for full-screen/interactive programs, including manual toggle and auto mode for common command names like `vim`, `top`, and `ssh`.
-- Bidi-safe Persian/English command input using `dir="auto"` and `unicode-bidi: plaintext`.
-- Smart input keeps command history (localStorage), supports Ctrl/Cmd+K focus, and ArrowUp/ArrowDown history recall.
+- Terminal-first typing now means normal xterm typing goes directly to the shell prompt.
+- The command composer remains available for bidi-safe Persian/English command entry through Cmd/Ctrl+K, quick actions, or direct click; it keeps local history and `dir="auto"`/`unicode-bidi: plaintext`.
 - Live Persian/English reader panel that mirrors recent terminal lines in normal HTML with per-line RTL/LTR direction detection.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
@@ -97,10 +95,9 @@ This avoids block output being polluted by unrelated redraws or repeated termina
 
 Terminal grids and tmux redraws are not a reliable place to solve every Unicode bidirectional edge case. The app now uses a layered approach:
 
-- the command composer is a normal browser input with `dir="auto"` and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable while typing;
-- Smart Input mode is default-on and routes printable terminal typing into that composer first while keeping xterm focused, with a visible toggle for direct xterm workflows;
-- raw passthrough can be toggled manually and is enabled automatically for common interactive command names;
-- command history is persisted in `localStorage` and can be recalled with ArrowUp/ArrowDown;
+- normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` appear where users expect;
+- the command composer is an explicit browser input with `dir="auto"` and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable when the user focuses it with Cmd/Ctrl+K or click;
+- command history is persisted in `localStorage` and can be recalled with ArrowUp/ArrowDown while the composer is focused;
 - terminal rows get a CSS bidi hint when Bidi mode is enabled;
 - a live Bidi reader mirrors recent xterm buffer lines into normal HTML, detects each line's first strong RTL/LTR character, and sets per-line direction;
 - command blocks and sidebar previews also use bidi plaintext styling and direction detection.
@@ -134,7 +131,8 @@ Browser QA also verified:
 - session sidebar renders,
 - new session creation works,
 - command composer executes in the real shell,
-- Smart Input submit, terminal-first focus retention, raw passthrough toggle, direct raw command execution, and ArrowUp history recall were verified with browser DOM/headless Chrome CDP evidence,
+- Direct xterm typing of `hermes chat` was dogfooded with headless Chrome/CDP and verified to stay at the terminal prompt instead of jumping to the top composer,
+- command composer submit, terminal focus retention, and ArrowUp history recall were verified with browser DOM/headless Chrome CDP evidence,
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
@@ -145,7 +143,7 @@ Browser QA also verified:
 - This is not a full Warp clone; it implements the core local workflow primitives first.
 - Command-block output is a preview, not a perfect structured transcript for every possible full-screen/TUI command.
 - The Bidi reader solves readability for normal text output and command input; full-screen TUIs can still bypass this because they paint their own terminal grid.
-- Smart Input improves normal command typing; direct raw xterm typing is available via the raw passthrough toggle and auto mode for interactive TUIs/unusual key sequences.
+- Direct terminal typing is the default; use the explicit composer for bidi-heavy command input or browser-side history.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.
 - No GitHub remote is configured yet unless one is added later.
