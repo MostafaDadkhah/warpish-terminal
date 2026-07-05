@@ -141,7 +141,8 @@ try {
   const health = await httpJson('/healthz');
   const indexHtml = await httpText('/', { token });
   const appJs = await httpText('/app.js', { token });
-  const terminalNativeUiVerified = indexHtml.includes('composerToggle')
+  const terminalNativeUiVerified = indexHtml.includes('terminal-input-mask')
+    && indexHtml.includes('composerToggle')
     && indexHtml.includes('blocksToggle')
     && indexHtml.includes('Reader: off')
     && appJs.includes('terminal-native-mode')
@@ -152,6 +153,8 @@ try {
     && appJs.includes('shouldAutoOpenRtlComposer')
     && appJs.includes('openComposerCapture')
     && appJs.includes('commandInputDirection')
+    && appJs.includes('scrollLines')
+    && appJs.includes('BLOCK_OUTPUT_PREVIEW_CHARS')
     && !appJs.includes('isAlternateBufferActive');
   if (!terminalNativeUiVerified) {
     throw new Error('terminal-native collapsible UI source verification failed');

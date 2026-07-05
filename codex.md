@@ -102,7 +102,7 @@ zsh -n scripts/warpish-shell-integration.zsh
   - WebSocket connection management.
   - xterm.js rendering.
   - Sidebar/session UI.
-  - Command composer.
+  - Terminal input mask.
   - Command-block search/copy/rerun UI.
 
 - `public/index.html` and `public/styles.css`
@@ -116,13 +116,13 @@ zsh -n scripts/warpish-shell-integration.zsh
 
 ### Persian/English bidi readability
 
-- Direct xterm typing must remain the default for ordinary commands: typing `hermes chat` in the terminal should echo at the shell prompt, not in the top composer.
-- Keep the primary workspace terminal-native: composer, command blocks, and Bidi reader must be collapsed/hidden by default so input and output stay in one large terminal surface.
-- The command composer must keep `dir="auto"`/dynamic `rtl` direction and `unicode-bidi: plaintext` so mixed Persian/English input remains readable when the user explicitly focuses it.
-- Typing a Persian/Arabic character while xterm is focused should auto-open the bidi composer and seed that character there; ordinary English commands must still go directly to xterm.
-- Cmd/Ctrl+K should focus/select the composer; ArrowUp/ArrowDown history should work while the composer is focused.
+- Direct xterm typing must remain the default for ordinary commands: typing `hermes chat` in the terminal should echo at the shell prompt, not in the input mask.
+- Keep the primary workspace terminal-native: input mask, command blocks, and Bidi reader must be collapsed/hidden by default so input and output stay in one large terminal surface.
+- The terminal input mask must keep `dir="auto"`/dynamic `rtl` direction and `unicode-bidi: plaintext` so mixed Persian/English input remains readable when the user explicitly focuses it.
+- Typing a Persian/Arabic character while xterm is focused should auto-open the bidi input mask over the terminal and seed that character there; ordinary English commands must still go directly to xterm.
+- Cmd/Ctrl+K should focus/select the input mask; ArrowUp/ArrowDown history should work while the mask is focused.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
-- Keep the Bidi reader available as an overlay toggle; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
+- Keep the Bidi reader available as an overlay toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML and sets per-line `dir` from the first strong RTL/LTR character. If a full-screen terminal app leaves xterm scrollback at `baseY=0`, wheel should open/update this reader overlay rather than trying to split the terminal layout.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
 - Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
 - If changing xterm rendering or terminal layout, verify a line like `سلام Mostafa، command: git status و path: /Users/test خواناست` appears in the Bidi reader and command block output with `dir="rtl"` and `unicode-bidi: plaintext`.
@@ -173,14 +173,15 @@ Then open the app in Chrome and verify at least:
 
 - sidebar renders sessions,
 - `+ New terminal` creates a session,
-- composer command runs in the terminal,
+- input mask command runs in the terminal,
 - reload/reattach preserves terminal output,
 - command blocks render and rerun works,
 - Bidi reader renders Persian/English mixed text in readable order,
-- direct xterm typing of `hermes chat` echoes at the terminal prompt rather than appearing in the top composer,
-- typing Persian/Arabic at the terminal prompt auto-opens the bidi composer, seeds the typed character, keeps focus in the composer, and renders RTL-first text right-aligned with `dir="rtl"`,
-- composer, command blocks, and Bidi reader are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
-- command composer submit/focus/history behavior works,
+- direct xterm typing of `hermes chat` echoes at the terminal prompt rather than appearing in the input mask,
+- typing Persian/Arabic at the terminal prompt auto-opens the bidi input mask over the terminal, seeds the typed character, keeps focus in the mask, and renders RTL-first text right-aligned with `dir="rtl"`,
+- input mask, command blocks, and Bidi reader are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
+- input mask submit/focus/history behavior works,
+- `hermes --resume 20260706_010032_731a69` leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured Hermes text rather than freezing or splitting the layout,
 - browser console has no JavaScript errors.
 
 For docs-only changes, at minimum verify:
@@ -212,4 +213,4 @@ git diff --cached --stat
 - tmux capture/output boundaries are tricky; full-screen/TUI apps may not produce useful command block previews.
 - Browser screenshot tooling may fail in constrained local environments; use DOM/console/API evidence as fallback.
 - Unicode bidi is visual, not just data correctness: backend output can be correct while terminal rendering is unreadable. Verify the browser reader/styles too.
-- Keep direct terminal typing as the default. Composer capture, command blocks, and reader must be opt-in/collapsible, not default surfaces that split input from output.
+- Keep direct terminal typing as the default. Input-mask capture, command blocks, and reader must be opt-in/collapsible overlays, not default surfaces that split input from output.

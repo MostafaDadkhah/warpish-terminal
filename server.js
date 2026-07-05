@@ -482,6 +482,21 @@ function capturePreview(id, lines = 28) {
   }
 }
 
+function capturePaneText(id, { lines = 600, alternate = false } = {}) {
+  const args = ['capture-pane', '-p', '-J', '-t', id];
+  if (alternate) args.splice(1, 0, '-a');
+  else args.push('-S', `-${Math.max(20, Math.min(Number(lines) || 600, 5000))}`);
+  try {
+    return runTmux(args)
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .join('\n')
+      .trimEnd();
+  } catch {
+    return '';
+  }
+}
+
 function summarizeSessions() {
   const meta = readMetadata();
   const active = listActiveTmuxSessions();
@@ -611,8 +626,12 @@ function purgeSession(id) {
 }
 
 function writeWorker(worker, message) {
-  if (!worker.stdin.destroyed) {
+  if (!worker?.stdin || worker.stdin.destroyed || !worker.stdin.writable) return false;
+  try {
     worker.stdin.write(`${JSON.stringify(message)}\n`);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -679,6 +698,16 @@ app.get('/api/sessions/:id/blocks', (req, res) => {
   const { id } = req.params;
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
   res.json({ blocks: getBlocks(id) });
+});
+
+app.get('/api/sessions/:id/capture', (req, res) => {
+  const { id } = req.params;
+  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
+  const lines = clampNumber(req.query.lines, 600, 20, 5000);
+  const normal = capturePaneText(id, { lines });
+  const alternate = capturePaneText(id, { alternate: true });
+  const text = alternate.trim() ? alternate : normal;
+  res.json({ text, normal, alternate, usingAlternate: Boolean(alternate.trim()) });
 });
 
 app.patch('/api/sessions/:id', (req, res) => {
@@ -759,6 +788,14 @@ wss.on('connection', (ws, req) => {
     },
   });
   const eventReader = createEventReader(sessionId, (event) => sendControl(event));
+
+  worker.stdin.on('error', (error) => {
+    stderrBuffer = `${stderrBuffer}\nstdin ${error.code || 'error'}: ${error.message || error}`.slice(-4096);
+    if (ws.readyState === ws.OPEN) {
+      sendControl({ type: 'server-error', message: `PTY input closed: ${error.code || error.message || 'stdin error'}` });
+      ws.close();
+    }
+  });
 
   worker.stdout.on('data', (chunk) => {
     stdoutBuffer += chunk.toString('utf8');

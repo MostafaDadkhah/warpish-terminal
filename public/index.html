@@ -49,36 +49,13 @@
           </div>
         </header>
 
-        <section class="composer-card">
-          <div class="composer-head">
-            <span>Command composer</span>
-            <div class="composer-tools">
-              <small id="inputModeHint">Direct terminal input — Persian opens the bidi composer automatically</small>
-              <button id="smartInputToggle" type="button" class="smart-input-toggle" title="Bidi-safe command composer for Persian/English input; Persian typing in the terminal opens it automatically, or use Cmd/Ctrl+K.">Bidi composer: on</button>
-              <button id="passthroughToggle" type="button" class="passthrough-toggle" title="When on, typing in xterm goes directly to the shell prompt. Turn off only to capture terminal typing into the composer.">Direct terminal: on</button>
-            </div>
-          </div>
-          <form id="commandForm" class="composer">
-            <input id="commandInput" autocomplete="off" spellcheck="false" dir="auto" placeholder="Type a command, e.g. echo 'سلام Mostafa'" />
-            <button type="submit">Run ↵</button>
-          </form>
-          <div class="quick-actions" aria-label="Quick commands">
-            <button data-send="pwd">pwd</button>
-            <button data-send="whoami && hostname">whoami</button>
-            <button data-send="ls -la">ls -la</button>
-            <button data-send="git status --short">git status</button>
-            <button data-send='printf "سلام Mostafa، command: git status و path: /Users/test خواناست\\n"'>bidi test</button>
-            <button data-send="clear">clear</button>
-          </div>
-        </section>
-
         <section class="terminal-grid">
           <section class="terminal-card">
             <div class="terminal-toolbar">
               <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
               <div class="terminal-title" id="terminalTitle">No session attached</div>
               <div class="toolbar-actions">
-                <button id="composerToggle" title="Open optional command composer (Cmd/Ctrl+K)">Composer</button>
+                <button id="composerToggle" title="Open terminal input mask (Cmd/Ctrl+K)">Mask</button>
                 <button id="blocksToggle" title="Show or hide command blocks">Blocks</button>
                 <button id="renameSession" title="Rename selected session">Rename</button>
                 <button id="copySelection" title="Copy selected terminal text">Copy</button>
@@ -88,6 +65,28 @@
               </div>
             </div>
             <div id="terminal"></div>
+            <section class="composer-card terminal-input-mask" aria-label="Terminal input mask">
+              <div class="composer-head">
+                <span>Input mask</span>
+                <div class="composer-tools">
+                  <small id="inputModeHint">Direct terminal input — Persian opens an RTL mask over the terminal</small>
+                  <button id="smartInputToggle" type="button" class="smart-input-toggle" title="Bidi-safe terminal mask for Persian/English input; Persian typing in the terminal opens it automatically, or use Cmd/Ctrl+K.">RTL mask: on</button>
+                  <button id="passthroughToggle" type="button" class="passthrough-toggle" title="When on, ordinary xterm typing goes directly to the shell prompt. Turn off only to capture all terminal typing into the mask.">Direct terminal: on</button>
+                </div>
+              </div>
+              <form id="commandForm" class="composer">
+                <input id="commandInput" autocomplete="off" spellcheck="false" dir="auto" placeholder="Type here only when the RTL mask is open" />
+                <button type="submit">Send ↵</button>
+              </form>
+              <div class="quick-actions" aria-label="Quick commands">
+                <button data-send="pwd">pwd</button>
+                <button data-send="whoami && hostname">whoami</button>
+                <button data-send="ls -la">ls -la</button>
+                <button data-send="git status --short">git status</button>
+                <button data-send='printf "سلام Mostafa، command: git status و path: /Users/test خواناست\\n"'>bidi test</button>
+                <button data-send="clear">clear</button>
+              </div>
+            </section>
             <div id="bidiReader" class="bidi-reader" aria-live="polite">
               <div class="bidi-reader-head">
                 <span>Persian/English reader</span>

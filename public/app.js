@@ -87,6 +87,16 @@ commandHistoryIndex = commandHistory.length;
 const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const BIDI_READER_MAX_LINES = 80;
+const BLOCK_RENDER_LIMIT = 60;
+const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
+const SESSION_PREVIEW_CHARS = 900;
+let blockRenderPending = false;
+
+function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
+  const value = String(text || '');
+  if (value.length <= maxChars) return value;
+  return `… truncated ${value.length - maxChars} chars …\n${value.slice(-maxChars)}`;
+}
 
 function bidiDirection(text = '') {
   const firstStrong = String(text).match(STRONG_CHAR_RE)?.[0] || '';
@@ -129,10 +139,9 @@ function getReadableTerminalLines(limit = BIDI_READER_MAX_LINES) {
   return lines.slice(-limit);
 }
 
-function renderBidiReader() {
+function renderBidiReader(lines = getReadableTerminalLines()) {
   if (!bidiReaderLines) return;
   bidiReaderLines.innerHTML = '';
-  const lines = getReadableTerminalLines();
   if (!lines.length) {
     const empty = document.createElement('div');
     empty.className = 'bidi-line empty-state';
@@ -160,6 +169,24 @@ function scheduleBidiReaderUpdate() {
   });
 }
 
+async function refreshBidiReaderFromCapture() {
+  if (!bidiReaderEnabled || !currentSessionId) {
+    renderBidiReader();
+    return;
+  }
+  try {
+    const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=1200`);
+    const lines = String(payload.text || '')
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .filter((line) => line.trim().length > 0)
+      .slice(-BIDI_READER_MAX_LINES);
+    renderBidiReader(lines.length ? lines : getReadableTerminalLines());
+  } catch {
+    renderBidiReader();
+  }
+}
+
 function refitTerminal() {
   requestAnimationFrame(() => {
     try { if (fitAddon) fitAddon.fit(); } catch {}
@@ -173,7 +200,7 @@ function applyPanelMode() {
   document.body.classList.add('terminal-native-mode');
   document.body.classList.toggle('composer-open', composerOpen);
   document.body.classList.toggle('blocks-open', blocksOpen);
-  if (composerToggleButton) composerToggleButton.textContent = composerOpen ? 'Hide composer' : 'Composer';
+  if (composerToggleButton) composerToggleButton.textContent = composerOpen ? 'Hide mask' : 'Mask';
   if (blocksToggleButton) blocksToggleButton.textContent = blocksOpen ? 'Hide blocks' : 'Blocks';
   refitTerminal();
 }
@@ -194,13 +221,14 @@ function setBlocksOpen(open) {
   blocksOpen = Boolean(open);
   localStorage.setItem('warpish_blocks_open', blocksOpen ? 'on' : 'off');
   applyPanelMode();
+  if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(console.error);
 }
 
 function applyBidiMode() {
   document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
   if (bidiToggleButton) bidiToggleButton.textContent = `Reader: ${bidiReaderEnabled ? 'on' : 'off'}`;
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
-  if (bidiReaderEnabled) scheduleBidiReaderUpdate();
+  if (bidiReaderEnabled) refreshBidiReaderFromCapture().catch(() => renderBidiReader());
   refitTerminal();
 }
 
@@ -209,10 +237,10 @@ function isRawInputActive() {
 }
 
 function inputModeDescription() {
-  if (!smartInputEnabled) return 'Direct terminal input — Smart composer is off.';
-  if (directTerminalEnabled) return 'Direct terminal input — English types at the prompt; Persian opens the bidi composer automatically.';
+  if (!smartInputEnabled) return 'Direct terminal input — RTL mask is off.';
+  if (directTerminalEnabled) return 'Direct terminal input — English goes to the prompt; Persian opens an RTL mask over the terminal.';
   if (autoRawInputReason) return `Auto direct terminal input — ${autoRawInputReason}.`;
-  return 'Composer capture — printable terminal keys stage in the bidi-safe composer.';
+  return 'Mask capture — printable terminal keys stage over the terminal.';
 }
 
 function applySmartInputMode() {
@@ -222,7 +250,7 @@ function applySmartInputMode() {
   document.body.classList.toggle('terminal-first-mode', smartInputEnabled);
   document.body.classList.toggle('composer-capture-mode', smartInputEnabled && !rawActive);
   document.body.classList.toggle('raw-input-mode', rawActive && !directTerminalEnabled);
-  if (smartInputToggle) smartInputToggle.textContent = `Bidi composer: ${smartInputEnabled ? 'on' : 'off'}`;
+  if (smartInputToggle) smartInputToggle.textContent = `RTL mask: ${smartInputEnabled ? 'on' : 'off'}`;
   if (passthroughToggle) {
     passthroughToggle.textContent = directTerminalEnabled
       ? 'Direct terminal: on'
@@ -393,10 +421,11 @@ function submitCommand(command) {
   input.value = '';
   input.setSelectionRange(0, 0);
   syncCommandInputDirection();
+  setComposerOpen(false);
   focusPreferredInput();
   setTimeout(() => {
     refreshSessions().catch(console.error);
-    loadBlocks().catch(console.error);
+    if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(console.error);
   }, 1200);
 }
 
@@ -686,7 +715,7 @@ function renderSessions() {
 
     const preview = document.createElement('div');
     preview.className = 'session-preview';
-    const previewText = session.preview || (session.alive ? 'fresh terminal — no output yet' : 'no saved preview');
+    const previewText = compactText(session.preview || (session.alive ? 'fresh terminal — no output yet' : 'no saved preview'), SESSION_PREVIEW_CHARS);
     applyBidiText(preview, previewText);
 
     button.append(title, meta, preview);
@@ -698,8 +727,17 @@ function renderSessions() {
 
 function blockMatchesFilter(block) {
   if (!blockFilter) return true;
-  const haystack = `${block.command || ''}\n${block.output || ''}\n${block.status || ''}`.toLowerCase();
+  const haystack = `${block.command || ''}\n${compactText(block.output || '', 6000)}\n${block.status || ''}`.toLowerCase();
   return haystack.includes(blockFilter.toLowerCase());
+}
+
+function scheduleRenderBlocks() {
+  if (blockRenderPending) return;
+  blockRenderPending = true;
+  requestAnimationFrame(() => {
+    blockRenderPending = false;
+    renderBlocks();
+  });
 }
 
 function upsertBlock(block) {
@@ -708,13 +746,18 @@ function upsertBlock(block) {
   if (existing >= 0) blocks[existing] = { ...blocks[existing], ...block };
   else blocks.unshift(block);
   blocks.sort((a, b) => new Date(b.startedAt || 0) - new Date(a.startedAt || 0));
-  renderBlocks();
+  scheduleRenderBlocks();
 }
 
 function renderBlocks() {
-  blockList.innerHTML = '';
   const filtered = blocks.filter(blockMatchesFilter);
   blocksCount.textContent = `${filtered.length}${filtered.length === blocks.length ? '' : ` / ${blocks.length}`} block${blocks.length === 1 ? '' : 's'}`;
+  if (!blocksOpen) {
+    blockList.replaceChildren();
+    return;
+  }
+
+  blockList.innerHTML = '';
 
   if (!currentSessionId) {
     const empty = document.createElement('div');
@@ -734,7 +777,8 @@ function renderBlocks() {
     return;
   }
 
-  for (const block of filtered) {
+  const visibleBlocks = filtered.slice(0, BLOCK_RENDER_LIMIT);
+  for (const block of visibleBlocks) {
     const card = document.createElement('article');
     card.className = `block-card ${block.status || 'unknown'}`;
 
@@ -758,7 +802,7 @@ function renderBlocks() {
 
     const output = document.createElement('pre');
     output.className = 'block-output';
-    const outputText = (block.output || '').trim() || (block.status === 'running' ? 'Waiting for output…' : 'No output.');
+    const outputText = compactText((block.output || '').trim() || (block.status === 'running' ? 'Waiting for output…' : 'No output.'));
     applyBidiText(output, outputText);
 
     const actions = document.createElement('div');
@@ -781,11 +825,22 @@ function renderBlocks() {
     card.append(command, meta, output, actions);
     blockList.appendChild(card);
   }
+
+  if (filtered.length > visibleBlocks.length) {
+    const more = document.createElement('div');
+    more.className = 'empty-state';
+    more.textContent = `Showing latest ${visibleBlocks.length} of ${filtered.length} matching blocks. Narrow search to inspect older blocks.`;
+    blockList.appendChild(more);
+  }
 }
 
-async function loadBlocks(sessionId = currentSessionId) {
+async function loadBlocks(sessionId = currentSessionId, { force = false } = {}) {
   if (!sessionId) {
     blocks = [];
+    renderBlocks();
+    return;
+  }
+  if (!blocksOpen && !force) {
     renderBlocks();
     return;
   }
@@ -812,7 +867,7 @@ async function refreshSessions({ selectId, createIfEmpty = false } = {}) {
     || sessions.find((session) => session.alive)?.id;
 
   if (targetId && targetId !== currentSessionId) connectToSession(targetId);
-  else if (targetId) loadBlocks(targetId).catch(console.error);
+  else if (targetId && blocksOpen) loadBlocks(targetId, { force: true }).catch(console.error);
   if (!targetId) updateHeader();
 }
 
@@ -847,7 +902,7 @@ function connectToSession(sessionId) {
   blocks = [];
   renderSessions();
   renderBlocks();
-  loadBlocks(sessionId).catch(console.error);
+  if (blocksOpen) loadBlocks(sessionId, { force: true }).catch(console.error);
   term.reset();
   scheduleBidiReaderUpdate();
   setStatus('warn', 'attaching…', session.title);
@@ -902,7 +957,7 @@ function connectToSession(sessionId) {
     }
     setTimeout(() => {
       refreshSessions().catch(console.error);
-      loadBlocks().catch(console.error);
+      if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(console.error);
     }, 300);
   });
 
@@ -939,8 +994,27 @@ const resizeObserver = new ResizeObserver(() => {
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
   }
 });
+function shouldOpenReaderOnTrappedScroll() {
+  const text = getReadableTerminalLines(40).join('\n');
+  return /Welcome to Hermes Agent|\bgpt-[\w.]+\b|ctx --|❯/.test(text);
+}
+
 resizeObserver.observe(terminalEl);
 terminalEl.addEventListener('pointerdown', () => setTimeout(() => term.focus(), 0));
+terminalEl.addEventListener('wheel', (event) => {
+  if (event.ctrlKey) return;
+  const lineHeight = 18;
+  const lines = Math.max(1, Math.min(12, Math.round(Math.abs(event.deltaY) / lineHeight)));
+  const before = term.buffer?.active?.viewportY ?? 0;
+  term.scrollLines(event.deltaY > 0 ? lines : -lines);
+  const after = term.buffer?.active?.viewportY ?? before;
+  if (after === before && (term.buffer?.active?.baseY ?? 0) === 0 && shouldOpenReaderOnTrappedScroll()) {
+    bidiReaderEnabled = true;
+    localStorage.setItem('warpish_bidi_reader_v2', 'on');
+    applyBidiMode();
+  }
+  event.preventDefault();
+}, { capture: true, passive: false });
 
 window.addEventListener('keydown', (event) => {
   if (!shouldAutoOpenRtlComposer(event)) return;
@@ -982,7 +1056,7 @@ newSessionButton.addEventListener('click', async () => {
 });
 
 refreshSessionsButton.addEventListener('click', () => refreshSessions().catch((error) => setStatus('bad', 'refresh failed', error.message)));
-refreshBlocksButton.addEventListener('click', () => loadBlocks().catch((error) => setStatus('bad', 'blocks refresh failed', error.message)));
+refreshBlocksButton.addEventListener('click', () => loadBlocks(currentSessionId, { force: true }).catch((error) => setStatus('bad', 'blocks refresh failed', error.message)));
 blockSearch.addEventListener('input', () => {
   blockFilter = blockSearch.value.trim();
   renderBlocks();
@@ -1117,7 +1191,7 @@ refreshSessions({ createIfEmpty: true }).catch((error) => {
 
 refreshTimer = setInterval(() => {
   refreshSessions().catch(() => {});
-  loadBlocks().catch(() => {});
+  if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
 }, 5000);
 
 window.addEventListener('beforeunload', () => {

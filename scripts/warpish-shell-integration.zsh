@@ -63,3 +63,37 @@ __warpish_precmd() {
 
 add-zsh-hook preexec __warpish_preexec 2>/dev/null || true
 add-zsh-hook precmd __warpish_precmd 2>/dev/null || true
+
+__warpish_hermes_should_force_cli() {
+  emulate -L zsh
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --cli|--tui|--dev|-z|--oneshot|-h|--help|--version|-V)
+        return 1
+        ;;
+    esac
+  done
+
+  # Hermes' modern TUI uses an alternate screen and can trap scrollback inside
+  # browser xterm. In Warpish, default interactive/resume Hermes sessions to the
+  # classic CLI unless the user explicitly asks for --tui.
+  [[ $# -eq 0 ]] && return 0
+  for arg in "$@"; do
+    case "$arg" in
+      --resume|--resume=*|-r|--continue|--continue=*|-c)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+hermes() {
+  emulate -L zsh
+  if __warpish_hermes_should_force_cli "$@"; then
+    command hermes --cli "$@"
+  else
+    command hermes "$@"
+  fi
+}
