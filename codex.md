@@ -118,7 +118,8 @@ zsh -n scripts/warpish-shell-integration.zsh
 
 - Direct xterm typing must remain the default for ordinary commands: typing `hermes chat` in the terminal should echo at the shell prompt, not in the top composer.
 - Keep the primary workspace terminal-native: composer, command blocks, and Bidi reader must be collapsed/hidden by default so input and output stay in one large terminal surface.
-- The command composer must keep `dir="auto"` and `unicode-bidi: plaintext` so mixed Persian/English input remains readable when the user explicitly focuses it.
+- The command composer must keep `dir="auto"`/dynamic `rtl` direction and `unicode-bidi: plaintext` so mixed Persian/English input remains readable when the user explicitly focuses it.
+- Typing a Persian/Arabic character while xterm is focused should auto-open the bidi composer and seed that character there; ordinary English commands must still go directly to xterm.
 - Cmd/Ctrl+K should focus/select the composer; ArrowUp/ArrowDown history should work while the composer is focused.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
 - Keep the Bidi reader available as an overlay toggle; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
@@ -177,6 +178,7 @@ Then open the app in Chrome and verify at least:
 - command blocks render and rerun works,
 - Bidi reader renders Persian/English mixed text in readable order,
 - direct xterm typing of `hermes chat` echoes at the terminal prompt rather than appearing in the top composer,
+- typing Persian/Arabic at the terminal prompt auto-opens the bidi composer, seeds the typed character, keeps focus in the composer, and renders RTL-first text right-aligned with `dir="rtl"`,
 - composer, command blocks, and Bidi reader are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
 - command composer submit/focus/history behavior works,
 - browser console has no JavaScript errors.

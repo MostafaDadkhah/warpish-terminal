@@ -93,6 +93,16 @@ function bidiDirection(text = '') {
   return RTL_CHAR_RE.test(firstStrong) ? 'rtl' : 'ltr';
 }
 
+function commandInputDirection(text = '') {
+  const firstStrong = String(text).match(STRONG_CHAR_RE)?.[0] || '';
+  if (!firstStrong) return 'auto';
+  return RTL_CHAR_RE.test(firstStrong) ? 'rtl' : 'ltr';
+}
+
+function syncCommandInputDirection() {
+  input.dir = commandInputDirection(input.value);
+}
+
 function applyBidiText(element, text, { className = 'bidi-plain' } = {}) {
   if (!element) return;
   element.textContent = text;
@@ -200,7 +210,7 @@ function isRawInputActive() {
 
 function inputModeDescription() {
   if (!smartInputEnabled) return 'Direct terminal input — Smart composer is off.';
-  if (directTerminalEnabled) return 'Direct terminal input — type at the prompt; use Cmd/Ctrl+K for the bidi composer.';
+  if (directTerminalEnabled) return 'Direct terminal input — English types at the prompt; Persian opens the bidi composer automatically.';
   if (autoRawInputReason) return `Auto direct terminal input — ${autoRawInputReason}.`;
   return 'Composer capture — printable terminal keys stage in the bidi-safe composer.';
 }
@@ -271,6 +281,7 @@ function setInputValueAtCursor(text) {
   input.value = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
   const cursor = start + text.length;
   input.setSelectionRange(cursor, cursor);
+  syncCommandInputDirection();
 }
 
 function deleteInputBackward() {
@@ -279,6 +290,7 @@ function deleteInputBackward() {
   if (start !== end) {
     input.value = `${input.value.slice(0, start)}${input.value.slice(end)}`;
     input.setSelectionRange(start, start);
+    syncCommandInputDirection();
     return true;
   }
   if (start <= 0) return false;
@@ -289,6 +301,7 @@ function deleteInputBackward() {
   input.value = nextValue;
   const cursor = before.join('').length;
   input.setSelectionRange(cursor, cursor);
+  syncCommandInputDirection();
   return chars.length !== Array.from(nextValue).length;
 }
 
@@ -298,16 +311,58 @@ function deleteInputWordBackward() {
   if (start !== end) {
     input.value = `${input.value.slice(0, start)}${input.value.slice(end)}`;
     input.setSelectionRange(start, start);
+    syncCommandInputDirection();
     return true;
   }
   start = input.value.slice(0, end).replace(/\s+$/, '').replace(/\S+$/, '').length;
   input.value = `${input.value.slice(0, start)}${input.value.slice(end)}`;
   input.setSelectionRange(start, start);
+  syncCommandInputDirection();
   return true;
 }
 
 function isPrintableTerminalData(data) {
   return Boolean(data) && !/[\x00-\x1f\x7f\x80-\x9f]/u.test(data);
+}
+
+function isSinglePrintableKey(key) {
+  return Array.from(key || '').length === 1 && !/[\x00-\x1f\x7f]/u.test(key);
+}
+
+function isTerminalKeyboardTarget(target) {
+  return Boolean(target)
+    && target !== input
+    && (
+      target.classList?.contains('xterm-helper-textarea')
+      || target.getAttribute?.('aria-label') === 'Terminal input'
+      || (target.tagName === 'TEXTAREA' && terminalEl.contains(target))
+    );
+}
+
+function shouldAutoOpenRtlComposer(event) {
+  if (!smartInputEnabled || !directTerminalEnabled || autoRawInputReason) return false;
+  if (event.defaultPrevented || event.isComposing) return false;
+  if (event.metaKey || event.ctrlKey || event.altKey) return false;
+  if (!isTerminalKeyboardTarget(event.target)) return false;
+  return isSinglePrintableKey(event.key) && RTL_CHAR_RE.test(event.key);
+}
+
+function normalizeComposerPaste(text) {
+  return String(text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+/g, ' ; ');
+}
+
+function openComposerCapture(text = '', { reset = false } = {}) {
+  if (reset || !composerOpen) {
+    input.value = '';
+    input.setSelectionRange(0, 0);
+  }
+  setComposerOpen(true, { focus: true });
+  if (text) setInputValueAtCursor(text);
+  syncCommandInputDirection();
+  requestAnimationFrame(() => {
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  });
 }
 
 function interactiveCommandName(command) {
@@ -337,6 +392,7 @@ function submitCommand(command) {
   sendRaw(`${trimmed}\r`);
   input.value = '';
   input.setSelectionRange(0, 0);
+  syncCommandInputDirection();
   focusPreferredInput();
   setTimeout(() => {
     refreshSessions().catch(console.error);
@@ -371,6 +427,7 @@ function handleTerminalInput(data) {
     if (input.value) {
       input.value = '';
       input.setSelectionRange(0, 0);
+      syncCommandInputDirection();
       commandHistoryIndex = commandHistory.length;
       focusPreferredInput();
     } else {
@@ -420,7 +477,10 @@ function handleTerminalInput(data) {
   }
 
   if (data === '\x15') {
-    if (input.value) input.value = '';
+    if (input.value) {
+      input.value = '';
+      syncCommandInputDirection();
+    }
     else sendRaw(data);
     input.setSelectionRange(0, 0);
     focusPreferredInput();
@@ -440,6 +500,7 @@ function handleTerminalInput(data) {
       sendRaw(`${input.value}\t`);
       input.value = '';
       input.setSelectionRange(0, 0);
+      syncCommandInputDirection();
     } else {
       sendRaw(data);
     }
@@ -480,6 +541,7 @@ function navigateHistory(offset) {
 
   const value = commandHistory[commandHistoryIndex] ?? '';
   input.value = value;
+  syncCommandInputDirection();
   const pos = value.length;
   input.setSelectionRange(pos, pos);
   focusPreferredInput();
@@ -880,6 +942,23 @@ const resizeObserver = new ResizeObserver(() => {
 resizeObserver.observe(terminalEl);
 terminalEl.addEventListener('pointerdown', () => setTimeout(() => term.focus(), 0));
 
+window.addEventListener('keydown', (event) => {
+  if (!shouldAutoOpenRtlComposer(event)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  openComposerCapture(event.key, { reset: true });
+}, true);
+
+document.addEventListener('paste', (event) => {
+  if (!smartInputEnabled || !directTerminalEnabled || autoRawInputReason) return;
+  if (!isTerminalKeyboardTarget(event.target)) return;
+  const text = event.clipboardData?.getData('text') || '';
+  if (!RTL_CHAR_RE.test(text)) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  openComposerCapture(normalizeComposerPaste(text), { reset: true });
+}, true);
+
 form.addEventListener('submit', (event) => {
   event.preventDefault();
   submitCommand(input.value);
@@ -968,6 +1047,7 @@ window.addEventListener('keydown', (event) => {
     }
     if (event.key === 'Escape') {
       input.value = '';
+      syncCommandInputDirection();
       commandHistoryIndex = commandHistory.length;
       setComposerOpen(false);
       focusPreferredInput();
@@ -1022,6 +1102,8 @@ window.addEventListener('keydown', (event) => {
 
 input.addEventListener('focus', () => document.body.classList.add('composer-focused'));
 input.addEventListener('blur', () => document.body.classList.remove('composer-focused'));
+input.addEventListener('input', syncCommandInputDirection);
+syncCommandInputDirection();
 
 applyPanelMode();
 applyBidiMode();

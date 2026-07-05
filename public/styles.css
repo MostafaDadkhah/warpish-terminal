@@ -319,6 +319,15 @@ body.smart-input-mode #commandInput {
   text-align: start;
   font-family: "SF Mono", Menlo, Monaco, Consolas, "Noto Sans Arabic", Tahoma, monospace;
 }
+#commandInput[dir="rtl"] {
+  text-align: right;
+  direction: rtl;
+  font-family: "Noto Sans Arabic", Tahoma, "SF Mono", Menlo, Monaco, Consolas, monospace;
+}
+#commandInput[dir="ltr"] {
+  text-align: left;
+  direction: ltr;
+}
 #commandInput:focus {
   border-color: rgba(139, 92, 246, 0.75);
   box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.15);

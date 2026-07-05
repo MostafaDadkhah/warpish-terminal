@@ -20,7 +20,7 @@ Implemented capabilities:
   - click-to-reattach behavior.
 - Command composer and quick actions are opt-in tools (Cmd/Ctrl+K or Composer button) that send commands to the selected live session without stealing the default typing path.
 - Terminal-native typing means normal xterm input and output stay in one large terminal surface.
-- The command composer remains available for bidi-safe Persian/English command entry through Cmd/Ctrl+K, quick actions, or direct click; it keeps local history and `dir="auto"`/`unicode-bidi: plaintext`.
+- The command composer remains available for bidi-safe Persian/English command entry through Cmd/Ctrl+K, quick actions, or direct click; Persian/Arabic typing in the terminal auto-opens it, keeps local history, and sets `dir="rtl"`/right alignment for RTL-first text.
 - Live Persian/English reader is hidden by default and opens as an overlay, not a terminal-splitting panel.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
@@ -97,7 +97,7 @@ Terminal grids and tmux redraws are not a reliable place to solve every Unicode 
 
 - normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` appear where users expect;
 - the terminal owns the primary workspace height; composer, command blocks, and reader are collapsed by default so input/output are not visually split;
-- the command composer is an explicit browser input with `dir="auto"` and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable when the user focuses it with Cmd/Ctrl+K or click;
+- the command composer is an explicit browser input with `dir="auto"`/dynamic `rtl` direction and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable when the user focuses it with Cmd/Ctrl+K/click or starts typing Persian/Arabic in the terminal;
 - command history is persisted in `localStorage` and can be recalled with ArrowUp/ArrowDown while the composer is focused;
 - terminal rows get a CSS bidi hint when Bidi mode is enabled;
 - a live Bidi reader can be toggled as an overlay, mirrors recent xterm buffer lines into normal HTML, detects each line's first strong RTL/LTR character, and sets per-line direction;
@@ -133,6 +133,7 @@ Browser QA also verified:
 - new session creation works,
 - command composer executes in the real shell,
 - Direct xterm typing of `hermes chat` was dogfooded with headless Chrome/CDP and screenshot evidence; it stayed at the terminal prompt while composer, command blocks, and Bidi reader were hidden by default,
+- Persian terminal typing was dogfooded with headless Chrome/CDP: first RTL key auto-opened the composer, `سلام دنیا خوبی` rendered as `dir="rtl"`, right-aligned, with composer focused and blocks/reader still hidden,
 - terminal-native layout was verified with a 1072×780 terminal viewport in browser QA,
 - command composer submit, terminal focus retention, and ArrowUp history recall were verified with browser DOM/headless Chrome CDP evidence,
 - block panel renders block count and block cards,
@@ -145,7 +146,7 @@ Browser QA also verified:
 - This is not a full Warp clone; it implements the core local workflow primitives first.
 - Command-block output is a preview, not a perfect structured transcript for every possible full-screen/TUI command.
 - The Bidi reader solves readability for normal text output and command input; full-screen TUIs can still bypass this because they paint their own terminal grid.
-- Direct terminal typing is the default; use the explicit composer for bidi-heavy command input or browser-side history. Reader/blocks are opt-in so the terminal remains usable as a daily driver.
+- Direct terminal typing is the default; Persian/Arabic typing auto-opens the explicit RTL composer, and you can also use it manually for bidi-heavy command input or browser-side history. Reader/blocks are opt-in so the terminal remains usable as a daily driver.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.
 - No GitHub remote is configured yet unless one is added later.

@@ -149,6 +149,9 @@ try {
     && appJs.includes('warpish_composer_open')
     && appJs.includes('warpish_blocks_open')
     && appJs.includes('Direct terminal input')
+    && appJs.includes('shouldAutoOpenRtlComposer')
+    && appJs.includes('openComposerCapture')
+    && appJs.includes('commandInputDirection')
     && !appJs.includes('isAlternateBufferActive');
   if (!terminalNativeUiVerified) {
     throw new Error('terminal-native collapsible UI source verification failed');
