@@ -598,6 +598,18 @@ function killSession(id) {
   } catch {}
 }
 
+function purgeSession(id) {
+  const meta = readMetadata();
+  const record = meta.sessions?.[id];
+  if (!record) return false;
+  delete meta.sessions[id];
+  writeMetadata(meta);
+  if (record.eventFile) {
+    try { fs.unlinkSync(record.eventFile); } catch {}
+  }
+  return true;
+}
+
 function writeWorker(worker, message) {
   if (!worker.stdin.destroyed) {
     worker.stdin.write(`${JSON.stringify(message)}\n`);
@@ -681,6 +693,7 @@ app.delete('/api/sessions/:id', (req, res) => {
   const { id } = req.params;
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
   killSession(id);
+  if (req.query.purge === '1') purgeSession(id);
   res.json({ ok: true, sessions: summarizeSessions() });
 });
 

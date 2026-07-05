@@ -141,14 +141,17 @@ try {
   const health = await httpJson('/healthz');
   const indexHtml = await httpText('/', { token });
   const appJs = await httpText('/app.js', { token });
-  const terminalFirstUiVerified = indexHtml.includes('passthroughToggle')
-    && indexHtml.includes('inputModeHint')
-    && appJs.includes('direct-terminal-mode')
-    && appJs.includes('warpish_direct_terminal')
+  const terminalNativeUiVerified = indexHtml.includes('composerToggle')
+    && indexHtml.includes('blocksToggle')
+    && indexHtml.includes('Reader: off')
+    && appJs.includes('terminal-native-mode')
+    && appJs.includes('warpish_bidi_reader_v2')
+    && appJs.includes('warpish_composer_open')
+    && appJs.includes('warpish_blocks_open')
     && appJs.includes('Direct terminal input')
     && !appJs.includes('isAlternateBufferActive');
-  if (!terminalFirstUiVerified) {
-    throw new Error('terminal-first/raw-passthrough UI source verification failed');
+  if (!terminalNativeUiVerified) {
+    throw new Error('terminal-native collapsible UI source verification failed');
   }
   const created = await httpJson('/api/sessions', {
     method: 'POST',
@@ -206,7 +209,7 @@ try {
     createdSession: smokeSessionId,
     resumeVerified: Boolean(listedSession?.alive),
     sidebarPreviewHasMarker: Boolean(listedSession?.preview?.includes('__WARPISH_SMOKE__')),
-    terminalFirstUiVerified,
+    terminalNativeUiVerified,
     blockVerified: block.status === 'success' && block.output.includes('__WARPISH_SMOKE__'),
     blockCommand: block.command,
     blockStatus: block.status,
@@ -218,7 +221,7 @@ try {
   try {
     if (tokenUrl && smokeSessionId) {
       const token = new URL(tokenUrl).searchParams.get('token');
-      await httpJson(`/api/sessions/${smokeSessionId}`, { method: 'DELETE', token });
+      await httpJson(`/api/sessions/${smokeSessionId}?purge=1`, { method: 'DELETE', token });
     }
   } catch {}
   child.kill('SIGTERM');

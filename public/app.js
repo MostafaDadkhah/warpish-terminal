@@ -14,6 +14,8 @@ const sessionList = document.getElementById('sessionList');
 const newSessionButton = document.getElementById('newSession');
 const refreshSessionsButton = document.getElementById('refreshSessions');
 const renameSessionButton = document.getElementById('renameSession');
+const composerToggleButton = document.getElementById('composerToggle');
+const blocksToggleButton = document.getElementById('blocksToggle');
 const copySelection = document.getElementById('copySelection');
 const bidiToggleButton = document.getElementById('bidiToggle');
 const bidiReader = document.getElementById('bidiReader');
@@ -67,10 +69,12 @@ let refreshTimer = null;
 let blockFilter = '';
 let smartInputEnabled = localStorage.getItem('warpish_smart_input') !== 'off';
 let directTerminalEnabled = localStorage.getItem('warpish_direct_terminal') !== 'off';
+let composerOpen = localStorage.getItem('warpish_composer_open') === 'on';
+let blocksOpen = localStorage.getItem('warpish_blocks_open') === 'on';
 let autoRawInputReason = '';
 let commandHistory = [];
 let commandHistoryIndex = 0;
-let bidiReaderEnabled = localStorage.getItem('warpish_bidi_reader') !== 'off';
+let bidiReaderEnabled = localStorage.getItem('warpish_bidi_reader_v2') === 'on';
 let bidiReaderUpdatePending = false;
 
 try {
@@ -146,11 +150,48 @@ function scheduleBidiReaderUpdate() {
   });
 }
 
+function refitTerminal() {
+  requestAnimationFrame(() => {
+    try { if (fitAddon) fitAddon.fit(); } catch {}
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'resize', cols: term.cols || 120, rows: term.rows || 36 }));
+    }
+  });
+}
+
+function applyPanelMode() {
+  document.body.classList.add('terminal-native-mode');
+  document.body.classList.toggle('composer-open', composerOpen);
+  document.body.classList.toggle('blocks-open', blocksOpen);
+  if (composerToggleButton) composerToggleButton.textContent = composerOpen ? 'Hide composer' : 'Composer';
+  if (blocksToggleButton) blocksToggleButton.textContent = blocksOpen ? 'Hide blocks' : 'Blocks';
+  refitTerminal();
+}
+
+function setComposerOpen(open, { focus = false, select = false } = {}) {
+  composerOpen = Boolean(open);
+  localStorage.setItem('warpish_composer_open', composerOpen ? 'on' : 'off');
+  applyPanelMode();
+  if (composerOpen && focus) {
+    requestAnimationFrame(() => {
+      input.focus();
+      if (select) input.select();
+    });
+  }
+}
+
+function setBlocksOpen(open) {
+  blocksOpen = Boolean(open);
+  localStorage.setItem('warpish_blocks_open', blocksOpen ? 'on' : 'off');
+  applyPanelMode();
+}
+
 function applyBidiMode() {
   document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
-  if (bidiToggleButton) bidiToggleButton.textContent = `Bidi reader: ${bidiReaderEnabled ? 'on' : 'off'}`;
+  if (bidiToggleButton) bidiToggleButton.textContent = `Reader: ${bidiReaderEnabled ? 'on' : 'off'}`;
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
   if (bidiReaderEnabled) scheduleBidiReaderUpdate();
+  refitTerminal();
 }
 
 function isRawInputActive() {
@@ -184,6 +225,7 @@ function applySmartInputMode() {
 }
 
 function focusCommandInput({ select = false } = {}) {
+  if (!composerOpen) setComposerOpen(true);
   input.focus();
   if (select) input.select();
 }
@@ -546,7 +588,8 @@ function updateHeader() {
   }
   sessionTitle.textContent = session.title;
   sessionMeta.textContent = `${session.alive ? 'Live tmux session' : 'Stopped'} • ${session.cwd || '~'} • ${formatRelative(session.lastOpenedAt || session.createdAt)}`;
-  terminalTitle.textContent = `${session.title} — ${session.id}`;
+  terminalTitle.textContent = session.title;
+  terminalTitle.title = session.id;
 }
 
 function renderSessions() {
@@ -882,9 +925,15 @@ copySelection.addEventListener('click', async () => {
   await navigator.clipboard.writeText(text);
 });
 
+composerToggleButton?.addEventListener('click', () => {
+  setComposerOpen(!composerOpen, { focus: !composerOpen, select: !composerOpen });
+});
+
+blocksToggleButton?.addEventListener('click', () => setBlocksOpen(!blocksOpen));
+
 bidiToggleButton.addEventListener('click', () => {
   bidiReaderEnabled = !bidiReaderEnabled;
-  localStorage.setItem('warpish_bidi_reader', bidiReaderEnabled ? 'on' : 'off');
+  localStorage.setItem('warpish_bidi_reader_v2', bidiReaderEnabled ? 'on' : 'off');
   applyBidiMode();
 });
 
@@ -920,6 +969,7 @@ window.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       input.value = '';
       commandHistoryIndex = commandHistory.length;
+      setComposerOpen(false);
       focusPreferredInput();
       return;
     }
@@ -973,6 +1023,7 @@ window.addEventListener('keydown', (event) => {
 input.addEventListener('focus', () => document.body.classList.add('composer-focused'));
 input.addEventListener('blur', () => document.body.classList.remove('composer-focused'));
 
+applyPanelMode();
 applyBidiMode();
 applySmartInputMode();
 

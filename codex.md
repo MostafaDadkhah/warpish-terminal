@@ -117,10 +117,11 @@ zsh -n scripts/warpish-shell-integration.zsh
 ### Persian/English bidi readability
 
 - Direct xterm typing must remain the default for ordinary commands: typing `hermes chat` in the terminal should echo at the shell prompt, not in the top composer.
+- Keep the primary workspace terminal-native: composer, command blocks, and Bidi reader must be collapsed/hidden by default so input and output stay in one large terminal surface.
 - The command composer must keep `dir="auto"` and `unicode-bidi: plaintext` so mixed Persian/English input remains readable when the user explicitly focuses it.
 - Cmd/Ctrl+K should focus/select the composer; ArrowUp/ArrowDown history should work while the composer is focused.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
-- Keep the Bidi reader enabled by default; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
+- Keep the Bidi reader available as an overlay toggle; it mirrors recent xterm buffer lines into normal HTML and sets per-line `dir` from the first strong RTL/LTR character.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
 - Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
 - If changing xterm rendering or terminal layout, verify a line like `سلام Mostafa، command: git status و path: /Users/test خواناست` appears in the Bidi reader and command block output with `dir="rtl"` and `unicode-bidi: plaintext`.
@@ -176,6 +177,7 @@ Then open the app in Chrome and verify at least:
 - command blocks render and rerun works,
 - Bidi reader renders Persian/English mixed text in readable order,
 - direct xterm typing of `hermes chat` echoes at the terminal prompt rather than appearing in the top composer,
+- composer, command blocks, and Bidi reader are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
 - command composer submit/focus/history behavior works,
 - browser console has no JavaScript errors.
 
@@ -208,4 +210,4 @@ git diff --cached --stat
 - tmux capture/output boundaries are tricky; full-screen/TUI apps may not produce useful command block previews.
 - Browser screenshot tooling may fail in constrained local environments; use DOM/console/API evidence as fallback.
 - Unicode bidi is visual, not just data correctness: backend output can be correct while terminal rendering is unreadable. Verify the browser reader/styles too.
-- Keep direct terminal typing as the default. The visible toggle must allow composer-capture mode only as an opt-in, not as the default typing path.
+- Keep direct terminal typing as the default. Composer capture, command blocks, and reader must be opt-in/collapsible, not default surfaces that split input from output.
