@@ -653,6 +653,84 @@ function writeWorker(worker, message) {
   }
 }
 
+const TMUX_ESCAPE_KEYS = [
+  ['\x1b[A', 'Up'],
+  ['\x1b[B', 'Down'],
+  ['\x1b[C', 'Right'],
+  ['\x1b[D', 'Left'],
+  ['\x1b[H', 'Home'],
+  ['\x1b[F', 'End'],
+  ['\x1b[3~', 'Delete'],
+  ['\x1b[5~', 'PageUp'],
+  ['\x1b[6~', 'PageDown'],
+];
+
+function tmuxControlKey(code) {
+  if (code === 0) return 'C-Space';
+  if (code === 3) return 'C-c';
+  if (code === 4) return 'C-d';
+  if (code === 7) return 'C-g';
+  if (code === 9) return 'Tab';
+  if (code === 10 || code === 13) return 'Enter';
+  if (code === 12) return 'C-l';
+  if (code === 18) return 'C-r';
+  if (code === 21) return 'C-u';
+  if (code === 23) return 'C-w';
+  if (code === 27) return 'Escape';
+  if (code === 28) return 'C-\\';
+  if (code === 29) return 'C-]';
+  if (code === 30) return 'C-^';
+  if (code === 31) return 'C-_';
+  if (code === 127) return 'BSpace';
+  if (code >= 1 && code <= 26) return `C-${String.fromCharCode(96 + code)}`;
+  return null;
+}
+
+function sendTmuxLiteral(sessionId, literal) {
+  if (!literal) return;
+  runTmux(['send-keys', '-t', sessionId, '-l', literal]);
+}
+
+function sendTmuxKey(sessionId, key) {
+  runTmux(['send-keys', '-t', sessionId, key]);
+}
+
+function writeTmuxInput(sessionId, data) {
+  const value = String(data || '');
+  let literal = '';
+  const flushLiteral = () => {
+    if (!literal) return;
+    sendTmuxLiteral(sessionId, literal);
+    literal = '';
+  };
+
+  for (let index = 0; index < value.length;) {
+    const escape = TMUX_ESCAPE_KEYS.find(([sequence]) => value.startsWith(sequence, index));
+    if (escape) {
+      flushLiteral();
+      sendTmuxKey(sessionId, escape[1]);
+      index += escape[0].length;
+      continue;
+    }
+
+    const code = value.charCodeAt(index);
+    const controlKey = code < 32 || code === 127 ? tmuxControlKey(code) : null;
+    if (controlKey) {
+      flushLiteral();
+      sendTmuxKey(sessionId, controlKey);
+      index += 1;
+      continue;
+    }
+
+    const codePoint = value.codePointAt(index);
+    const char = String.fromCodePoint(codePoint);
+    literal += char;
+    index += char.length;
+  }
+  flushLiteral();
+  return true;
+}
+
 function createPtyWorker({ sessionId, cwd, cols, rows }) {
   const workerPath = path.join(__dirname, 'scripts/pty-worker.py');
   const env = {
@@ -879,7 +957,15 @@ wss.on('connection', (ws, req) => {
     }
 
     if (msg.type === 'input' && typeof msg.data === 'string') {
-      writeWorker(worker, { type: 'input', data: Buffer.from(msg.data, 'utf8').toString('base64') });
+      if (msg.directTmux) {
+        try {
+          writeTmuxInput(sessionId, msg.data);
+        } catch (error) {
+          sendControl({ type: 'server-error', message: `tmux input failed: ${error.message || error}` });
+        }
+      } else {
+        writeWorker(worker, { type: 'input', data: Buffer.from(msg.data, 'utf8').toString('base64') });
+      }
     } else if (msg.type === 'resize') {
       writeWorker(worker, {
         type: 'resize',

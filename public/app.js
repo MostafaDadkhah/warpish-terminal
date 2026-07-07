@@ -74,6 +74,12 @@ const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
 const BIDI_READER_MAX_LINES = 360;
 const BIDI_READER_RENDER_INTERVAL_MS = 70;
 const BIDI_READER_BOTTOM_EPSILON = 10;
+const XTERM_COLOR_MODE_PALETTE = 0x1000000;
+const XTERM_COLOR_MODE_RGB = 0x3000000;
+const ANSI_PALETTE = [
+  '#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
+  '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#ffffff',
+];
 const BLOCK_RENDER_LIMIT = 60;
 const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
 const SESSION_PREVIEW_CHARS = 900;
@@ -83,6 +89,7 @@ let lastBidiReaderRenderAt = 0;
 let lastBidiReaderRenderKey = '';
 let bidiReaderPinnedToBottom = true;
 let bidiReaderCaptureForScrollPending = false;
+let stalePromptRecoverySent = false;
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
   const value = String(text || '');
@@ -192,6 +199,143 @@ function normalizeReadableEntries(input = []) {
     .filter((entry) => entry.text.length || entry.ghostStart != null);
 }
 
+function rgbToHex(value) {
+  const color = Number(value) >>> 0;
+  return `#${color.toString(16).padStart(6, '0').slice(-6)}`;
+}
+
+function xtermPaletteColor(index, bold = false) {
+  const value = Number(index);
+  if (!Number.isFinite(value) || value < 0) return '';
+  if (value < 8 && bold) return ANSI_PALETTE[value + 8] || ANSI_PALETTE[value] || '';
+  if (value < ANSI_PALETTE.length) return ANSI_PALETTE[value] || '';
+  if (value >= 16 && value <= 231) {
+    const cube = value - 16;
+    const r = Math.floor(cube / 36);
+    const g = Math.floor((cube % 36) / 6);
+    const b = cube % 6;
+    const component = (n) => (n === 0 ? 0 : 55 + n * 40);
+    return `rgb(${component(r)}, ${component(g)}, ${component(b)})`;
+  }
+  if (value >= 232 && value <= 255) {
+    const gray = 8 + (value - 232) * 10;
+    return `rgb(${gray}, ${gray}, ${gray})`;
+  }
+  return '';
+}
+
+function xtermColor(mode, value, { bold = false } = {}) {
+  if (!mode || value == null || value < 0) return '';
+  if (mode === XTERM_COLOR_MODE_PALETTE) return xtermPaletteColor(value, bold);
+  if (mode === XTERM_COLOR_MODE_RGB || mode === 0x2000000) return rgbToHex(value);
+  return '';
+}
+
+function cellTextStyle(cell) {
+  if (!cell) return null;
+  const bold = Boolean(cell.isBold?.());
+  const dim = Boolean(cell.isDim?.());
+  const inverse = Boolean(cell.isInverse?.());
+  let fg = xtermColor(cell.getFgColorMode?.(), cell.getFgColor?.(), { bold });
+  let bg = xtermColor(cell.getBgColorMode?.(), cell.getBgColor?.());
+  if (inverse) [fg, bg] = [bg || 'var(--reader-fg)', fg || 'rgba(238, 234, 255, 0.16)'];
+  const style = {
+    fg,
+    bg,
+    bold,
+    dim,
+    italic: Boolean(cell.isItalic?.()),
+    underline: Boolean(cell.isUnderline?.()),
+    inverse,
+  };
+  return style;
+}
+
+function textStyleKey(style = {}) {
+  if (!style) return '';
+  return [style.fg || '', style.bg || '', style.bold ? 'b' : '', style.dim ? 'd' : '', style.italic ? 'i' : '', style.underline ? 'u' : '', style.inverse ? 'r' : ''].join('|');
+}
+
+function hasVisibleTextStyle(style = {}) {
+  return Boolean(style?.fg || style?.bg || style?.bold || style?.dim || style?.italic || style?.underline || style?.inverse);
+}
+
+function applyTextStyle(element, style = {}) {
+  if (!element || !hasVisibleTextStyle(style)) return;
+  element.classList.add('bidi-style-run');
+  if (style.fg) element.style.color = style.fg;
+  if (style.bg) element.style.backgroundColor = style.bg;
+  if (style.bold) element.style.fontWeight = '700';
+  if (style.dim) element.style.opacity = '0.62';
+  if (style.italic) element.style.fontStyle = 'italic';
+  if (style.underline) element.style.textDecoration = 'underline';
+}
+
+function mergeStyledSegment(segments, text, style) {
+  if (!text) return;
+  const normalizedStyle = hasVisibleTextStyle(style) ? style : null;
+  const key = textStyleKey(normalizedStyle);
+  const last = segments[segments.length - 1];
+  if (last && last.key === key) {
+    last.text += text;
+  } else {
+    segments.push({ text, style: normalizedStyle, key });
+  }
+}
+
+function sliceStyledSegments(segments = [], start = 0, end = Infinity) {
+  const result = [];
+  let offset = 0;
+  for (const segment of segments) {
+    const segStart = offset;
+    const segEnd = offset + segment.text.length;
+    offset = segEnd;
+    if (segEnd <= start || segStart >= end) continue;
+    const from = Math.max(0, start - segStart);
+    const to = Math.min(segment.text.length, end - segStart);
+    mergeStyledSegment(result, segment.text.slice(from, to), segment.style);
+  }
+  return result;
+}
+
+function getLineStyledSegments(line, text) {
+  if (!line || !text) return [];
+  const segments = [];
+  let collected = '';
+  for (let cellIndex = 0; cellIndex < line.length && collected.length < text.length; cellIndex += 1) {
+    const cell = line.getCell(cellIndex);
+    if (!cell || cell.getWidth?.() === 0) continue;
+    let chars = cell.getChars?.() || ' ';
+    if (!chars) chars = ' ';
+    if (collected.length + chars.length > text.length) chars = chars.slice(0, text.length - collected.length);
+    collected += chars;
+    mergeStyledSegment(segments, chars, cellTextStyle(cell));
+  }
+  return segments.some((segment) => hasVisibleTextStyle(segment.style)) ? segments : [];
+}
+
+function appendStyledBidiContent(element, text, segments = []) {
+  if (!segments?.length) {
+    renderBidiRuns(element, text);
+    return;
+  }
+  for (const segment of segments) {
+    const wrapper = document.createElement('span');
+    applyTextStyle(wrapper, segment.style);
+    renderBidiRuns(wrapper, segment.text || ' ');
+    element.appendChild(wrapper);
+  }
+}
+
+function appendStyledSegmentsToEntry(entry, text, segments = []) {
+  const offset = entry.text.length;
+  entry.text += text;
+  if (segments?.length) {
+    for (const segment of segments) mergeStyledSegment(entry.segments, segment.text, segment.style);
+  }
+  return offset;
+}
+
 function getReadableTerminalEntries(limit = BIDI_READER_MAX_LINES) {
   const buffer = term.buffer?.active;
   if (!buffer) return [];
@@ -204,21 +348,23 @@ function getReadableTerminalEntries(limit = BIDI_READER_MAX_LINES) {
     const line = buffer.getLine(i);
     if (!line) continue;
     const rawText = line.translateToString(true).trimEnd();
-    const entry = { text: rawText };
+    const styledSegments = getLineStyledSegments(line, rawText);
+    const entry = { text: '', segments: [], isActiveLine: i === activeLineIndex };
+    const appendedOffset = appendStyledSegmentsToEntry(entry, rawText, styledSegments);
     if (i === activeLineIndex && Number.isFinite(buffer.cursorX) && buffer.cursorX < rawText.length) {
-      entry.ghostStart = Math.max(0, buffer.cursorX);
+      entry.ghostStart = Math.max(0, appendedOffset + buffer.cursorX);
     }
     if (line.isWrapped && entries.length) {
       const previous = entries[entries.length - 1];
-      const offset = previous.text.length;
-      previous.text += rawText;
-      if (entry.ghostStart != null) previous.ghostStart = offset + entry.ghostStart;
+      const offset = appendStyledSegmentsToEntry(previous, rawText, styledSegments);
+      previous.isActiveLine = previous.isActiveLine || entry.isActiveLine;
+      if (entry.ghostStart != null) previous.ghostStart = offset + buffer.cursorX;
     } else {
       entries.push(entry);
     }
   }
 
-  while (entries.length && !entries[entries.length - 1].text.trim()) entries.pop();
+  while (entries.length && !entries[entries.length - 1].text.trim() && !entries[entries.length - 1].isActiveLine) entries.pop();
   return entries.slice(-limit);
 }
 
@@ -233,18 +379,22 @@ function isBidiReaderNearBottom() {
 
 function renderBidiLine(row, entry) {
   const text = entry.text || ' ';
+  const segments = Array.isArray(entry.segments) ? entry.segments : [];
   const ghostStart = Number.isFinite(entry.ghostStart) ? Math.max(0, Math.min(entry.ghostStart, text.length)) : null;
   row.className = `bidi-line ${bidiDirection(text)}`;
+  row.classList.toggle('active-cursor-line', Boolean(entry.isActiveLine));
   row.dataset.logicalText = text;
   if (ghostStart == null || ghostStart >= text.length) {
-    renderBidiRuns(row, text);
+    appendStyledBidiContent(row, text, segments);
     return;
   }
 
   const visibleText = text.slice(0, ghostStart) || ' ';
   const ghostText = text.slice(ghostStart);
+  const visibleSegments = sliceStyledSegments(segments, 0, ghostStart);
+  const ghostSegments = sliceStyledSegments(segments, ghostStart, text.length);
   row.classList.add('has-ghost');
-  renderBidiRuns(row, visibleText);
+  appendStyledBidiContent(row, visibleText, visibleSegments);
   const cursor = document.createElement('span');
   cursor.className = 'bidi-inline-cursor';
   cursor.textContent = '▌';
@@ -253,13 +403,18 @@ function renderBidiLine(row, entry) {
     const ghost = document.createElement('span');
     ghost.className = 'bidi-ghost';
     ghost.dataset.ghostText = ghostText;
-    renderBidiRuns(ghost, ghostText);
+    appendStyledBidiContent(ghost, ghostText, ghostSegments);
     row.appendChild(ghost);
   }
 }
 
 function readableEntriesKey(entries) {
-  return entries.map((entry) => `${entry.ghostStart ?? ''}\t${entry.text}`).join('\n');
+  return entries.map((entry) => {
+    const segmentKey = Array.isArray(entry.segments)
+      ? entry.segments.map((segment) => `${segment.key || textStyleKey(segment.style)}:${segment.text}`).join('|')
+      : '';
+    return `${entry.ghostStart ?? ''}\t${entry.text}\t${segmentKey}`;
+  }).join('\n');
 }
 
 function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false } = {}) {
@@ -718,6 +873,7 @@ function connectToSession(sessionId) {
   const serial = connectionSerial;
   disconnectCurrent({ quiet: true });
   currentSessionId = sessionId;
+  stalePromptRecoverySent = false;
   blocks = [];
   renderSessions();
   renderBlocks();
@@ -790,7 +946,7 @@ function connectToSession(sessionId) {
   });
 }
 
-function sendRaw(data) {
+function sendRaw(data, { directTmux = false } = {}) {
   if (!currentSessionId) {
     term.writeln('\r\n\x1b[31mNo session selected. Create or select a terminal first.\x1b[0m');
     scheduleBidiReaderUpdate();
@@ -798,10 +954,113 @@ function sendRaw(data) {
   }
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     connectToSession(currentSessionId);
-    setTimeout(() => sendRaw(data), 500);
+    setTimeout(() => sendRaw(data, { directTmux }), 500);
     return;
   }
-  ws.send(JSON.stringify({ type: 'input', data }));
+  ws.send(JSON.stringify({ type: 'input', data, directTmux }));
+}
+
+function isXtermHelperTarget(target) {
+  return Boolean(target?.classList?.contains('xterm-helper-textarea'));
+}
+
+function isTerminalKeyTarget(event) {
+  const target = event?.target;
+  if (!target || !terminalCard?.contains(target)) return false;
+  if (isXtermHelperTarget(target)) return true;
+  return !target.closest?.('button, input, textarea, select, a, [contenteditable="true"]');
+}
+
+function ctrlKeyData(key) {
+  if (!key) return null;
+  if (key === ' ') return '\x00';
+  if (key === '[') return '\x1b';
+  if (key === '\\') return '\x1c';
+  if (key === ']') return '\x1d';
+  if (key === '^') return '\x1e';
+  if (key === '_') return '\x1f';
+  const upper = key.toUpperCase();
+  if (upper.length === 1 && upper >= 'A' && upper <= 'Z') return String.fromCharCode(upper.charCodeAt(0) - 64);
+  return null;
+}
+
+function terminalKeyData(event) {
+  if (!event || event.isComposing || event.metaKey) return null;
+  if (event.ctrlKey) return ctrlKeyData(event.key);
+  if (event.altKey) return null;
+  const keyMap = {
+    Enter: '\r',
+    Backspace: '\x7f',
+    Tab: '\t',
+    Escape: '\x1b',
+    ArrowUp: '\x1b[A',
+    ArrowDown: '\x1b[B',
+    ArrowRight: '\x1b[C',
+    ArrowLeft: '\x1b[D',
+    Home: '\x1b[H',
+    End: '\x1b[F',
+    Delete: '\x1b[3~',
+    PageUp: '\x1b[5~',
+    PageDown: '\x1b[6~',
+  };
+  if (keyMap[event.key]) return keyMap[event.key];
+  if (event.key && event.key.length === 1) return event.key;
+  return null;
+}
+
+function currentCursorLineText() {
+  const buffer = term.buffer?.active;
+  if (!buffer) return '';
+  const line = buffer.getLine(buffer.baseY + buffer.cursorY);
+  return line?.translateToString(true).trimEnd() || '';
+}
+
+function looksLikeShellPrompt(text = '') {
+  return /(?:^|\s)[^\n]{0,160}(?:[%$#❯›➜>]\s*)(?:.*)$/u.test(String(text));
+}
+
+function looksLikePromptOnly(text = '') {
+  return /^[^\n]{0,160}(?:[%$#❯›➜>]\s*)$/u.test(String(text).trimEnd());
+}
+
+function shouldRecoverStalePromptBeforeInput(data) {
+  if (stalePromptRecoverySent || !bidiReaderEnabled || !data || data.length !== 1 || data < ' ') return false;
+  const activeLine = currentCursorLineText();
+  if (activeLine.trim()) return looksLikePromptOnly(activeLine);
+  const recentLines = getReadableTerminalLines(12).filter((line) => line.trim());
+  const lastNonEmpty = recentLines.at(-1) || '';
+  return looksLikeShellPrompt(lastNonEmpty);
+}
+
+function maybeRecoverStalePromptBeforeInput(data) {
+  if (!shouldRecoverStalePromptBeforeInput(data)) return false;
+  stalePromptRecoverySent = true;
+  sendRaw('\x07\x15', { directTmux: true });
+  return true;
+}
+
+function handleReadableTerminalKeydown(event) {
+  if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
+  const data = terminalKeyData(event);
+  if (!data) return;
+  event.preventDefault();
+  event.stopPropagation();
+  focusTerminalSoon();
+  if (maybeRecoverStalePromptBeforeInput(data)) {
+    setTimeout(() => sendRaw(data, { directTmux: true }), 80);
+  } else {
+    sendRaw(data, { directTmux: true });
+  }
+}
+
+function handleReadableTerminalPaste(event) {
+  if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
+  const text = event.clipboardData?.getData('text/plain');
+  if (!text) return;
+  event.preventDefault();
+  event.stopPropagation();
+  focusTerminalSoon();
+  sendRaw(text, { directTmux: true });
 }
 
 term.onData((data) => handleTerminalInput(data));
@@ -860,6 +1119,8 @@ terminalCard?.addEventListener('pointerdown', (event) => {
 terminalCard?.addEventListener('click', (event) => {
   if (!shouldPreserveControlFocus(event)) focusPreferredInput();
 });
+terminalCard?.addEventListener('keydown', handleReadableTerminalKeydown, { capture: true });
+terminalCard?.addEventListener('paste', handleReadableTerminalPaste, { capture: true });
 bidiReaderLines?.addEventListener('scroll', handleBidiReaderScroll, { passive: true });
 bidiReader?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 bidiReaderLines?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });

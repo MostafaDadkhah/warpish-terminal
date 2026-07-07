@@ -100,7 +100,7 @@ function httpText(pathname, { token } = {}) {
   });
 }
 
-async function wsUntilMarker({ token, sessionId, sendCommand, markerRegex }) {
+async function wsUntilMarker({ token, sessionId, sendCommand, markerRegex, directTmux = false }) {
   const wsUrl = new URL('/ws', tokenUrl);
   wsUrl.protocol = 'ws:';
   wsUrl.searchParams.set('token', token);
@@ -115,7 +115,7 @@ async function wsUntilMarker({ token, sessionId, sendCommand, markerRegex }) {
 
     ws.on('open', () => {
       if (sendCommand) {
-        setTimeout(() => ws.send(JSON.stringify({ type: 'input', data: sendCommand })), 500);
+        setTimeout(() => ws.send(JSON.stringify({ type: 'input', data: sendCommand, directTmux })), 500);
       }
     });
 
@@ -158,6 +158,7 @@ try {
   const indexHtml = await httpText('/', { token });
   const appJs = await httpText('/app.js', { token });
   const stylesCss = await httpText('/styles.css', { token });
+  const serverJs = fs.readFileSync(path.join(projectRoot, 'server.js'), 'utf8');
   const terminalNativeUiVerified = !indexHtml.includes('terminal-input-mask')
     && !indexHtml.includes('composerToggle')
     && indexHtml.includes('clearStoppedSessions')
@@ -168,6 +169,14 @@ try {
     && appJs.includes('warpish_blocks_open')
     && appJs.includes('function handleTerminalInput(data)')
     && appJs.includes('sendRaw(data)')
+    && appJs.includes('directTmux')
+    && appJs.includes('function handleReadableTerminalKeydown(event)')
+    && appJs.includes('function looksLikePromptOnly(text =')
+    && appJs.includes('XTERM_COLOR_MODE_PALETTE')
+    && appJs.includes('function getLineStyledSegments(line, text)')
+    && appJs.includes('function applyTextStyle(element, style = {})')
+    && serverJs.includes('function writeTmuxInput(sessionId, data)')
+    && serverJs.includes("['\\x1b[A', 'Up']")
     && !appJs.includes('warpish_composer_open')
     && !appJs.includes('shouldAutoOpenRtlComposer')
     && !appJs.includes('openComposerCapture')
@@ -191,6 +200,8 @@ try {
     && stylesCss.includes('.bidi-segment.rtl')
     && stylesCss.includes('.bidi-ghost')
     && stylesCss.includes('.bidi-inline-cursor')
+    && stylesCss.includes('.bidi-style-run')
+    && stylesCss.includes('--reader-fg')
     && stylesCss.includes('pointer-events: auto')
     && stylesCss.includes('overscroll-behavior: contain')
     && stylesCss.includes('body.bidi-mode #terminal .xterm-screen')
@@ -232,6 +243,14 @@ try {
     markerRegex,
   });
   const marker = resumedOutput.match(markerRegex)?.[0] || 'marker-found';
+  const directTmuxText = '__WARPISH_DIRECT_TMUX__';
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `echo ${directTmuxText}\r`,
+    markerRegex: new RegExp(directTmuxText),
+    directTmux: true,
+  });
   const block = await waitForBlock({
     token,
     sessionId: smokeSessionId,
@@ -288,6 +307,7 @@ try {
     resumeVerified: Boolean(listedSession?.alive),
     sidebarPreviewHasMarker: Boolean(listedSession?.preview?.includes('__WARPISH_SMOKE__')),
     terminalNativeUiVerified,
+    directTmuxInputVerified: true,
     blockVerified: block.status === 'success' && block.output.includes('__WARPISH_SMOKE__'),
     blockCommand: block.command,
     blockStatus: block.status,

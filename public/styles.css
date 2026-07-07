@@ -479,6 +479,7 @@ button.danger:hover { border-color: rgba(251, 113, 133, 0.7); color: #fecdd3; }
   border: 1px solid rgba(34, 211, 238, 0.18);
   border-radius: 18px;
   background: rgba(2, 6, 23, 0.96);
+  --reader-fg: #eeeaff;
   box-shadow: 0 16px 60px rgba(0, 0, 0, 0.42), inset 0 0 0 1px rgba(139, 92, 246, 0.06);
   pointer-events: auto;
 }
@@ -520,7 +521,7 @@ body.bidi-mode #terminal .xterm-cursor-layer {
   white-space: pre-wrap;
   unicode-bidi: isolate;
   overflow-wrap: anywhere;
-  color: #eeeaff;
+  color: var(--reader-fg, #eeeaff);
   font-family: "SF Mono", Menlo, Monaco, Consolas, "Noto Sans Arabic", Tahoma, monospace;
   font-size: 12px;
   line-height: 1.65;
@@ -533,6 +534,16 @@ body.bidi-mode #terminal .xterm-cursor-layer {
 .bidi-line.ltr {
   direction: ltr;
   text-align: left;
+}
+.bidi-line.active-cursor-line {
+  min-height: 1.65em;
+}
+.bidi-style-run {
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.bidi-style-run .bidi-run {
+  color: inherit;
 }
 .bidi-ghost {
   color: #8b86a8;
