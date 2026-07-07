@@ -9,7 +9,7 @@ What it does:
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
 - Adds Warp-style command blocks for new sessions; the block panel is hidden by default and opens only when you ask for it.
-- Uses a terminal-native layout: normal xterm typing/output stay in one large terminal surface, while Cmd/Ctrl+K opens an optional bidi-safe input mask over the terminal, Persian/Arabic typing at the prompt auto-opens that RTL mask, and the Persian/English reader is an overlay backed by tmux capture when terminal apps trap scroll.
+- Uses a terminal-native layout: normal xterm input goes to the real shell, while input echo and output are shown through a default readable terminal mask with bidi/plaintext HTML line rendering. You can toggle back to raw xterm with `Readable: off` for edge-case TUIs.
 - Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
 
 Requirements already present on this Mac:

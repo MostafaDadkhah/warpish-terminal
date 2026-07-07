@@ -19,10 +19,9 @@ Implemented capabilities:
   - recent output preview,
   - click-to-reattach behavior,
   - clear-stopped-history control that purges only stopped metadata/events and keeps live `tmux` sessions running.
-- Terminal input mask and quick actions are opt-in tools (Cmd/Ctrl+K or Mask button) that sit over the selected live terminal and send commands to that session without stealing the default typing path.
-- Terminal-native typing means normal xterm input and output stay in one large terminal surface.
-- The terminal input mask remains available for bidi-safe Persian/English command entry through Cmd/Ctrl+K, quick actions, or direct click; it is positioned inside the terminal card, Persian/Arabic typing in the terminal auto-opens it, keeps local history, and sets `dir="rtl"`/right alignment for RTL-first text.
-- Live Persian/English reader is hidden by default and opens as an overlay, not a terminal-splitting panel; when terminal apps trap xterm scrollback, it can render tmux-captured pane text as normal scrollable HTML.
+- Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
+- Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi/plaintext styling by default so mixed Persian/English terminal input/output is readable in the primary surface.
+- The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
   - command text,
@@ -46,7 +45,7 @@ Main files:
 - `scripts/warpish-shell-integration.zsh` — scoped zsh integration that emits command start/end events through `preexec`/`precmd`.
 - `public/index.html` — app shell markup.
 - `public/app.js` — browser state, WebSocket handling, xterm.js integration, session list, command blocks UI.
-- `public/styles.css` — visual design for sidebar, terminal, input mask, reader overlay, and block panel.
+- `public/styles.css` — visual design for sidebar, terminal, default bidi/plaintext terminal styling, reader overlay, and block panel.
 - `scripts/smoke.js` — end-to-end smoke test for server health, isolated session creation, reconnect/resume, command-block capture, bidi output, and stopped-history cleanup.
 - `start.sh` / `stop.sh` — local lifecycle helpers.
 - `README.md` — user-facing run/security notes.
@@ -93,16 +92,14 @@ Attached tmux panes can replay/redraw screen content, and raw WebSocket data is 
 
 This avoids block output being polluted by unrelated redraws or repeated terminal history.
 
-### 4. Persian/English readability is handled outside the raw terminal grid
+### 4. Persian/English readability defaults to the terminal surface
 
-Terminal grids and tmux redraws are not a reliable place to solve every Unicode bidirectional edge case. The app now uses a layered approach:
+The primary product goal is a readable terminal, so the default path keeps input in the real xterm/PTY path while rendering input echo and output through a readable terminal mask instead of splitting commands into a separate input mask/composer. The app uses a layered approach:
 
-- normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` appear where users expect;
-- the terminal owns the primary workspace height; input mask, command blocks, and reader are collapsed by default so input/output are not visually split;
-- the terminal input mask is an explicit browser input over the terminal with `dir="auto"`/dynamic `rtl` direction and `unicode-bidi: plaintext`, so mixed Persian/English commands remain readable when the user focuses it with Cmd/Ctrl+K/click or starts typing Persian/Arabic in the terminal;
-- command history is persisted in `localStorage` and can be recalled with ArrowUp/ArrowDown while the mask is focused;
-- terminal rows get a CSS bidi hint when Bidi mode is enabled;
-- a live Bidi reader can be toggled as an overlay, mirrors recent xterm or tmux-captured pane lines into normal HTML, detects each line's first strong RTL/LTR character, and sets per-line direction;
+- normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` execute where users expect;
+- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, and sets per-line direction from the first strong RTL/LTR character;
+- the terminal owns the primary workspace height; command blocks are opt-in/collapsible so input/output are not visually split;
+- raw terminal rows and the xterm helper textarea still get `unicode-bidi: plaintext`/auto-direction styling as fallback;
 - command blocks and sidebar previews also use bidi plaintext styling and direction detection.
 
 This is especially important for Hermes/Persian output, where raw terminal ordering can be unreadable when English paths, commands, and Persian prose are mixed.
@@ -136,12 +133,11 @@ Browser QA also verified:
 - Chrome UI loads,
 - session sidebar renders,
 - new session creation works,
-- command input mask executes in the real shell,
-- Direct xterm typing of `hermes chat` was dogfooded with headless Chrome/CDP and screenshot evidence; it stayed at the terminal prompt while input mask, command blocks, and Bidi reader were hidden by default,
-- Persian terminal typing was dogfooded with headless Chrome/CDP: first RTL key auto-opened the terminal input mask over the terminal, `سلام دنیا خوبی` rendered as `dir="rtl"`, right-aligned, with mask focused and blocks/reader still hidden,
-- `hermes --resume 20260706_010032_731a69` was dogfooded in a disposable Warpish session: the backend stayed connected after resume, the mask still toggled, and wheel over a no-scrollback Hermes full-screen view opened a tmux-backed Bidi reader overlay instead of freezing the UI,
+- direct terminal input executes in the real shell,
+- the readable terminal mask is default-on and covers the terminal surface without adding a separate input section,
+- Direct xterm typing of `hermes chat` was dogfooded with headless Chrome/CDP and screenshot evidence; it stayed in the terminal workflow while command blocks stayed hidden by default,
+- `hermes --resume 20260706_010032_731a69` was dogfooded in a disposable Warpish session: the backend stayed connected after resume, and wheel over a no-scrollback Hermes full-screen view opened a tmux-backed Bidi reader overlay instead of freezing the UI,
 - terminal-native layout was verified with a 1072×780 terminal viewport in browser QA,
-- input mask submit, terminal focus retention, and ArrowUp history recall were verified with browser DOM/headless Chrome CDP evidence,
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
@@ -151,8 +147,8 @@ Browser QA also verified:
 
 - This is not a full Warp clone; it implements the core local workflow primitives first.
 - Command-block output is a preview, not a perfect structured transcript for every possible full-screen/TUI command.
-- The Bidi reader solves readability for normal text output and command input; full-screen TUIs can still bypass this because they paint their own terminal grid.
-- Direct terminal typing is the default; Persian/Arabic typing auto-opens the explicit RTL input mask over the terminal, and you can also use it manually for bidi-heavy command input or browser-side history. Reader/blocks are opt-in so the terminal remains usable as a daily driver.
+- Default readable terminal-mask rendering improves readability for normal text input echo/output; full-screen TUIs can still bypass this because they paint their own terminal grid.
+- Direct terminal typing is the only default input path; no input-mask section should split commands away from output. The readable mask is default-on, while raw xterm and blocks remain toggles so the terminal remains usable as a daily driver.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.
 - No GitHub remote is configured yet unless one is added later.

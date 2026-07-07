@@ -157,24 +157,30 @@ try {
   const health = await httpJson('/healthz');
   const indexHtml = await httpText('/', { token });
   const appJs = await httpText('/app.js', { token });
-  const terminalNativeUiVerified = indexHtml.includes('terminal-input-mask')
-    && indexHtml.includes('composerToggle')
+  const stylesCss = await httpText('/styles.css', { token });
+  const terminalNativeUiVerified = !indexHtml.includes('terminal-input-mask')
+    && !indexHtml.includes('composerToggle')
     && indexHtml.includes('clearStoppedSessions')
     && indexHtml.includes('blocksToggle')
-    && indexHtml.includes('Reader: off')
+    && indexHtml.includes('Readable: on')
     && appJs.includes('terminal-native-mode')
-    && appJs.includes('warpish_bidi_reader_v2')
-    && appJs.includes('warpish_composer_open')
+    && appJs.includes('warpish_readable_terminal_v1')
     && appJs.includes('warpish_blocks_open')
-    && appJs.includes('Direct terminal input')
-    && appJs.includes('shouldAutoOpenRtlComposer')
-    && appJs.includes('openComposerCapture')
-    && appJs.includes('commandInputDirection')
+    && appJs.includes('function handleTerminalInput(data)')
+    && appJs.includes('sendRaw(data)')
+    && !appJs.includes('warpish_composer_open')
+    && !appJs.includes('shouldAutoOpenRtlComposer')
+    && !appJs.includes('openComposerCapture')
+    && !appJs.includes('commandInputDirection')
+    && stylesCss.includes('#terminal .xterm-rows > div')
+    && stylesCss.includes('body.bidi-mode #terminal .xterm-screen')
+    && stylesCss.includes("content: '▌'")
+    && stylesCss.includes('unicode-bidi: plaintext')
     && appJs.includes('scrollLines')
     && appJs.includes('BLOCK_OUTPUT_PREVIEW_CHARS')
     && !appJs.includes('isAlternateBufferActive');
   if (!terminalNativeUiVerified) {
-    throw new Error('terminal-native collapsible UI source verification failed');
+    throw new Error('terminal-native raw/default-readable UI source verification failed');
   }
   const created = await httpJson('/api/sessions', {
     method: 'POST',
