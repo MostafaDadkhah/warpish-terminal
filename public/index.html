@@ -22,7 +22,10 @@
 
         <div class="sidebar-section-head">
           <span>Session history</span>
-          <button id="refreshSessions" title="Refresh session list">↻</button>
+          <div class="session-history-actions">
+            <button id="clearStoppedSessions" title="Clear stopped sessions from history; live tmux sessions are kept">Clear</button>
+            <button id="refreshSessions" title="Refresh session list">↻</button>
+          </div>
         </div>
 
         <div id="sessionList" class="session-list" aria-label="Terminal sessions"></div>

@@ -111,13 +111,29 @@ button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 10px;
   color: var(--muted);
   font-size: 12px;
   text-transform: uppercase;
   letter-spacing: .12em;
   font-weight: 800;
 }
+.session-history-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
 .sidebar-section-head button { padding: 5px 8px; border-radius: 10px; }
+#clearStoppedSessions {
+  max-width: 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: normal;
+  text-transform: none;
+}
 
 .session-list {
   min-height: 0;

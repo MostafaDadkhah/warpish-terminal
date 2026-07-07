@@ -13,6 +13,7 @@ const terminalTitle = document.getElementById('terminalTitle');
 const sessionList = document.getElementById('sessionList');
 const newSessionButton = document.getElementById('newSession');
 const refreshSessionsButton = document.getElementById('refreshSessions');
+const clearStoppedSessionsButton = document.getElementById('clearStoppedSessions');
 const renameSessionButton = document.getElementById('renameSession');
 const composerToggleButton = document.getElementById('composerToggle');
 const blocksToggleButton = document.getElementById('blocksToggle');
@@ -221,7 +222,7 @@ function setBlocksOpen(open) {
   blocksOpen = Boolean(open);
   localStorage.setItem('warpish_blocks_open', blocksOpen ? 'on' : 'off');
   applyPanelMode();
-  if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(console.error);
+  if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
 }
 
 function applyBidiMode() {
@@ -424,8 +425,8 @@ function submitCommand(command) {
   setComposerOpen(false);
   focusPreferredInput();
   setTimeout(() => {
-    refreshSessions().catch(console.error);
-    if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(console.error);
+    refreshSessions().catch(() => {});
+    if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
   }, 1200);
 }
 
@@ -683,8 +684,19 @@ function updateHeader() {
   terminalTitle.title = session.id;
 }
 
+function updateSessionHistoryActions() {
+  if (!clearStoppedSessionsButton) return;
+  const stoppedCount = sessions.filter((session) => !session.alive).length;
+  clearStoppedSessionsButton.disabled = stoppedCount === 0;
+  clearStoppedSessionsButton.textContent = stoppedCount ? `Clear (${stoppedCount})` : 'Clear';
+  clearStoppedSessionsButton.title = stoppedCount
+    ? `Clear ${stoppedCount} stopped session${stoppedCount === 1 ? '' : 's'} from history; live tmux sessions are kept`
+    : 'No stopped sessions to clear';
+}
+
 function renderSessions() {
   sessionList.innerHTML = '';
+  updateSessionHistoryActions();
   if (!sessions.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
@@ -867,8 +879,28 @@ async function refreshSessions({ selectId, createIfEmpty = false } = {}) {
     || sessions.find((session) => session.alive)?.id;
 
   if (targetId && targetId !== currentSessionId) connectToSession(targetId);
-  else if (targetId && blocksOpen) loadBlocks(targetId, { force: true }).catch(console.error);
+  else if (targetId && blocksOpen) loadBlocks(targetId, { force: true }).catch(() => {});
   if (!targetId) updateHeader();
+}
+
+async function clearStoppedSessions() {
+  const stoppedCount = sessions.filter((session) => !session.alive).length;
+  if (!stoppedCount) return;
+  if (!window.confirm(`Clear ${stoppedCount} stopped session${stoppedCount === 1 ? '' : 's'} from history? Live tmux sessions stay running.`)) return;
+  clearStoppedSessionsButton.disabled = true;
+  try {
+    const payload = await api('/api/sessions?stopped=1', { method: 'DELETE' });
+    sessions = payload.sessions || [];
+    if (currentSessionId && !sessions.some((session) => session.id === currentSessionId && session.alive)) currentSessionId = null;
+    renderSessions();
+    setStatus('ok', 'history cleaned', `${payload.purged?.length || stoppedCount} stopped removed`);
+    const target = currentSessionId || sessions.find((session) => session.alive)?.id;
+    if (target && target !== currentSessionId) connectToSession(target);
+  } catch (error) {
+    setStatus('bad', 'clear failed', error.message);
+  } finally {
+    updateSessionHistoryActions();
+  }
 }
 
 function socketUrl(sessionId) {
@@ -902,7 +934,7 @@ function connectToSession(sessionId) {
   blocks = [];
   renderSessions();
   renderBlocks();
-  if (blocksOpen) loadBlocks(sessionId, { force: true }).catch(console.error);
+  if (blocksOpen) loadBlocks(sessionId, { force: true }).catch(() => {});
   term.reset();
   scheduleBidiReaderUpdate();
   setStatus('warn', 'attaching…', session.title);
@@ -956,8 +988,8 @@ function connectToSession(sessionId) {
       setStatus('bad', 'disconnected', 'click session to attach again');
     }
     setTimeout(() => {
-      refreshSessions().catch(console.error);
-      if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(console.error);
+      refreshSessions().catch(() => {});
+      if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
     }, 300);
   });
 
@@ -1056,6 +1088,7 @@ newSessionButton.addEventListener('click', async () => {
 });
 
 refreshSessionsButton.addEventListener('click', () => refreshSessions().catch((error) => setStatus('bad', 'refresh failed', error.message)));
+clearStoppedSessionsButton?.addEventListener('click', () => clearStoppedSessions());
 refreshBlocksButton.addEventListener('click', () => loadBlocks(currentSessionId, { force: true }).catch((error) => setStatus('bad', 'blocks refresh failed', error.message)));
 blockSearch.addEventListener('input', () => {
   blockFilter = blockSearch.value.trim();

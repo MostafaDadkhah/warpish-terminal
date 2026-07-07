@@ -1,12 +1,27 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import process from 'node:process';
 import WebSocket from 'ws';
 
 const port = Number(process.env.PORT || 8876);
+const projectRoot = new URL('..', import.meta.url).pathname;
+const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'warpish-smoke-'));
+const smokeDataDir = path.join(smokeRoot, 'data');
+const smokeTokenFile = path.join(smokeRoot, 'token');
+const smokePrefix = `warpishsmoke-${process.pid.toString(36)}-`;
 const child = spawn(process.execPath, ['server.js'], {
-  cwd: new URL('..', import.meta.url).pathname,
-  env: { ...process.env, PORT: String(port), HOST: '127.0.0.1' },
+  cwd: projectRoot,
+  env: {
+    ...process.env,
+    PORT: String(port),
+    HOST: '127.0.0.1',
+    WARPISH_DATA_DIR: smokeDataDir,
+    WARPISH_TOKEN_FILE: smokeTokenFile,
+    WARPISH_SESSION_PREFIX: smokePrefix,
+  },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 
@@ -14,6 +29,7 @@ let stdout = '';
 let stderr = '';
 let tokenUrl;
 let smokeSessionId;
+let stoppedCleanupSessionId;
 
 child.stdout.on('data', (chunk) => {
   stdout += chunk.toString();
@@ -143,6 +159,7 @@ try {
   const appJs = await httpText('/app.js', { token });
   const terminalNativeUiVerified = indexHtml.includes('terminal-input-mask')
     && indexHtml.includes('composerToggle')
+    && indexHtml.includes('clearStoppedSessions')
     && indexHtml.includes('blocksToggle')
     && indexHtml.includes('Reader: off')
     && appJs.includes('terminal-native-mode')
@@ -206,6 +223,28 @@ try {
     outputNeedle: bidiText,
   });
 
+  const stoppedCreated = await httpJson('/api/sessions', {
+    method: 'POST',
+    token,
+    body: { title: 'Stopped cleanup smoke' },
+  });
+  stoppedCleanupSessionId = stoppedCreated.session.id;
+  await httpJson(`/api/sessions/${stoppedCleanupSessionId}`, { method: 'DELETE', token });
+  const beforeCleanup = await httpJson('/api/sessions', { token });
+  const stoppedBeforeCleanup = beforeCleanup.sessions.find((session) => session.id === stoppedCleanupSessionId);
+  if (!stoppedBeforeCleanup || stoppedBeforeCleanup.alive) {
+    throw new Error(`stopped cleanup fixture was not stopped. sessions=${JSON.stringify(beforeCleanup.sessions)}`);
+  }
+  const cleanupPayload = await httpJson('/api/sessions?stopped=1', { method: 'DELETE', token });
+  const liveAfterCleanup = cleanupPayload.sessions.find((session) => session.id === smokeSessionId);
+  const stoppedAfterCleanup = cleanupPayload.sessions.find((session) => session.id === stoppedCleanupSessionId);
+  const stoppedCleanupVerified = Boolean(cleanupPayload.purged?.includes(stoppedCleanupSessionId))
+    && Boolean(liveAfterCleanup?.alive)
+    && !stoppedAfterCleanup;
+  if (!stoppedCleanupVerified) {
+    throw new Error(`stopped cleanup failed. payload=${JSON.stringify(cleanupPayload)}`);
+  }
+
   const listed = await httpJson('/api/sessions', { token });
   const listedSession = listed.sessions.find((session) => session.id === smokeSessionId);
 
@@ -221,14 +260,22 @@ try {
     blockStatus: block.status,
     bidiBlockVerified: bidiBlock.status === 'success' && bidiBlock.output.includes(bidiText),
     bidiBlockOutput: bidiBlock.output,
+    stoppedCleanupVerified,
+    stoppedCleanupPurged: cleanupPayload.purged,
+    isolatedRuntime: {
+      dataDir: smokeDataDir,
+      sessionPrefix: smokePrefix,
+    },
     marker,
   }, null, 2));
 } finally {
   try {
-    if (tokenUrl && smokeSessionId) {
+    if (tokenUrl) {
       const token = new URL(tokenUrl).searchParams.get('token');
-      await httpJson(`/api/sessions/${smokeSessionId}?purge=1`, { method: 'DELETE', token });
+      if (smokeSessionId) await httpJson(`/api/sessions/${smokeSessionId}?purge=1`, { method: 'DELETE', token });
+      if (stoppedCleanupSessionId) await httpJson(`/api/sessions/${stoppedCleanupSessionId}?purge=1`, { method: 'DELETE', token });
     }
   } catch {}
   child.kill('SIGTERM');
+  try { fs.rmSync(smokeRoot, { recursive: true, force: true }); } catch {}
 }

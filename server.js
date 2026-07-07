@@ -17,15 +17,15 @@ const PORT = Number(process.env.PORT || 8765);
 const SHELL = process.env.SHELL || '/bin/zsh';
 const PYTHON = process.env.PYTHON || '/usr/bin/python3';
 const TMUX = process.env.TMUX_BIN || findExecutable(['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'], 'tmux');
-const PREFIX = 'warpish-';
-const DATA_DIR = path.join(__dirname, '.warpish');
+const PREFIX = (process.env.WARPISH_SESSION_PREFIX || 'warpish-').replace(/[^a-z0-9-]/gi, '').toLowerCase() || 'warpish-';
+const DATA_DIR = path.resolve(process.env.WARPISH_DATA_DIR || path.join(__dirname, '.warpish'));
 const METADATA_FILE = path.join(DATA_DIR, 'sessions.json');
 const ZDOTDIR = path.join(DATA_DIR, 'zdotdir');
 const EVENTS_DIR = path.join(DATA_DIR, 'events');
 const SHELL_INTEGRATION = path.join(__dirname, 'scripts/warpish-shell-integration.zsh');
 const MAX_BLOCKS_PER_SESSION = 300;
 const MAX_BLOCK_OUTPUT_CHARS = 24000;
-const TOKEN_FILE = path.join(__dirname, '.auth-token');
+const TOKEN_FILE = path.resolve(process.env.WARPISH_TOKEN_FILE || path.join(__dirname, '.auth-token'));
 const TOKEN = process.env.WARPISH_TOKEN || readOrCreateToken(TOKEN_FILE);
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -625,6 +625,24 @@ function purgeSession(id) {
   return true;
 }
 
+function purgeStoppedSessions() {
+  const meta = readMetadata();
+  const active = listActiveTmuxSessions();
+  const purged = [];
+
+  for (const [id, record] of Object.entries(meta.sessions || {})) {
+    if (active.has(id)) continue;
+    purged.push(id);
+    delete meta.sessions[id];
+    if (record.eventFile) {
+      try { fs.unlinkSync(record.eventFile); } catch {}
+    }
+  }
+
+  if (purged.length) writeMetadata(meta);
+  return purged;
+}
+
 function writeWorker(worker, message) {
   if (!worker?.stdin || worker.stdin.destroyed || !worker.stdin.writable) return false;
   try {
@@ -683,6 +701,12 @@ app.get('/healthz', (_req, res) => {
 
 app.get('/api/sessions', (_req, res) => {
   res.json({ sessions: summarizeSessions() });
+});
+
+app.delete('/api/sessions', (req, res) => {
+  if (req.query.stopped !== '1') return res.status(400).json({ error: 'set stopped=1 to clear stopped session history' });
+  const purged = purgeStoppedSessions();
+  res.json({ ok: true, purged, sessions: summarizeSessions() });
 });
 
 app.post('/api/sessions', (req, res) => {

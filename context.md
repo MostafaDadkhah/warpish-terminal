@@ -17,7 +17,8 @@ Implemented capabilities:
   - live/stopped state,
   - attached count,
   - recent output preview,
-  - click-to-reattach behavior.
+  - click-to-reattach behavior,
+  - clear-stopped-history control that purges only stopped metadata/events and keeps live `tmux` sessions running.
 - Terminal input mask and quick actions are opt-in tools (Cmd/Ctrl+K or Mask button) that sit over the selected live terminal and send commands to that session without stealing the default typing path.
 - Terminal-native typing means normal xterm input and output stay in one large terminal surface.
 - The terminal input mask remains available for bidi-safe Persian/English command entry through Cmd/Ctrl+K, quick actions, or direct click; it is positioned inside the terminal card, Persian/Arabic typing in the terminal auto-opens it, keeps local history, and sets `dir="rtl"`/right alignment for RTL-first text.
@@ -46,7 +47,7 @@ Main files:
 - `public/index.html` — app shell markup.
 - `public/app.js` — browser state, WebSocket handling, xterm.js integration, session list, command blocks UI.
 - `public/styles.css` — visual design for sidebar, terminal, input mask, reader overlay, and block panel.
-- `scripts/smoke.js` — end-to-end smoke test for server health, session creation, reconnect/resume, and command-block capture.
+- `scripts/smoke.js` — end-to-end smoke test for server health, isolated session creation, reconnect/resume, command-block capture, bidi output, and stopped-history cleanup.
 - `start.sh` / `stop.sh` — local lifecycle helpers.
 - `README.md` — user-facing run/security notes.
 - `.gitignore` — excludes runtime state, token, logs, and dependencies.
@@ -71,6 +72,7 @@ Important behavior:
 - Attach session: backend starts `tmux attach-session` inside `scripts/pty-worker.py`.
 - Detach: browser/WS close stops the attach process only.
 - Kill: UI/API explicitly kills the backing tmux session.
+- Clear stopped history: UI/API removes only metadata/event files for sessions with no active `tmux` backing session.
 - Previews: backend uses `tmux capture-pane` for sidebar previews and smoke-test resume evidence.
 
 ### 2. Command blocks use scoped shell integration
@@ -118,13 +120,16 @@ The repository tracks source, docs, scripts, and lockfiles only. It must not tra
 Local smoke test passed with these checks:
 
 - server health endpoint returned ok,
+- smoke ran against an isolated temporary runtime directory/token/session prefix rather than the real `.warpish` state,
 - a session was created,
 - a command marker was sent through the browser/PTY path,
 - session resume was verified after reconnect,
 - sidebar preview contained the marker,
 - command block capture was verified,
 - block command was recorded,
-- block status was `success`.
+- block status was `success`,
+- mixed Persian/English command-block output was verified,
+- stopped-history cleanup purged a stopped fixture while keeping a live smoke session alive.
 
 Browser QA also verified:
 

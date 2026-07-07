@@ -110,7 +110,8 @@ zsh -n scripts/warpish-shell-integration.zsh
 
 - `scripts/smoke.js`
   - End-to-end regression test.
-  - Must keep proving session resume and command-block capture.
+  - Runs against a temporary `WARPISH_DATA_DIR`, token file, and session prefix so smoke sessions do not pollute the real sidebar.
+  - Must keep proving session resume, command-block capture, bidi output, and stopped-history cleanup.
 
 ## Critical behavior to preserve
 
@@ -131,7 +132,8 @@ zsh -n scripts/warpish-shell-integration.zsh
 
 - A browser reload or WebSocket close must detach only the current attach process.
 - It must not kill the tmux session.
-- The UI `Kill session` action is the intentional destructive path.
+- The UI `Kill session` action is the intentional destructive path for live shells.
+- The UI `Clear stopped` action may purge stopped history metadata/event files, but it must not kill active `tmux` sessions.
 - Sidebar previews should come from actual tmux pane content, not fabricated state.
 
 ### Command blocks
@@ -181,6 +183,7 @@ Then open the app in Chrome and verify at least:
 - typing Persian/Arabic at the terminal prompt auto-opens the bidi input mask over the terminal, seeds the typed character, keeps focus in the mask, and renders RTL-first text right-aligned with `dir="rtl"`,
 - input mask, command blocks, and Bidi reader are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
 - input mask submit/focus/history behavior works,
+- clearing stopped session history removes stopped sidebar entries and keeps live sessions alive,
 - `hermes --resume 20260706_010032_731a69` leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured Hermes text rather than freezing or splitting the layout,
 - browser console has no JavaScript errors.
 
