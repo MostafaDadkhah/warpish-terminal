@@ -478,16 +478,16 @@ button.danger:hover { border-color: rgba(251, 113, 133, 0.7); color: #fecdd3; }
   gap: 0;
   border: 1px solid rgba(34, 211, 238, 0.18);
   border-radius: 18px;
-  background: rgba(2, 6, 23, 0.94);
+  background: rgba(2, 6, 23, 0.96);
   box-shadow: 0 16px 60px rgba(0, 0, 0, 0.42), inset 0 0 0 1px rgba(139, 92, 246, 0.06);
-  pointer-events: none;
+  pointer-events: auto;
 }
 body.bidi-mode .bidi-reader {
   display: grid;
   grid-template-rows: minmax(0, 1fr);
 }
 body.bidi-mode #terminal .xterm-screen {
-  opacity: 0.08;
+  opacity: 0;
 }
 body.bidi-mode #terminal .xterm-cursor-layer {
   opacity: 0;
@@ -507,6 +507,8 @@ body.bidi-mode #terminal .xterm-cursor-layer {
 .bidi-reader-lines {
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  pointer-events: auto;
   display: grid;
   align-content: start;
   gap: 3px;
@@ -531,6 +533,22 @@ body.bidi-mode #terminal .xterm-cursor-layer {
 .bidi-line.ltr {
   direction: ltr;
   text-align: left;
+}
+.bidi-ghost {
+  color: #8b86a8;
+  opacity: 0.46;
+}
+.bidi-ghost .bidi-run {
+  color: inherit;
+}
+.bidi-inline-cursor {
+  color: #22d3ee;
+  margin-inline: 1px;
+  animation: cursorBlink 1s steps(1) infinite;
+}
+.bidi-reader-lines .bidi-line.has-ghost:last-child:not(.empty-state)::after {
+  content: '';
+  margin: 0;
 }
 .bidi-reader-lines .bidi-line:last-child:not(.empty-state)::after {
   content: '▌';

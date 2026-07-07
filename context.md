@@ -21,7 +21,7 @@ Implemented capabilities:
   - clear-stopped-history control that purges only stopped metadata/events and keeps live `tmux` sessions running.
 - Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
 - Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask keeps LTR shell prompts separate from compact Word-style RTL suffix segments while preserving English commands, paths, flags, and code as isolated LTR islands.
-- The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs.
+- The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs. The readable surface owns wheel scrolling when enabled: it stops wheel events from becoming shell history/navigation input, refreshes tmux-captured history when xterm has no scrollback, and preserves xterm focus for old-session reattaches.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
   - command text,
@@ -97,7 +97,7 @@ This avoids block output being polluted by unrelated redraws or repeated termina
 The primary product goal is a readable terminal, so the default path keeps input in the real xterm/PTY path while rendering input echo and output through a readable terminal mask instead of splitting commands into a separate input mask/composer. The app uses a layered approach:
 
 - normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` execute where users expect;
-- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, splits an LTR shell prompt from a following RTL input suffix, renders that suffix as a compact Word-style `dir=rtl` segment, and wraps English commands, paths, flags, and code as isolated `dir=ltr` islands;
+- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, splits an LTR shell prompt from a following RTL input suffix, renders that suffix as a compact Word-style `dir=rtl` segment, wraps English commands, paths, flags, and code as isolated `dir=ltr` islands, dims shell suggestion text after the cursor, throttles/cache-skips fast redraws, and uses tmux capture for wheel scroll when xterm scrollback is unavailable;
 - the terminal owns the primary workspace height; command blocks are opt-in/collapsible so input/output are not visually split;
 - raw terminal rows and the xterm helper textarea still get `unicode-bidi: plaintext`/auto-direction styling as fallback;
 - command blocks and sidebar previews also use bidi plaintext styling and direction detection.
@@ -142,6 +142,7 @@ Browser QA also verified:
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
 - Browser QA verified against the user's Word screenshot: prompt + `سلام عزیزم koja بودی` renders as an LTR prompt followed by one compact RTL suffix segment whose visual order matches Word (`سلام`/`عزیزم` on the right, `koja` as an LTR island, `بودی` on the left). Mixed output keeps Persian phrase runs and readable LTR/code islands.
+- Browser QA verified readable terminal interaction fixes: old live session reattach returns focus to `xterm-helper-textarea` and real keyboard input reaches the PTY; wheel over the readable surface expands from xterm's 23 visible rows to tmux-captured history (149/360 lines in QA) without sending `^[[A`/history input; synthetic inline suggestion text after the cursor renders as `.bidi-ghost` opacity `0.46`; fast 320-line streaming output rendered only 3 readable redraws with the underlying xterm screen opacity at `0`, reducing flicker.
 - Browser QA verified terminal typing after blur: with `Readable: on`, focus was moved to toolbar, then clicking the terminal surface returned focus to `xterm-helper-textarea`; real keyboard keypress `z` reached the PTY and produced `zsh: command not found: z`.
 
 ## Current limitations / future work

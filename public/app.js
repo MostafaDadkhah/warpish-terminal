@@ -71,11 +71,18 @@ const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/@~#$%&+=\\'"`|^-]/u;
 const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
-const BIDI_READER_MAX_LINES = 80;
+const BIDI_READER_MAX_LINES = 360;
+const BIDI_READER_RENDER_INTERVAL_MS = 70;
+const BIDI_READER_BOTTOM_EPSILON = 10;
 const BLOCK_RENDER_LIMIT = 60;
 const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
 const SESSION_PREVIEW_CHARS = 900;
 let blockRenderPending = false;
+let bidiReaderUpdateTimer = null;
+let lastBidiReaderRenderAt = 0;
+let lastBidiReaderRenderKey = '';
+let bidiReaderPinnedToBottom = true;
+let bidiReaderCaptureForScrollPending = false;
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
   const value = String(text || '');
@@ -179,70 +186,141 @@ function applyBidiText(element, text, { className = 'bidi-plain' } = {}) {
   renderBidiRuns(element, text);
 }
 
-function getReadableTerminalLines(limit = BIDI_READER_MAX_LINES) {
+function normalizeReadableEntries(input = []) {
+  return input
+    .map((entry) => (typeof entry === 'string' ? { text: entry } : { ...entry, text: String(entry?.text || '') }))
+    .filter((entry) => entry.text.length || entry.ghostStart != null);
+}
+
+function getReadableTerminalEntries(limit = BIDI_READER_MAX_LINES) {
   const buffer = term.buffer?.active;
   if (!buffer) return [];
   const end = Math.min(buffer.length, buffer.baseY + term.rows);
   const start = Math.max(0, end - limit * 2);
-  const lines = [];
+  const activeLineIndex = buffer.baseY + buffer.cursorY;
+  const entries = [];
 
   for (let i = start; i < end; i += 1) {
     const line = buffer.getLine(i);
     if (!line) continue;
-    const text = line.translateToString(true).trimEnd();
-    if (line.isWrapped && lines.length) lines[lines.length - 1] += text;
-    else lines.push(text);
+    const rawText = line.translateToString(true).trimEnd();
+    const entry = { text: rawText };
+    if (i === activeLineIndex && Number.isFinite(buffer.cursorX) && buffer.cursorX < rawText.length) {
+      entry.ghostStart = Math.max(0, buffer.cursorX);
+    }
+    if (line.isWrapped && entries.length) {
+      const previous = entries[entries.length - 1];
+      const offset = previous.text.length;
+      previous.text += rawText;
+      if (entry.ghostStart != null) previous.ghostStart = offset + entry.ghostStart;
+    } else {
+      entries.push(entry);
+    }
   }
 
-  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-  return lines.slice(-limit);
+  while (entries.length && !entries[entries.length - 1].text.trim()) entries.pop();
+  return entries.slice(-limit);
 }
 
-function renderBidiReader(lines = getReadableTerminalLines()) {
-  if (!bidiReaderLines) return;
-  bidiReaderLines.innerHTML = '';
-  if (!lines.length) {
-    const empty = document.createElement('div');
-    empty.className = 'bidi-line empty-state';
-    empty.textContent = 'Waiting for terminal output…';
-    bidiReaderLines.appendChild(empty);
+function getReadableTerminalLines(limit = BIDI_READER_MAX_LINES) {
+  return getReadableTerminalEntries(limit).map((entry) => entry.text);
+}
+
+function isBidiReaderNearBottom() {
+  if (!bidiReaderLines) return true;
+  return bidiReaderLines.scrollHeight - bidiReaderLines.scrollTop - bidiReaderLines.clientHeight <= BIDI_READER_BOTTOM_EPSILON;
+}
+
+function renderBidiLine(row, entry) {
+  const text = entry.text || ' ';
+  const ghostStart = Number.isFinite(entry.ghostStart) ? Math.max(0, Math.min(entry.ghostStart, text.length)) : null;
+  row.className = `bidi-line ${bidiDirection(text)}`;
+  row.dataset.logicalText = text;
+  if (ghostStart == null || ghostStart >= text.length) {
+    renderBidiRuns(row, text);
     return;
   }
 
-  for (const line of lines) {
-    const row = document.createElement('div');
-    row.className = `bidi-line ${bidiDirection(line)}`;
-    row.dataset.logicalText = line || ' ';
-    renderBidiRuns(row, line || ' ');
-    bidiReaderLines.appendChild(row);
+  const visibleText = text.slice(0, ghostStart) || ' ';
+  const ghostText = text.slice(ghostStart);
+  row.classList.add('has-ghost');
+  renderBidiRuns(row, visibleText);
+  const cursor = document.createElement('span');
+  cursor.className = 'bidi-inline-cursor';
+  cursor.textContent = '▌';
+  row.appendChild(cursor);
+  if (ghostText) {
+    const ghost = document.createElement('span');
+    ghost.className = 'bidi-ghost';
+    ghost.dataset.ghostText = ghostText;
+    renderBidiRuns(ghost, ghostText);
+    row.appendChild(ghost);
   }
-  bidiReaderLines.scrollTop = bidiReaderLines.scrollHeight;
 }
 
-function scheduleBidiReaderUpdate() {
+function readableEntriesKey(entries) {
+  return entries.map((entry) => `${entry.ghostStart ?? ''}\t${entry.text}`).join('\n');
+}
+
+function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false } = {}) {
+  if (!bidiReaderLines) return;
+  const entries = normalizeReadableEntries(input);
+  const key = readableEntriesKey(entries);
+  if (!force && key === lastBidiReaderRenderKey) return;
+  const wasPinned = keepScroll ? false : (bidiReaderPinnedToBottom || isBidiReaderNearBottom());
+  const previousScrollTop = bidiReaderLines.scrollTop;
+  lastBidiReaderRenderKey = key;
+
+  const fragment = document.createDocumentFragment();
+  if (!entries.length) {
+    const empty = document.createElement('div');
+    empty.className = 'bidi-line empty-state';
+    empty.textContent = 'Waiting for terminal output…';
+    fragment.appendChild(empty);
+  } else {
+    for (const entry of entries) {
+      const row = document.createElement('div');
+      renderBidiLine(row, entry);
+      fragment.appendChild(row);
+    }
+  }
+
+  bidiReaderLines.replaceChildren(fragment);
+  if (wasPinned) bidiReaderLines.scrollTop = bidiReaderLines.scrollHeight;
+  else bidiReaderLines.scrollTop = Math.min(previousScrollTop, bidiReaderLines.scrollHeight);
+  bidiReaderPinnedToBottom = isBidiReaderNearBottom();
+}
+
+function flushBidiReaderUpdate() {
+  bidiReaderUpdatePending = false;
+  bidiReaderUpdateTimer = null;
+  lastBidiReaderRenderAt = performance.now();
+  renderBidiReader();
+}
+
+function scheduleBidiReaderUpdate({ immediate = false } = {}) {
   if (!bidiReaderEnabled || bidiReaderUpdatePending) return;
   bidiReaderUpdatePending = true;
-  requestAnimationFrame(() => {
-    bidiReaderUpdatePending = false;
-    renderBidiReader();
-  });
+  const elapsed = performance.now() - lastBidiReaderRenderAt;
+  const delay = immediate ? 0 : Math.max(0, BIDI_READER_RENDER_INTERVAL_MS - elapsed);
+  bidiReaderUpdateTimer = window.setTimeout(() => requestAnimationFrame(flushBidiReaderUpdate), delay);
 }
 
-async function refreshBidiReaderFromCapture() {
+async function refreshBidiReaderFromCapture({ keepScroll = false } = {}) {
   if (!bidiReaderEnabled || !currentSessionId) {
-    renderBidiReader();
+    renderBidiReader(getReadableTerminalEntries(), { keepScroll });
     return;
   }
   try {
     const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=1200`);
-    const lines = String(payload.text || '')
+    const entries = String(payload.text || '')
       .split('\n')
-      .map((line) => line.trimEnd())
-      .filter((line) => line.trim().length > 0)
+      .map((line) => ({ text: line.trimEnd() }))
+      .filter((entry) => entry.text.trim().length > 0)
       .slice(-BIDI_READER_MAX_LINES);
-    renderBidiReader(lines.length ? lines : getReadableTerminalLines());
+    renderBidiReader(entries.length ? entries : getReadableTerminalEntries(), { force: true, keepScroll });
   } catch {
-    renderBidiReader();
+    renderBidiReader(getReadableTerminalEntries(), { force: true, keepScroll });
   }
 }
 
@@ -273,12 +351,24 @@ function applyBidiMode() {
   document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
   if (bidiToggleButton) bidiToggleButton.textContent = `Readable: ${bidiReaderEnabled ? 'on' : 'off'}`;
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
-  if (bidiReaderEnabled) refreshBidiReaderFromCapture().catch(() => renderBidiReader());
+  if (bidiReaderUpdateTimer) window.clearTimeout(bidiReaderUpdateTimer);
+  bidiReaderUpdatePending = false;
+  bidiReaderUpdateTimer = null;
+  lastBidiReaderRenderKey = '';
+  bidiReaderPinnedToBottom = true;
+  if (bidiReaderEnabled) refreshBidiReaderFromCapture().catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
   refitTerminal();
 }
 
 function focusTerminalSoon() {
-  setTimeout(() => term.focus(), 0);
+  setTimeout(() => focusTerminalReliably(), 0);
+}
+
+function focusTerminalReliably() {
+  term.focus();
+  requestAnimationFrame(() => term.focus());
+  setTimeout(() => term.focus(), 80);
+  setTimeout(() => term.focus(), 240);
 }
 
 function shouldPreserveControlFocus(event) {
@@ -287,7 +377,7 @@ function shouldPreserveControlFocus(event) {
 }
 
 function focusPreferredInput() {
-  term.focus();
+  focusTerminalReliably();
 }
 
 function clearAutoRawInput() {
@@ -633,7 +723,10 @@ function connectToSession(sessionId) {
   renderBlocks();
   if (blocksOpen) loadBlocks(sessionId, { force: true }).catch(() => {});
   term.reset();
-  scheduleBidiReaderUpdate();
+  lastBidiReaderRenderKey = '';
+  bidiReaderPinnedToBottom = true;
+  scheduleBidiReaderUpdate({ immediate: true });
+  focusTerminalSoon();
   setStatus('warn', 'attaching…', session.title);
 
   ws = new WebSocket(socketUrl(sessionId));
@@ -664,6 +757,7 @@ function connectToSession(sessionId) {
 
     if (msg.type === 'hello') {
       setStatus('ok', 'connected', `tmux ${msg.sessionId} • attach pid ${msg.pid}`);
+      focusPreferredInput();
     } else if (msg.type === 'server-error') {
       setStatus('bad', 'error', msg.message || 'server error');
       term.writeln(`\r\n\x1b[31m${msg.message || 'server error'}\x1b[0m`);
@@ -728,6 +822,36 @@ function shouldOpenReaderOnTrappedScroll() {
   return /Welcome to Hermes Agent|\bgpt-[\w.]+\b|ctx --|❯/.test(text);
 }
 
+function handleBidiReaderScroll() {
+  bidiReaderPinnedToBottom = isBidiReaderNearBottom();
+}
+
+async function refreshBidiReaderForScroll(deltaY) {
+  if (bidiReaderCaptureForScrollPending || !currentSessionId || !bidiReaderLines) return;
+  bidiReaderCaptureForScrollPending = true;
+  const wasNearBottom = isBidiReaderNearBottom();
+  try {
+    await refreshBidiReaderFromCapture({ keepScroll: true });
+    if (wasNearBottom && deltaY < 0) {
+      bidiReaderLines.scrollTop = Math.max(0, bidiReaderLines.scrollHeight - bidiReaderLines.clientHeight + deltaY);
+    }
+    bidiReaderPinnedToBottom = isBidiReaderNearBottom();
+  } finally {
+    bidiReaderCaptureForScrollPending = false;
+  }
+}
+
+function handleBidiReaderWheel(event) {
+  if (!bidiReaderEnabled || !bidiReaderLines) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const needsTmuxHistory = event.deltaY < 0 && (term.buffer?.active?.baseY ?? 0) === 0;
+  if (needsTmuxHistory) refreshBidiReaderForScroll(event.deltaY).catch(() => {});
+  bidiReaderLines.scrollTop += event.deltaY;
+  bidiReaderPinnedToBottom = isBidiReaderNearBottom();
+  focusTerminalSoon();
+}
+
 resizeObserver.observe(terminalEl);
 terminalEl.addEventListener('pointerdown', () => focusTerminalSoon());
 terminalCard?.addEventListener('pointerdown', (event) => {
@@ -736,6 +860,9 @@ terminalCard?.addEventListener('pointerdown', (event) => {
 terminalCard?.addEventListener('click', (event) => {
   if (!shouldPreserveControlFocus(event)) focusPreferredInput();
 });
+bidiReaderLines?.addEventListener('scroll', handleBidiReaderScroll, { passive: true });
+bidiReader?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
+bidiReaderLines?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 terminalEl.addEventListener('wheel', (event) => {
   if (event.ctrlKey) return;
   const lineHeight = 18;
