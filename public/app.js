@@ -68,7 +68,7 @@ let bidiReaderUpdatePending = false;
 
 const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
-const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/:@~#$%&+=,;!?<>{}()\[\]\\'"`|^-]/u;
+const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/@~#$%&+=\\'"`|^-]/u;
 const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
 const BIDI_READER_MAX_LINES = 80;
 const BLOCK_RENDER_LIMIT = 60;
@@ -88,10 +88,18 @@ function bidiDirection(text = '') {
 }
 
 function bidiTokenDirection(token = '', fallbackDir = 'ltr') {
-  if (/^\s+$/u.test(token)) return 'space';
   if (LTR_TOKEN_CHAR_RE.test(token)) return 'ltr';
   if (RTL_CHAR_RE.test(token)) return 'rtl';
   return fallbackDir;
+}
+
+function appendBidiRun(element, text, dir) {
+  if (!text) return;
+  const run = document.createElement('bdi');
+  run.className = `bidi-run ${dir}`;
+  run.dir = dir;
+  run.textContent = text;
+  element.appendChild(run);
 }
 
 function renderBidiRuns(element, text = '') {
@@ -105,18 +113,29 @@ function renderBidiRuns(element, text = '') {
   element.classList.toggle('source-ltr', sourceDir !== 'rtl');
 
   const tokens = value.match(BIDI_TOKEN_RE) || [value];
+  let pendingText = '';
+  let pendingDir = '';
+
   for (const token of tokens) {
-    const dir = bidiTokenDirection(token, sourceDir);
-    if (dir === 'space') {
-      element.appendChild(document.createTextNode(token));
+    if (/^\s+$/u.test(token)) {
+      pendingText += token;
       continue;
     }
-    const run = document.createElement('bdi');
-    run.className = `bidi-run ${dir}`;
-    run.dir = dir;
-    run.textContent = token;
-    element.appendChild(run);
+    const dir = bidiTokenDirection(token, sourceDir);
+    if (!pendingDir) {
+      pendingDir = dir;
+      pendingText += token;
+      continue;
+    }
+    if (dir === pendingDir) {
+      pendingText += token;
+      continue;
+    }
+    appendBidiRun(element, pendingText, pendingDir);
+    pendingDir = dir;
+    pendingText = token;
   }
+  appendBidiRun(element, pendingText, pendingDir || sourceDir);
 }
 
 function applyBidiText(element, text, { className = 'bidi-plain' } = {}) {

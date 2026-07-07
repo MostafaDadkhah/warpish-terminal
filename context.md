@@ -20,7 +20,7 @@ Implemented capabilities:
   - click-to-reattach behavior,
   - clear-stopped-history control that purges only stopped metadata/events and keeps live `tmux` sessions running.
 - Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
-- Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask renders Persian/Arabic lines as real RTL/right-aligned text while preserving English commands, paths, flags, and code as isolated LTR islands.
+- Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask renders Persian/Arabic phrases as grouped real RTL runs while preserving English commands, paths, flags, and code as isolated LTR islands.
 - The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
@@ -97,7 +97,7 @@ This avoids block output being polluted by unrelated redraws or repeated termina
 The primary product goal is a readable terminal, so the default path keeps input in the real xterm/PTY path while rendering input echo and output through a readable terminal mask instead of splitting commands into a separate input mask/composer. The app uses a layered approach:
 
 - normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` execute where users expect;
-- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, sets Persian/Arabic lines to real `dir=rtl`/right-aligned layout, and wraps English commands, paths, flags, and code as isolated `dir=ltr` islands;
+- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, groups consecutive Persian/Arabic words/spaces into real `dir=rtl` runs, and wraps English commands, paths, flags, and code as isolated `dir=ltr` islands;
 - the terminal owns the primary workspace height; command blocks are opt-in/collapsible so input/output are not visually split;
 - raw terminal rows and the xterm helper textarea still get `unicode-bidi: plaintext`/auto-direction styling as fallback;
 - command blocks and sidebar previews also use bidi plaintext styling and direction detection.
@@ -141,7 +141,7 @@ Browser QA also verified:
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
-- Browser QA verified real RTL visual order with coordinates: in `سلام Mostafa، command: git status و path: /Users/test خواناست`, `سلام` is rightmost, then `Mostafa،`, `command:`, `git`, `status`, `path:`, `/Users/test`, and `خواناست` progresses leftward; `مرحله ۲:` starts from the right as an RTL phrase while `run npm test -- --grep=فارسی` stays readable as an LTR/code island.
+- Browser QA verified grouped RTL behavior against macOS Terminal: prompt + `سلام عزیزم` renders as an LTR prompt followed by a single RTL phrase, not separate Persian word islands. Mixed output keeps `سلام`, `مرحله ۲:`, `در`, and `انجام شد` as RTL phrase runs while `command: git status`, `path: /Users/test`, `run npm test -- --grep=فارسی`, and `/tmp/app` stay readable as LTR/code islands.
 
 ## Current limitations / future work
 
