@@ -69,7 +69,7 @@ let bidiReaderUpdatePending = false;
 const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/:@~#$%&+=,;!?<>{}()\[\]\\'"`|^-]/u;
-const BIDI_TOKEN_RE = /(\s+|[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]+|[A-Za-z0-9_.\/:@~#$%&+=,;!?<>{}()\[\]\\'"`|^-]+|[^\s])/gu;
+const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
 const BIDI_READER_MAX_LINES = 80;
 const BLOCK_RENDER_LIMIT = 60;
 const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
@@ -87,10 +87,11 @@ function bidiDirection(text = '') {
   return RTL_CHAR_RE.test(firstStrong) ? 'rtl' : 'ltr';
 }
 
-function bidiTokenDirection(token = '') {
-  if (RTL_CHAR_RE.test(token)) return 'rtl';
+function bidiTokenDirection(token = '', fallbackDir = 'ltr') {
+  if (/^\s+$/u.test(token)) return 'space';
   if (LTR_TOKEN_CHAR_RE.test(token)) return 'ltr';
-  return 'neutral';
+  if (RTL_CHAR_RE.test(token)) return 'rtl';
+  return fallbackDir;
 }
 
 function renderBidiRuns(element, text = '') {
@@ -98,17 +99,21 @@ function renderBidiRuns(element, text = '') {
   const value = String(text || ' ');
   const sourceDir = bidiDirection(value);
   element.textContent = '';
-  element.dir = 'ltr';
+  element.dir = sourceDir;
   element.dataset.sourceDir = sourceDir;
   element.classList.toggle('source-rtl', sourceDir === 'rtl');
   element.classList.toggle('source-ltr', sourceDir !== 'rtl');
 
   const tokens = value.match(BIDI_TOKEN_RE) || [value];
   for (const token of tokens) {
-    const dir = bidiTokenDirection(token);
+    const dir = bidiTokenDirection(token, sourceDir);
+    if (dir === 'space') {
+      element.appendChild(document.createTextNode(token));
+      continue;
+    }
     const run = document.createElement('bdi');
     run.className = `bidi-run ${dir}`;
-    run.dir = 'ltr';
+    run.dir = dir;
     run.textContent = token;
     element.appendChild(run);
   }

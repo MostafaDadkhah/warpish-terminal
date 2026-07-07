@@ -82,24 +82,18 @@ h2 { font-size: clamp(24px, 2.2vw, 34px); }
 
 button, input { font: inherit; }
 .bidi-plain {
-  direction: ltr;
   unicode-bidi: isolate;
 }
 .bidi-run {
   unicode-bidi: isolate;
   white-space: pre-wrap;
-  min-width: 0;
-  overflow-wrap: anywhere;
 }
 .bidi-run.ltr {
   direction: ltr;
 }
 .bidi-run.rtl {
-  direction: ltr;
+  direction: rtl;
   font-family: "Noto Sans Arabic", Tahoma, "SF Mono", Menlo, Monaco, Consolas, monospace;
-}
-.bidi-run.neutral {
-  direction: ltr;
 }
 button {
   border: 1px solid var(--border);
@@ -509,24 +503,21 @@ body.bidi-mode #terminal .xterm-cursor-layer {
   background: rgba(0, 0, 0, 0.24);
 }
 .bidi-line {
-  direction: ltr;
+  white-space: pre-wrap;
   unicode-bidi: isolate;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  align-content: flex-start;
-  justify-content: flex-start;
-  text-align: left;
   overflow-wrap: anywhere;
   color: #eeeaff;
   font-family: "SF Mono", Menlo, Monaco, Consolas, "Noto Sans Arabic", Tahoma, monospace;
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1.65;
 }
 .bidi-line.rtl {
-  text-align: left;
+  direction: rtl;
+  text-align: right;
+  font-family: "Noto Sans Arabic", Tahoma, "SF Mono", Menlo, Monaco, Consolas, monospace;
 }
 .bidi-line.ltr {
+  direction: ltr;
   text-align: left;
 }
 .bidi-reader-lines .bidi-line:last-child:not(.empty-state)::after {
