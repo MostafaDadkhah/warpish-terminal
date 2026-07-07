@@ -20,7 +20,7 @@ Implemented capabilities:
   - click-to-reattach behavior,
   - clear-stopped-history control that purges only stopped metadata/events and keeps live `tmux` sessions running.
 - Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
-- Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi/plaintext styling by default so mixed Persian/English terminal input/output is readable in the primary surface.
+- Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask preserves terminal order left-to-right and wraps Persian/English/code/path runs in isolated tokens so mixed Persian/English terminal input/output stays readable in the primary surface.
 - The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs.
 - Session rename, copy selection, detach, and kill controls.
 - Warp-style command blocks for sessions created with the current shell integration:
@@ -97,7 +97,7 @@ This avoids block output being polluted by unrelated redraws or repeated termina
 The primary product goal is a readable terminal, so the default path keeps input in the real xterm/PTY path while rendering input echo and output through a readable terminal mask instead of splitting commands into a separate input mask/composer. The app uses a layered approach:
 
 - normal xterm typing goes directly to the PTY/shell prompt, so ordinary commands such as `hermes chat` execute where users expect;
-- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, and sets per-line direction from the first strong RTL/LTR character;
+- the readable terminal mask is on by default, covers the terminal surface, re-renders recent xterm/tmux-captured lines as normal HTML, keeps each line in stable terminal/LTR order, and isolates Persian/English/code/path runs as separate tokens instead of setting the whole line to RTL;
 - the terminal owns the primary workspace height; command blocks are opt-in/collapsible so input/output are not visually split;
 - raw terminal rows and the xterm helper textarea still get `unicode-bidi: plaintext`/auto-direction styling as fallback;
 - command blocks and sidebar previews also use bidi plaintext styling and direction detection.
@@ -141,7 +141,7 @@ Browser QA also verified:
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
-- Bidi reader rendered a mixed Persian/English line with RTL direction and `unicode-bidi: plaintext` while command blocks stored the same text cleanly.
+- Browser QA verified run-level visual order for mixed Persian/English lines with coordinates: `سلام` → `Mostafa` → `command:` → `git status` → `path:` → `/Users/test` → `خواناست`, and `مرحله` → `۲` → `:` → `run` stayed in order instead of flipping to `۲: مرحله`.
 
 ## Current limitations / future work
 

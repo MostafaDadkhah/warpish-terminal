@@ -118,15 +118,15 @@ zsh -n scripts/warpish-shell-integration.zsh
 ### Persian/English bidi readability
 
 - Direct xterm typing must remain the real input path: typing `hermes chat` in the terminal should execute in the shell, not in a separate mask/composer.
-- The readable terminal mask is default-on: terminal input echo and output should render through normal HTML lines with bidi/plaintext handling while preserving the raw PTY path underneath.
+- The readable terminal mask is default-on: terminal input echo and output should render through normal HTML lines while preserving stable terminal/LTR order. Do not set the whole mixed line to RTL; isolate Persian words, English/code tokens, paths, flags, and punctuation as separate runs so RTL text cannot reorder neighboring command/path segments.
 - Keep the primary workspace terminal-native: command blocks must be collapsed/hidden by default so input and output stay in one large terminal surface.
 - Do not add a separate input-mask/composer section; one goal of this project is a readable terminal, so terminal input echo and terminal output should be masked/readable by default.
 - Cmd/Ctrl+K should focus the terminal, not open a separate command mask.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
-- Keep the readable terminal mask available as the default surface/toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML and sets per-line `dir` from the first strong RTL/LTR character. If a full-screen terminal app leaves xterm scrollback at `baseY=0`, wheel should refresh/update this tmux-backed readable layer rather than trying to split the terminal layout.
+- Keep the readable terminal mask available as the default surface/toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML, keeps terminal/LTR order stable, and isolates Persian/English/code/path runs instead of applying RTL to the whole line. If a full-screen terminal app leaves xterm scrollback at `baseY=0`, wheel should refresh/update this tmux-backed readable layer rather than trying to split the terminal layout.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
 - Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
-- If changing xterm rendering or terminal layout, verify a line like `سلام Mostafa، command: git status و path: /Users/test خواناست` appears in the Bidi reader and command block output with `dir="rtl"` and `unicode-bidi: plaintext`.
+- If changing xterm rendering or terminal layout, verify a line like `سلام Mostafa، command: git status و path: /Users/test خواناست` appears in the readable mask with monotonically increasing token positions (`سلام` before `Mostafa` before `path:` before `/Users/test` before `خواناست`), and verify `مرحله ۲:` does not flip to `۲: مرحله`.
 
 ### Sessions
 
