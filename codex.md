@@ -122,6 +122,7 @@ zsh -n scripts/warpish-shell-integration.zsh
 - Keep the primary workspace terminal-native: command blocks must be collapsed/hidden by default so input and output stay in one large terminal surface.
 - Do not add a separate input-mask/composer section; one goal of this project is a readable terminal, so terminal input echo and terminal output should be masked/readable by default.
 - Cmd/Ctrl+K should focus the terminal, not open a separate command mask.
+- Readable overlay/focus regression guard: the overlay must not steal typing. Keep readable layers pointer-transparent where possible, and keep explicit focus handlers on the terminal surface/card so that after toolbar blur, clicking the terminal/readable area focuses xterm and real keyboard events reach the PTY.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
 - Keep the readable terminal mask available as the default surface/toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML, splits LTR prompts from RTL suffix segments, and isolates English/code/path runs as LTR. If a full-screen terminal app leaves xterm scrollback at `baseY=0`, wheel should refresh/update this tmux-backed readable layer rather than trying to split the terminal layout.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.

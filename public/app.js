@@ -1,4 +1,5 @@
 const terminalEl = document.getElementById('terminal');
+const terminalCard = document.querySelector('.terminal-card');
 const statusCard = document.getElementById('statusCard');
 const statusText = document.getElementById('statusText');
 const sessionText = document.getElementById('sessionText');
@@ -274,6 +275,15 @@ function applyBidiMode() {
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
   if (bidiReaderEnabled) refreshBidiReaderFromCapture().catch(() => renderBidiReader());
   refitTerminal();
+}
+
+function focusTerminalSoon() {
+  setTimeout(() => term.focus(), 0);
+}
+
+function shouldPreserveControlFocus(event) {
+  const target = event?.target;
+  return Boolean(target?.closest?.('button, input, textarea, select, a, [contenteditable="true"]'));
 }
 
 function focusPreferredInput() {
@@ -719,7 +729,13 @@ function shouldOpenReaderOnTrappedScroll() {
 }
 
 resizeObserver.observe(terminalEl);
-terminalEl.addEventListener('pointerdown', () => setTimeout(() => term.focus(), 0));
+terminalEl.addEventListener('pointerdown', () => focusTerminalSoon());
+terminalCard?.addEventListener('pointerdown', (event) => {
+  if (!shouldPreserveControlFocus(event)) focusTerminalSoon();
+});
+terminalCard?.addEventListener('click', (event) => {
+  if (!shouldPreserveControlFocus(event)) focusPreferredInput();
+});
 terminalEl.addEventListener('wheel', (event) => {
   if (event.ctrlKey) return;
   const lineHeight = 18;

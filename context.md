@@ -142,6 +142,7 @@ Browser QA also verified:
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
 - Browser QA verified against the user's Word screenshot: prompt + `سلام عزیزم koja بودی` renders as an LTR prompt followed by one compact RTL suffix segment whose visual order matches Word (`سلام`/`عزیزم` on the right, `koja` as an LTR island, `بودی` on the left). Mixed output keeps Persian phrase runs and readable LTR/code islands.
+- Browser QA verified terminal typing after blur: with `Readable: on`, focus was moved to toolbar, then clicking the terminal surface returned focus to `xterm-helper-textarea`; real keyboard keypress `z` reached the PTY and produced `zsh: command not found: z`.
 
 ## Current limitations / future work
 

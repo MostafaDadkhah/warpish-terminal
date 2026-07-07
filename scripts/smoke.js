@@ -172,6 +172,8 @@ try {
     && !appJs.includes('shouldAutoOpenRtlComposer')
     && !appJs.includes('openComposerCapture')
     && !appJs.includes('commandInputDirection')
+    && appJs.includes('function shouldPreserveControlFocus(event)')
+    && appJs.includes("terminalCard?.addEventListener('pointerdown'")
     && appJs.includes('function splitPromptRtlSuffix(value =')
     && appJs.includes("segment.className = 'bidi-segment rtl'")
     && appJs.includes('function appendBidiRunWithBoundarySpace(element, text, dir)')
