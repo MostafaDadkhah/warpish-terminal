@@ -102,17 +102,26 @@ function appendBidiRun(element, text, dir) {
   element.appendChild(run);
 }
 
-function renderBidiRuns(element, text = '') {
-  if (!element) return;
-  const value = String(text || ' ');
-  const sourceDir = bidiDirection(value);
-  element.textContent = '';
-  element.dir = sourceDir;
-  element.dataset.sourceDir = sourceDir;
-  element.classList.toggle('source-rtl', sourceDir === 'rtl');
-  element.classList.toggle('source-ltr', sourceDir !== 'rtl');
+function appendBidiRunWithBoundarySpace(element, text, dir) {
+  const match = String(text || '').match(/^(.*?)(\s+)$/u);
+  if (!match) {
+    appendBidiRun(element, text, dir);
+    return;
+  }
+  appendBidiRun(element, match[1], dir);
+  element.appendChild(document.createTextNode(match[2]));
+}
 
-  const tokens = value.match(BIDI_TOKEN_RE) || [value];
+function splitPromptRtlSuffix(value = '') {
+  const match = String(value).match(/^(.{0,160}?(?:[%$#❯›➜>]\s+))(.+)$/u);
+  if (!match) return null;
+  const [, prefix, suffix] = match;
+  if (bidiDirection(prefix) !== 'ltr' || bidiDirection(suffix) !== 'rtl') return null;
+  return { prefix, suffix };
+}
+
+function renderBidiTokenRuns(element, value, sourceDir) {
+  const tokens = String(value || ' ').match(BIDI_TOKEN_RE) || [String(value || ' ')];
   let pendingText = '';
   let pendingDir = '';
 
@@ -131,11 +140,36 @@ function renderBidiRuns(element, text = '') {
       pendingText += token;
       continue;
     }
-    appendBidiRun(element, pendingText, pendingDir);
+    appendBidiRunWithBoundarySpace(element, pendingText, pendingDir);
     pendingDir = dir;
     pendingText = token;
   }
   appendBidiRun(element, pendingText, pendingDir || sourceDir);
+}
+
+function renderBidiRuns(element, text = '') {
+  if (!element) return;
+  const value = String(text || ' ');
+  const promptSplit = splitPromptRtlSuffix(value);
+  const sourceDir = promptSplit ? 'ltr' : bidiDirection(value);
+  element.textContent = '';
+  element.dir = sourceDir;
+  element.dataset.sourceDir = sourceDir;
+  element.classList.toggle('source-rtl', sourceDir === 'rtl');
+  element.classList.toggle('source-ltr', sourceDir !== 'rtl');
+
+  if (promptSplit) {
+    appendBidiRunWithBoundarySpace(element, promptSplit.prefix, 'ltr');
+    const segment = document.createElement('span');
+    segment.className = 'bidi-segment rtl';
+    segment.dir = 'rtl';
+    segment.dataset.sourceDir = 'rtl';
+    renderBidiTokenRuns(segment, promptSplit.suffix, 'rtl');
+    element.appendChild(segment);
+    return;
+  }
+
+  renderBidiTokenRuns(element, value, sourceDir);
 }
 
 function applyBidiText(element, text, { className = 'bidi-plain' } = {}) {

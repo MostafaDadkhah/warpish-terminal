@@ -9,7 +9,7 @@ What it does:
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
 - Adds Warp-style command blocks for new sessions; the block panel is hidden by default and opens only when you ask for it.
-- Uses a terminal-native layout: normal xterm input goes to the real shell, while input echo and output are shown through a default readable terminal mask. Persian/Arabic phrases render as grouped real RTL runs — matching macOS Terminal behavior for input like `سلام عزیزم` after an LTR prompt — while English commands, paths, flags, and code stay isolated LTR islands. You can toggle back to raw xterm with `Readable: off` for edge-case TUIs.
+- Uses a terminal-native layout: normal xterm input goes to the real shell, while input echo and output are shown through a default readable terminal mask. When an LTR shell prompt is followed by Persian/Arabic input, the prompt stays LTR and the typed suffix becomes a compact Word-style RTL segment; English commands, paths, flags, and code stay isolated LTR islands. You can toggle back to raw xterm with `Readable: off` for edge-case TUIs.
 - Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
 
 Requirements already present on this Mac:

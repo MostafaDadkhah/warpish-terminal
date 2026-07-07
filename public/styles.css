@@ -95,6 +95,18 @@ button, input { font: inherit; }
   direction: rtl;
   font-family: "Noto Sans Arabic", Tahoma, "SF Mono", Menlo, Monaco, Consolas, monospace;
 }
+.bidi-segment {
+  display: inline-block;
+  unicode-bidi: isolate;
+  white-space: pre-wrap;
+}
+.bidi-segment.rtl {
+  direction: rtl;
+  font-family: "Noto Sans Arabic", Tahoma, "SF Mono", Menlo, Monaco, Consolas, monospace;
+}
+.bidi-segment.ltr {
+  direction: ltr;
+}
 button {
   border: 1px solid var(--border);
   color: var(--text);
