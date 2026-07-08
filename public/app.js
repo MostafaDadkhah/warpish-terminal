@@ -73,6 +73,7 @@ const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/@~#$%&+=\\'"`|^-]/u;
 const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
 const BIDI_READER_MAX_LINES = 360;
 const BIDI_READER_RENDER_INTERVAL_MS = 70;
+const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 600;
 const BIDI_READER_BOTTOM_EPSILON = 10;
 const XTERM_COLOR_MODE_PALETTE = 0x1000000;
 const XTERM_COLOR_MODE_RGB = 0x3000000;
@@ -89,6 +90,9 @@ let lastBidiReaderRenderAt = 0;
 let lastBidiReaderRenderKey = '';
 let bidiReaderPinnedToBottom = true;
 let bidiReaderCaptureForScrollPending = false;
+let bidiReaderCaptureRefreshPending = false;
+let lastBidiReaderCaptureAt = 0;
+let lastCapturedReaderEntries = [];
 let stalePromptRecoverySent = false;
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
@@ -372,6 +376,17 @@ function getReadableTerminalLines(limit = BIDI_READER_MAX_LINES) {
   return getReadableTerminalEntries(limit).map((entry) => entry.text);
 }
 
+function isTerminalAlternateBuffer() {
+  return term?.buffer?.active?.type === 'alternate';
+}
+
+function isSparseReadableEntries(entries = []) {
+  if (!entries.length) return true;
+  const nonEmpty = entries.map((entry) => String(entry.text || '').trim()).filter(Boolean);
+  if (!nonEmpty.length) return true;
+  return nonEmpty.length <= 2 && nonEmpty.every((line) => /^(?:<[^>]+>|~|[│╭╰╮╯─\s])+$/u.test(line));
+}
+
 function isBidiReaderNearBottom() {
   if (!bidiReaderLines) return true;
   return bidiReaderLines.scrollHeight - bidiReaderLines.scrollTop - bidiReaderLines.clientHeight <= BIDI_READER_BOTTOM_EPSILON;
@@ -417,17 +432,24 @@ function readableEntriesKey(entries) {
   }).join('\n');
 }
 
+function setBidiReaderHasContent(hasContent) {
+  document.body.classList.toggle('bidi-reader-has-content', Boolean(hasContent));
+  if (bidiReader) bidiReader.classList.toggle('has-content', Boolean(hasContent));
+}
+
 function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false } = {}) {
   if (!bidiReaderLines) return;
   const entries = normalizeReadableEntries(input);
-  const key = readableEntriesKey(entries);
+  const hasContent = entries.length > 0;
+  const key = `${hasContent ? 'content' : 'empty'}\n${readableEntriesKey(entries)}`;
   if (!force && key === lastBidiReaderRenderKey) return;
   const wasPinned = keepScroll ? false : (bidiReaderPinnedToBottom || isBidiReaderNearBottom());
   const previousScrollTop = bidiReaderLines.scrollTop;
   lastBidiReaderRenderKey = key;
+  setBidiReaderHasContent(hasContent);
 
   const fragment = document.createDocumentFragment();
-  if (!entries.length) {
+  if (!hasContent) {
     const empty = document.createElement('div');
     empty.className = 'bidi-line empty-state';
     empty.textContent = 'Waiting for terminal output…';
@@ -450,7 +472,16 @@ function flushBidiReaderUpdate() {
   bidiReaderUpdatePending = false;
   bidiReaderUpdateTimer = null;
   lastBidiReaderRenderAt = performance.now();
-  renderBidiReader();
+  const entries = getReadableTerminalEntries();
+  const shouldUseCapture = isTerminalAlternateBuffer() && (isSparseReadableEntries(entries) || lastCapturedReaderEntries.length > 0);
+  if (shouldUseCapture) {
+    if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries);
+    if (performance.now() - lastBidiReaderCaptureAt > BIDI_CAPTURE_REFRESH_INTERVAL_MS) {
+      refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom }).catch(() => renderBidiReader(entries, { force: true }));
+    }
+    return;
+  }
+  renderBidiReader(entries);
 }
 
 function scheduleBidiReaderUpdate({ immediate = false } = {}) {
@@ -462,10 +493,16 @@ function scheduleBidiReaderUpdate({ immediate = false } = {}) {
 }
 
 async function refreshBidiReaderFromCapture({ keepScroll = false } = {}) {
+  if (bidiReaderCaptureRefreshPending) {
+    if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll });
+    return;
+  }
   if (!bidiReaderEnabled || !currentSessionId) {
     renderBidiReader(getReadableTerminalEntries(), { keepScroll });
     return;
   }
+  bidiReaderCaptureRefreshPending = true;
+  lastBidiReaderCaptureAt = performance.now();
   try {
     const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=1200`);
     const entries = String(payload.text || '')
@@ -473,9 +510,16 @@ async function refreshBidiReaderFromCapture({ keepScroll = false } = {}) {
       .map((line) => ({ text: line.trimEnd() }))
       .filter((entry) => entry.text.trim().length > 0)
       .slice(-BIDI_READER_MAX_LINES);
-    renderBidiReader(entries.length ? entries : getReadableTerminalEntries(), { force: true, keepScroll });
+    if (entries.length) lastCapturedReaderEntries = entries;
+    const xtermEntries = getReadableTerminalEntries();
+    const fallbackEntries = lastCapturedReaderEntries.length && isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries)
+      ? lastCapturedReaderEntries
+      : xtermEntries;
+    renderBidiReader(entries.length ? entries : fallbackEntries, { force: true, keepScroll });
   } catch {
-    renderBidiReader(getReadableTerminalEntries(), { force: true, keepScroll });
+    renderBidiReader(lastCapturedReaderEntries.length ? lastCapturedReaderEntries : getReadableTerminalEntries(), { force: true, keepScroll });
+  } finally {
+    bidiReaderCaptureRefreshPending = false;
   }
 }
 
@@ -506,6 +550,7 @@ function applyBidiMode() {
   document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
   if (bidiToggleButton) bidiToggleButton.textContent = `Readable: ${bidiReaderEnabled ? 'on' : 'off'}`;
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
+  if (!bidiReaderEnabled) setBidiReaderHasContent(false);
   if (bidiReaderUpdateTimer) window.clearTimeout(bidiReaderUpdateTimer);
   bidiReaderUpdatePending = false;
   bidiReaderUpdateTimer = null;
@@ -865,6 +910,14 @@ function disconnectCurrent({ quiet = false } = {}) {
   ws = null;
 }
 
+function refreshReadableFromTmuxSoon(delay = 250) {
+  if (!bidiReaderEnabled || !currentSessionId) return;
+  setTimeout(() => {
+    if (!bidiReaderEnabled || !currentSessionId) return;
+    refreshBidiReaderFromCapture().catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
+  }, delay);
+}
+
 function connectToSession(sessionId) {
   const session = sessions.find((candidate) => candidate.id === sessionId);
   if (!session?.alive) return;
@@ -874,6 +927,8 @@ function connectToSession(sessionId) {
   disconnectCurrent({ quiet: true });
   currentSessionId = sessionId;
   stalePromptRecoverySent = false;
+  lastCapturedReaderEntries = [];
+  lastBidiReaderCaptureAt = 0;
   blocks = [];
   renderSessions();
   renderBlocks();
@@ -882,6 +937,7 @@ function connectToSession(sessionId) {
   lastBidiReaderRenderKey = '';
   bidiReaderPinnedToBottom = true;
   scheduleBidiReaderUpdate({ immediate: true });
+  refreshReadableFromTmuxSoon(350);
   focusTerminalSoon();
   setStatus('warn', 'attaching…', session.title);
 
@@ -893,6 +949,7 @@ function connectToSession(sessionId) {
     setStatus('ok', 'connected', `${session.title} • tmux resumable`);
     const { cols, rows } = currentDims();
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+    refreshReadableFromTmuxSoon(200);
     focusPreferredInput();
   });
 
@@ -913,6 +970,7 @@ function connectToSession(sessionId) {
 
     if (msg.type === 'hello') {
       setStatus('ok', 'connected', `tmux ${msg.sessionId} • attach pid ${msg.pid}`);
+      refreshReadableFromTmuxSoon(200);
       focusPreferredInput();
     } else if (msg.type === 'server-error') {
       setStatus('bad', 'error', msg.message || 'server error');

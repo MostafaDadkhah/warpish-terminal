@@ -487,10 +487,13 @@ body.bidi-mode .bidi-reader {
   display: grid;
   grid-template-rows: minmax(0, 1fr);
 }
-body.bidi-mode #terminal .xterm-screen {
+body.bidi-mode:not(.bidi-reader-has-content) .bidi-reader {
+  display: none;
+}
+body.bidi-mode.bidi-reader-has-content #terminal .xterm-screen {
   opacity: 0;
 }
-body.bidi-mode #terminal .xterm-cursor-layer {
+body.bidi-mode.bidi-reader-has-content #terminal .xterm-cursor-layer {
   opacity: 0;
 }
 .bidi-reader-head {
