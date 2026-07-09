@@ -275,6 +275,118 @@ function applyTextStyle(element, style = {}) {
   if (style.underline) element.style.textDecoration = 'underline';
 }
 
+function cloneTextStyle(style = {}) {
+  return {
+    fg: style.fg || '',
+    bg: style.bg || '',
+    bold: Boolean(style.bold),
+    dim: Boolean(style.dim),
+    italic: Boolean(style.italic),
+    underline: Boolean(style.underline),
+    inverse: Boolean(style.inverse),
+  };
+}
+
+function resetTextStyle(style, scope = 'all') {
+  if (scope === 'all') {
+    style.fg = '';
+    style.bg = '';
+    style.bold = false;
+    style.dim = false;
+    style.italic = false;
+    style.underline = false;
+    style.inverse = false;
+  } else if (scope === 'fg') {
+    style.fg = '';
+  } else if (scope === 'bg') {
+    style.bg = '';
+  }
+  return style;
+}
+
+function ansiRgb(r, g, b) {
+  const clamp = (value) => Math.max(0, Math.min(255, Number(value) || 0));
+  return `rgb(${clamp(r)}, ${clamp(g)}, ${clamp(b)})`;
+}
+
+function applyAnsiSgr(style, rawCodes = '') {
+  const codes = rawCodes === ''
+    ? [0]
+    : rawCodes.split(';').filter((part) => part.length).map((part) => Number(part));
+  if (!codes.length) codes.push(0);
+  for (let index = 0; index < codes.length; index += 1) {
+    const code = Number.isFinite(codes[index]) ? codes[index] : 0;
+    if (code === 0) resetTextStyle(style);
+    else if (code === 1) style.bold = true;
+    else if (code === 2) style.dim = true;
+    else if (code === 3) style.italic = true;
+    else if (code === 4) style.underline = true;
+    else if (code === 7) style.inverse = true;
+    else if (code === 22) { style.bold = false; style.dim = false; }
+    else if (code === 23) style.italic = false;
+    else if (code === 24) style.underline = false;
+    else if (code === 27) style.inverse = false;
+    else if (code === 39) resetTextStyle(style, 'fg');
+    else if (code === 49) resetTextStyle(style, 'bg');
+    else if (code >= 30 && code <= 37) style.fg = xtermPaletteColor(code - 30, style.bold);
+    else if (code >= 90 && code <= 97) style.fg = xtermPaletteColor(code - 90 + 8, style.bold);
+    else if (code >= 40 && code <= 47) style.bg = xtermPaletteColor(code - 40);
+    else if (code >= 100 && code <= 107) style.bg = xtermPaletteColor(code - 100 + 8);
+    else if (code === 38 || code === 48) {
+      const target = code === 38 ? 'fg' : 'bg';
+      const mode = codes[index + 1];
+      if (mode === 2 && codes.length >= index + 5) {
+        style[target] = ansiRgb(codes[index + 2], codes[index + 3], codes[index + 4]);
+        index += 4;
+      } else if (mode === 5 && codes.length >= index + 3) {
+        style[target] = xtermPaletteColor(codes[index + 2], style.bold);
+        index += 2;
+      }
+    }
+  }
+  return style;
+}
+
+function trimStyledEntryEnd(entry) {
+  const text = String(entry?.text || '').trimEnd();
+  const segments = entry?.segments?.length ? sliceStyledSegments(entry.segments, 0, text.length) : [];
+  return { text, segments };
+}
+
+function parseAnsiCaptureEntries(text = '') {
+  const entries = [];
+  let entry = { text: '', segments: [] };
+  const style = resetTextStyle({});
+  const pushEntry = () => {
+    entries.push(trimStyledEntryEnd(entry));
+    entry = { text: '', segments: [] };
+  };
+  const appendText = (value = '') => {
+    if (!value) return;
+    const clean = String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+    const parts = clean.split('\n');
+    parts.forEach((part, index) => {
+      if (index > 0) pushEntry();
+      if (!part) return;
+      entry.text += part;
+      mergeStyledSegment(entry.segments, part, cloneTextStyle(style));
+    });
+  };
+  const sgrPattern = /\x1b\[([0-9;]*)m/g;
+  let cursor = 0;
+  let match;
+  while ((match = sgrPattern.exec(String(text))) !== null) {
+    appendText(String(text).slice(cursor, match.index));
+    applyAnsiSgr(style, match[1]);
+    cursor = sgrPattern.lastIndex;
+  }
+  appendText(String(text).slice(cursor));
+  pushEntry();
+  return entries
+    .map(trimStyledEntryEnd)
+    .filter((item) => item.text.trim().length > 0);
+}
+
 function mergeStyledSegment(segments, text, style) {
   if (!text) return;
   const normalizedStyle = hasVisibleTextStyle(style) ? style : null;
@@ -381,10 +493,17 @@ function isTerminalAlternateBuffer() {
 }
 
 function isSparseReadableEntries(entries = []) {
-  if (!entries.length) return true;
-  const nonEmpty = entries.map((entry) => String(entry.text || '').trim()).filter(Boolean);
-  if (!nonEmpty.length) return true;
-  return nonEmpty.length <= 2 && nonEmpty.every((line) => /^(?:<[^>]+>|~|[│╭╰╮╯─\s])+$/u.test(line));
+  const visible = entries.map((entry) => String(entry?.text || '').trim()).filter(Boolean);
+  if (!visible.length) return true;
+  return visible.length <= 2 && visible.every((line) => /^(?:<[^>]+>|~|[│╭╰╮╯─\s]|\[[A-Z]+\])+$/u.test(line));
+}
+
+function entriesHaveVisibleText(entries = []) {
+  return entries.some((entry) => String(entry?.text || '').trim().length > 0);
+}
+
+function entriesHaveVisibleStyle(entries = []) {
+  return entries.some((entry) => Array.isArray(entry?.segments) && entry.segments.some((segment) => hasVisibleTextStyle(segment.style)));
 }
 
 function isBidiReaderNearBottom() {
@@ -492,9 +611,9 @@ function scheduleBidiReaderUpdate({ immediate = false } = {}) {
   bidiReaderUpdateTimer = window.setTimeout(() => requestAnimationFrame(flushBidiReaderUpdate), delay);
 }
 
-async function refreshBidiReaderFromCapture({ keepScroll = false } = {}) {
+async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture = false } = {}) {
   if (bidiReaderCaptureRefreshPending) {
-    if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll });
+    if (preferCapture && lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll });
     return;
   }
   if (!bidiReaderEnabled || !currentSessionId) {
@@ -504,20 +623,32 @@ async function refreshBidiReaderFromCapture({ keepScroll = false } = {}) {
   bidiReaderCaptureRefreshPending = true;
   lastBidiReaderCaptureAt = performance.now();
   try {
-    const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=1200`);
-    const entries = String(payload.text || '')
-      .split('\n')
-      .map((line) => ({ text: line.trimEnd() }))
-      .filter((entry) => entry.text.trim().length > 0)
+    const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=1200&ansi=1`);
+    const captureEntries = parseAnsiCaptureEntries(payload.text || '')
       .slice(-BIDI_READER_MAX_LINES);
-    if (entries.length) lastCapturedReaderEntries = entries;
+    if (captureEntries.length) lastCapturedReaderEntries = captureEntries;
+
     const xtermEntries = getReadableTerminalEntries();
-    const fallbackEntries = lastCapturedReaderEntries.length && isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries)
+    const xtermHasText = entriesHaveVisibleText(xtermEntries);
+    const xtermIsSparse = isSparseReadableEntries(xtermEntries);
+    const shouldUseCapture = Boolean(
+      captureEntries.length && (
+        preferCapture
+        || !xtermHasText
+        || (isTerminalAlternateBuffer() && xtermIsSparse)
+      )
+    );
+
+    const renderEntries = shouldUseCapture
+      ? captureEntries
+      : (xtermHasText ? xtermEntries : captureEntries);
+    renderBidiReader(renderEntries, { force: true, keepScroll });
+  } catch {
+    const xtermEntries = getReadableTerminalEntries();
+    const fallbackEntries = lastCapturedReaderEntries.length && (preferCapture || isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries))
       ? lastCapturedReaderEntries
       : xtermEntries;
-    renderBidiReader(entries.length ? entries : fallbackEntries, { force: true, keepScroll });
-  } catch {
-    renderBidiReader(lastCapturedReaderEntries.length ? lastCapturedReaderEntries : getReadableTerminalEntries(), { force: true, keepScroll });
+    renderBidiReader(fallbackEntries, { force: true, keepScroll });
   } finally {
     bidiReaderCaptureRefreshPending = false;
   }
@@ -1195,7 +1326,7 @@ terminalEl.addEventListener('wheel', (event) => {
       localStorage.setItem('warpish_readable_terminal_v1', 'on');
       applyBidiMode();
     } else {
-      refreshBidiReaderFromCapture().catch(() => renderBidiReader());
+      refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true }).catch(() => renderBidiReader());
     }
   }
   event.preventDefault();

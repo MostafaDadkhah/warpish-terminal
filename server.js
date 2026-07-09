@@ -482,10 +482,12 @@ function capturePreview(id, lines = 28) {
   }
 }
 
-function capturePaneText(id, { lines = 600, alternate = false } = {}) {
-  const args = ['capture-pane', '-p', '-J', '-t', id];
-  if (alternate) args.splice(1, 0, '-a');
+function capturePaneText(id, { lines = 600, alternate = false, escape = false } = {}) {
+  const args = ['capture-pane', '-p', '-J'];
+  if (escape) args.push('-e');
+  if (alternate) args.push('-a');
   else args.push('-S', `-${Math.max(20, Math.min(Number(lines) || 600, 5000))}`);
+  args.push('-t', id);
   try {
     return runTmux(args)
       .split('\n')
@@ -806,10 +808,11 @@ app.get('/api/sessions/:id/capture', (req, res) => {
   const { id } = req.params;
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
   const lines = clampNumber(req.query.lines, 600, 20, 5000);
-  const normal = capturePaneText(id, { lines });
-  const alternate = capturePaneText(id, { alternate: true });
+  const escape = req.query.ansi === '1' || req.query.escape === '1';
+  const normal = capturePaneText(id, { lines, escape });
+  const alternate = capturePaneText(id, { alternate: true, escape });
   const text = alternate.trim() ? alternate : normal;
-  res.json({ text, normal, alternate, usingAlternate: Boolean(alternate.trim()) });
+  res.json({ text, normal, alternate, usingAlternate: Boolean(alternate.trim()), ansi: escape });
 });
 
 app.patch('/api/sessions/:id', (req, res) => {
