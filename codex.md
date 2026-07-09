@@ -61,10 +61,13 @@ Manual server:
 npm start
 ```
 
-Smoke test:
+Smoke and browser regression tests:
 
 ```bash
 npm run smoke
+npm run regression
+# or run both:
+npm test
 ```
 
 Syntax checks:
@@ -109,9 +112,14 @@ zsh -n scripts/warpish-shell-integration.zsh
   - Layout and visual design.
 
 - `scripts/smoke.js`
-  - End-to-end regression test.
+  - End-to-end backend/tmux regression test.
   - Runs against a temporary `WARPISH_DATA_DIR`, token file, and session prefix so smoke sessions do not pollute the real sidebar.
   - Must keep proving session resume, command-block capture, bidi output, and stopped-history cleanup.
+
+- `scripts/browser-regressions.js`
+  - Headless Chrome/CDP regression test.
+  - Runs against a temporary `WARPISH_DATA_DIR`, token file, session prefix, and Chrome profile.
+  - Must keep proving readable-terminal ANSI styles, empty-reader fail-safe, and no stale-capture flicker while typing.
 
 ## Critical behavior to preserve
 
@@ -161,15 +169,16 @@ For backend/terminal/session changes:
 ```bash
 node --check server.js
 node --check scripts/smoke.js
+node --check scripts/browser-regressions.js
 zsh -n scripts/warpish-shell-integration.zsh
-npm run smoke
+npm test
 ```
 
 For frontend changes:
 
 ```bash
 node --check public/app.js
-npm run smoke
+npm test
 ```
 
 Then open the app in Chrome and verify at least:

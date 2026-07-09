@@ -47,6 +47,7 @@ Main files:
 - `public/app.js` — browser state, WebSocket handling, xterm.js integration, session list, command blocks UI.
 - `public/styles.css` — visual design for sidebar, terminal, default bidi/plaintext terminal styling, reader overlay, and block panel.
 - `scripts/smoke.js` — end-to-end smoke test for server health, isolated session creation, reconnect/resume, command-block capture, bidi output, and stopped-history cleanup.
+- `scripts/browser-regressions.js` — headless Chrome/CDP regression suite that starts an isolated server and verifies readable-terminal ANSI colors, empty-reader non-blanking, and no stale-capture flicker while typing.
 - `start.sh` / `stop.sh` — local lifecycle helpers.
 - `README.md` — user-facing run/security notes.
 - `.gitignore` — excludes runtime state, token, logs, and dependencies.

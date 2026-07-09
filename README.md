@@ -47,12 +47,14 @@ npm start
 # open the printed URL in Chrome
 ```
 
-Smoke test:
+Tests:
 
 ```bash
 cd warpish-terminal
-npm run smoke
+npm test
 ```
+
+`npm run smoke` checks backend/tmux/session behavior. `npm run regression` starts an isolated server plus headless Chrome and guards the readable-terminal regressions that caused previous bugs: ANSI colors, empty-reader blanking, and stale-capture flicker while typing.
 
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.
