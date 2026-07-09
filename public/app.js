@@ -592,7 +592,9 @@ function flushBidiReaderUpdate() {
   bidiReaderUpdateTimer = null;
   lastBidiReaderRenderAt = performance.now();
   const entries = getReadableTerminalEntries();
-  const shouldUseCapture = isTerminalAlternateBuffer() && (isSparseReadableEntries(entries) || lastCapturedReaderEntries.length > 0);
+  const xtermHasText = entriesHaveVisibleText(entries);
+  const xtermIsSparse = isSparseReadableEntries(entries);
+  const shouldUseCapture = isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse);
   if (shouldUseCapture) {
     if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries);
     if (performance.now() - lastBidiReaderCaptureAt > BIDI_CAPTURE_REFRESH_INTERVAL_MS) {
