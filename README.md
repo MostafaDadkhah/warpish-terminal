@@ -1,6 +1,6 @@
 # Warpish Terminal
 
-Local-only Chrome web terminal for this Mac, with Warp-like resumable terminal sessions.
+Local-only Chrome web terminal for macOS, with Warp-like resumable terminal sessions.
 
 ![Warpish Terminal screenshot](docs/screenshots/warpish-terminal.png)
 
@@ -14,23 +14,26 @@ What it does:
 - Uses a terminal-native layout: normal xterm input goes to the real shell, while input echo and output are shown through a default readable terminal mask. When an LTR shell prompt is followed by Persian/Arabic input, the prompt stays LTR and the typed suffix becomes a compact Word-style RTL segment; English commands, paths, flags, and code stay isolated LTR islands. The readable surface keeps typing focus across old-session reattaches, sends readable-mode keystrokes directly to the backing tmux pane when xterm attach input is stale, handles wheel scrolling through tmux-captured history instead of shell history, preserves live xterm ANSI/truecolor styles, dims inline suggestions after the cursor, keeps tmux-captured full-screen/alternate-screen apps such as Hermes visible instead of showing an empty waiting overlay, and throttles redraws to avoid streaming flicker. You can toggle back to raw xterm with `Readable: off` for edge-case TUIs.
 - Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
 
-Requirements already present on this Mac:
+Requirements:
+- macOS
 - Node.js
-- `/usr/bin/python3`
-- `tmux` (`/opt/homebrew/bin/tmux`)
+- Python 3
+- `tmux`
 - Google Chrome
 
 Run:
 
 ```bash
-cd ~/Documents/warpish-terminal
+git clone https://github.com/MostafaDadkhah/warpish-terminal.git
+cd warpish-terminal
+npm install
 ./start.sh
 ```
 
 Stop the web server:
 
 ```bash
-cd ~/Documents/warpish-terminal
+cd warpish-terminal
 ./stop.sh
 ```
 
@@ -39,7 +42,7 @@ Note: stopping the web server does not necessarily kill live `tmux` sessions. Us
 Dev/manual:
 
 ```bash
-cd ~/Documents/warpish-terminal
+cd warpish-terminal
 npm start
 # open the printed URL in Chrome
 ```
@@ -47,7 +50,7 @@ npm start
 Smoke test:
 
 ```bash
-cd ~/Documents/warpish-terminal
+cd warpish-terminal
 npm run smoke
 ```
 
