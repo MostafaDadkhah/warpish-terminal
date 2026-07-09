@@ -2,6 +2,8 @@
 
 Local-only Chrome web terminal for this Mac, with Warp-like resumable terminal sessions.
 
+![Warpish Terminal screenshot](docs/screenshots/warpish-terminal.png)
+
 What it does:
 - Opens a modern Chrome UI with a left sidebar.
 - Sidebar shows terminal session history with live/stopped state and recent preview.
