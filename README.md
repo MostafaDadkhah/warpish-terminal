@@ -54,7 +54,7 @@ cd warpish-terminal
 npm test
 ```
 
-`npm run smoke` checks backend/tmux/session behavior. `npm run regression` starts an isolated server plus headless Chrome and guards the readable-terminal regressions that caused previous bugs: ANSI colors, empty-reader blanking, and stale-capture flicker while typing.
+`npm run smoke` checks backend/tmux/session behavior. `npm run regression` starts an isolated server plus headless Chrome and guards the readable-terminal regressions that caused previous bugs: Hermes palette ANSI styles, empty-reader blanking, and stale-capture flicker while typing.
 
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.

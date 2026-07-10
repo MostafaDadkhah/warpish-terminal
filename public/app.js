@@ -76,6 +76,7 @@ const BIDI_READER_RENDER_INTERVAL_MS = 70;
 const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 600;
 const BIDI_READER_BOTTOM_EPSILON = 10;
 const XTERM_COLOR_MODE_PALETTE = 0x1000000;
+const XTERM_COLOR_MODE_P256 = 0x2000000;
 const XTERM_COLOR_MODE_RGB = 0x3000000;
 const ANSI_PALETTE = [
   '#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
@@ -230,8 +231,8 @@ function xtermPaletteColor(index, bold = false) {
 
 function xtermColor(mode, value, { bold = false } = {}) {
   if (!mode || value == null || value < 0) return '';
-  if (mode === XTERM_COLOR_MODE_PALETTE) return xtermPaletteColor(value, bold);
-  if (mode === XTERM_COLOR_MODE_RGB || mode === 0x2000000) return rgbToHex(value);
+  if (mode === XTERM_COLOR_MODE_PALETTE || mode === XTERM_COLOR_MODE_P256) return xtermPaletteColor(value, bold);
+  if (mode === XTERM_COLOR_MODE_RGB) return rgbToHex(value);
   return '';
 }
 

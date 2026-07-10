@@ -250,58 +250,61 @@ function respawnPane(sessionId, command) {
   execFileSync('tmux', ['respawn-pane', '-k', '-t', sessionId, command], { stdio: 'pipe' });
 }
 
-function ansiDemoCommand() {
+function hermesPaletteDemoCommand() {
   const ESC = '\x1b';
-  const screen = `${ESC}[2J${ESC}[H${ESC}[1;36mWarpish Terminal${ESC}[0m\n`
-    + `Readable ANSI regression fixture.\n\n`
-    + `${ESC}[38;2;139;92;246mdemo@localhost %${ESC}[0m hermes chat\n\n`
-    + `${ESC}[1m⚕ Hermes${ESC}[0m\n`
-    + `  سلام Mostafa — خروجی فارسی/English باید خوانا بماند.\n`
-    + `  English commands stay LTR: ${ESC}[33mgit status --short${ESC}[0m\n`
-    + `  Paths stay readable: ${ESC}[36m/demo/project/src/app.js${ESC}[0m\n`
-    + `  ANSI colors survive: ${ESC}[31mred${ESC}[0m  ${ESC}[32mgreen${ESC}[0m  ${ESC}[1;34mbold-blue${ESC}[0m  ${ESC}[38;2;255;128;64mtruecolor-orange${ESC}[0m  ${ESC}[48;2;64;40;10mbackground${ESC}[0m\n\n`
-    + `${ESC}[38;2;34;211;238mReadable: on${ESC}[0m\n`;
+  const screen = `${ESC}[2J${ESC}[HHermes readable regression fixture using captured Hermes SGR values.\n\n`
+    + `${ESC}[38;2;205;127;50mHermes border${ESC}[0m\n`
+    + `${ESC}[38;2;255;248;220mWelcome to Hermes Agent! Type your message or /help for commands.${ESC}[0m\n`
+    + `${ESC}[2;38;2;184;134;11m✦ Tip: BROWSER_CDP_URL connects browser tools to Chromium.${ESC}[0m\n`
+    + `${ESC}[1;33m⚠ 57 commits behind${ESC}[0;2;33m — run ${ESC}[1mhermes update${ESC}[0;2;33m to update${ESC}[0m\n`
+    + `${ESC}[1;38;5;71m[██░░░░░░░░]${ESC}[0m${ESC}[38;5;136m${ESC}[48;5;234m 18% │ 7m │ ⏱ 3m 36s${ESC}[0m\n`
+    + `${ESC}[38;5;173m────────────────────────────────────────${ESC}[0m\n`
+    + `${ESC}[3;38;5;136m⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel${ESC}[0m\n`
+    + `سلام Mostafa — خروجی فارسی/English باید خوانا بماند.\n`;
   const code = `import sys,time; sys.stdout.write(${JSON.stringify(screen)}); sys.stdout.flush(); time.sleep(90)`;
   return `python3 -c ${shellQuote(code)}`;
 }
 
-async function testAnsiStyles(page) {
-  const session = await createSession('ANSI Style Regression', path.join(runtimeRoot, 'ansi-cwd'));
-  respawnPane(session.id, ansiDemoCommand());
+async function testHermesPaletteStyles(page) {
+  const session = await createSession('Hermes Palette Regression', path.join(runtimeRoot, 'hermes-palette-cwd'));
+  respawnPane(session.id, hermesPaletteDemoCommand());
   await delay(800);
-  await page.navigate(`${tokenUrl}&case=ansi-styles`);
-  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('ANSI Style Regression')`, 15000, 'ANSI session selected');
+  await page.navigate(`${tokenUrl}&case=hermes-palette`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Hermes Palette Regression')`, 15000, 'Hermes palette session selected');
   const payload = await page.waitFor(`(() => {
-    const line = [...document.querySelectorAll('#bidiReaderLines .bidi-line')]
-      .find((candidate) => candidate.textContent.includes('ANSI colors survive'));
-    if (!line) return false;
-    const defaultColor = getComputedStyle(line).color;
-    const runs = [...line.querySelectorAll('.bidi-style-run')].map((node) => ({
+    const lines = [...document.querySelectorAll('#bidiReaderLines .bidi-line')];
+    if (!lines.some((line) => line.textContent.includes('Welcome to Hermes Agent'))) return false;
+    const runs = [...document.querySelectorAll('#bidiReaderLines .bidi-style-run')].map((node) => ({
       text: node.textContent,
       color: getComputedStyle(node).color,
       backgroundColor: getComputedStyle(node).backgroundColor,
       fontWeight: getComputedStyle(node).fontWeight,
+      fontStyle: getComputedStyle(node).fontStyle,
+      opacity: getComputedStyle(node).opacity,
       style: node.getAttribute('style') || '',
     }));
-    return { text: line.textContent, defaultColor, runs };
-  })()`, 15000, 'styled ANSI reader line');
+    return { text: lines.map((line) => line.textContent).join(String.fromCharCode(10)), runs };
+  })()`, 15000, 'styled Hermes palette reader output');
 
   const run = (needle) => payload.runs.find((item) => item.text.includes(needle));
-  const red = run('red');
-  const green = run('green');
-  const blue = run('bold-blue');
-  const orange = run('truecolor-orange');
-  const background = run('background');
+  const border = run('Hermes border');
+  const welcome = run('Welcome to Hermes Agent');
+  const tip = run('Tip: BROWSER_CDP_URL');
+  const warning = run('57 commits behind');
+  const progress = run('[██░░░░░░░░]');
+  const progressMeta = run('18%');
+  const promptHint = run('msg=interrupt');
 
-  assert(red && red.color !== payload.defaultColor, 'ANSI red run was not visibly styled', payload);
-  assert(green && green.color !== payload.defaultColor, 'ANSI green run was not visibly styled', payload);
-  assert(blue && blue.color !== payload.defaultColor && Number.parseInt(blue.fontWeight, 10) >= 700, 'ANSI bold blue run lost color or bold styling', payload);
-  assert(orange && /255\s*,\s*128\s*,\s*64/.test(orange.color), 'ANSI truecolor orange run was not preserved', payload);
-  assert(background && !['rgba(0, 0, 0, 0)', 'transparent'].includes(background.backgroundColor), 'ANSI background run lost background color', payload);
+  assert(border && /205\s*,\s*127\s*,\s*50/.test(border.color), 'Hermes border orange from captured SGR was not preserved', payload);
+  assert(welcome && /255\s*,\s*248\s*,\s*220/.test(welcome.color), 'Hermes warm welcome foreground was not preserved', payload);
+  assert(tip && /184\s*,\s*134\s*,\s*11/.test(tip.color) && Number(tip.opacity) < 1, 'Hermes dim gold tip styling was not preserved', payload);
+  assert(warning && /245\s*,\s*245\s*,\s*67/.test(warning.color) && Number.parseInt(warning.fontWeight, 10) >= 700, 'Hermes bold yellow warning styling was not preserved', payload);
+  assert(progress && /95\s*,\s*175\s*,\s*95/.test(progress.color) && Number.parseInt(progress.fontWeight, 10) >= 700, 'Hermes green progress styling was not preserved', payload);
+  assert(progressMeta && /175\s*,\s*135\s*,\s*0/.test(progressMeta.color) && /28\s*,\s*28\s*,\s*28/.test(progressMeta.backgroundColor), 'Hermes progress metadata foreground/background was not preserved', payload);
+  assert(promptHint && /175\s*,\s*135\s*,\s*0/.test(promptHint.color) && promptHint.fontStyle === 'italic', 'Hermes prompt hint italic/gold styling was not preserved', payload);
 
   return {
     ok: true,
-    line: payload.text,
     styledRuns: payload.runs.filter((item) => item.style).map((item) => item.text),
   };
 }
@@ -383,7 +386,7 @@ async function main() {
   await page.init();
   const health = await api('/healthz');
 
-  const ansiStyles = await testAnsiStyles(page);
+  const hermesPaletteStyles = await testHermesPaletteStyles(page);
   const emptyReaderGuard = await testEmptyReaderDoesNotBlankTerminal(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
 
@@ -399,7 +402,7 @@ async function main() {
       sessionPrefix,
     },
     regressions: {
-      ansiStyles,
+      hermesPaletteStyles,
       emptyReaderGuard,
       typingNoFlicker: {
         marker: typingNoFlicker.marker,
