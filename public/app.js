@@ -71,6 +71,8 @@ const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/@~#$%&+=\\'"`|^-]/u;
 const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
+const TERMINAL_LINK_RE = /(https?:\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+)/giu;
+const LINK_TRAILING_PUNCT_RE = /[.,;:!?،؛؟…]+$/u;
 const BIDI_READER_MAX_LINES = 2000;
 const BIDI_READER_RENDER_INTERVAL_MS = 70;
 const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 600;
@@ -116,12 +118,61 @@ function bidiTokenDirection(token = '', fallbackDir = 'ltr') {
   return fallbackDir;
 }
 
+function terminalLinkParts(raw = '') {
+  let url = String(raw || '');
+  let suffix = '';
+  const takeSuffix = (count = 1) => {
+    suffix = url.slice(-count) + suffix;
+    url = url.slice(0, -count);
+  };
+  const punctMatch = url.match(LINK_TRAILING_PUNCT_RE);
+  if (punctMatch?.[0]) {
+    takeSuffix(punctMatch[0].length);
+  }
+  if (url.endsWith(')') && !url.includes('(')) takeSuffix();
+  if (url.endsWith(']') && !url.includes('[')) takeSuffix();
+  return { url, suffix };
+}
+
+function terminalLinkHref(url = '') {
+  const value = String(url || '');
+  return /^www\./i.test(value) ? `https://${value}` : value;
+}
+
+function appendTerminalLinkifiedText(element, text = '') {
+  const value = String(text || '');
+  let cursor = 0;
+  for (const match of value.matchAll(TERMINAL_LINK_RE)) {
+    const raw = match[0] || '';
+    const start = match.index ?? 0;
+    if (start > cursor) element.appendChild(document.createTextNode(value.slice(cursor, start)));
+    const { url, suffix } = terminalLinkParts(raw);
+    const href = terminalLinkHref(url);
+    if (url && /^https?:\/\//i.test(href)) {
+      const link = document.createElement('a');
+      link.className = 'bidi-link';
+      link.href = href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.dir = 'ltr';
+      link.textContent = url;
+      link.title = 'Open link in new tab';
+      element.appendChild(link);
+      if (suffix) element.appendChild(document.createTextNode(suffix));
+    } else {
+      element.appendChild(document.createTextNode(raw));
+    }
+    cursor = start + raw.length;
+  }
+  if (cursor < value.length) element.appendChild(document.createTextNode(value.slice(cursor)));
+}
+
 function appendBidiRun(element, text, dir) {
   if (!text) return;
   const run = document.createElement('bdi');
   run.className = `bidi-run ${dir}`;
   run.dir = dir;
-  run.textContent = text;
+  appendTerminalLinkifiedText(run, text);
   element.appendChild(run);
 }
 

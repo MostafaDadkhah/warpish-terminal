@@ -554,6 +554,22 @@ body.bidi-mode.bidi-reader-has-content #terminal .xterm-cursor-layer {
 .bidi-style-run .bidi-run {
   color: inherit;
 }
+.bidi-link {
+  color: #67e8f9;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  unicode-bidi: isolate;
+  direction: ltr;
+}
+.bidi-link:hover {
+  color: #a5f3fc;
+}
+.bidi-style-run .bidi-link {
+  color: inherit;
+  text-decoration-color: currentColor;
+}
 .bidi-ghost {
   color: #8b86a8;
   opacity: 0.46;

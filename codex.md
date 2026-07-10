@@ -119,7 +119,7 @@ zsh -n scripts/warpish-shell-integration.zsh
 - `scripts/browser-regressions.js`
   - Headless Chrome/CDP regression test.
   - Runs against a temporary `WARPISH_DATA_DIR`, token file, session prefix, and Chrome profile.
-  - Must keep proving readable-terminal Hermes palette ANSI styles, empty-reader fail-safe, long Hermes scrollback readability, and no stale-capture flicker while typing.
+  - Must keep proving readable-terminal Hermes palette ANSI styles, clickable new-tab links, empty-reader fail-safe, long Hermes scrollback readability, and no stale-capture flicker while typing.
 
 ## Critical behavior to preserve
 

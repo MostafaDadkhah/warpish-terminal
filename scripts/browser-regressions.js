@@ -320,6 +320,63 @@ async function testHermesPaletteStyles(page) {
   };
 }
 
+function readableLinkDemoShellCommand() {
+  const lines = [
+    'Readable link regression fixture.',
+    'Source: https://example.com/path?q=1.',
+    'Docs: www.example.org/docs and encoded: https://api.torob.com/v4/base-product/search/?page=0&query=مودم',
+    'Persian URL: https://samennetwork.ir/product/مودم-4g-lte-قابل-حمل/',
+  ];
+  return `printf '%s\\n' ${lines.map((line) => shellQuote(line)).join(' ')}`;
+}
+
+async function testReadableLinksOpenNewTabs(page) {
+  const session = await createSession('Readable Link Regression', path.join(runtimeRoot, 'link-cwd'));
+  await delay(500);
+  await page.navigate(`${tokenUrl}&case=readable-links`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Readable Link Regression')`, 15000, 'readable-link session selected');
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'readable-link shell prompt visible');
+  await page.eval(`window.sendRaw(${JSON.stringify(`clear; ${readableLinkDemoShellCommand()}\r`)}, { directTmux: true })`);
+  const payload = await page.waitFor(`(() => {
+    const readerText = document.querySelector('#bidiReaderLines')?.innerText || '';
+    if (!readerText.includes('Readable link regression fixture.') || !readerText.includes('Persian URL:')) return false;
+    if (readerText.includes("printf '%s")) return false;
+    const anchors = [...document.querySelectorAll('#bidiReaderLines a.bidi-link')].map((node) => ({
+      text: node.textContent,
+      href: node.href,
+      decodedHref: decodeURI(node.href),
+      target: node.target,
+      rel: node.rel,
+      dir: node.dir,
+      title: node.title,
+      textDecorationLine: getComputedStyle(node).textDecorationLine,
+      cursor: getComputedStyle(node).cursor,
+    }));
+    if (anchors.length < 4) return false;
+    return { anchors, readerText: document.querySelector('#bidiReaderLines')?.innerText || '' };
+  })()`, 15000, 'readable links rendered as anchors');
+
+  const byText = (needle) => payload.anchors.find((link) => link.text.includes(needle));
+  const example = byText('https://example.com/path?q=1');
+  const www = byText('www.example.org/docs');
+  const torob = byText('api.torob.com');
+  const persian = byText('samennetwork.ir/product/مودم');
+
+  assert(example && example.href === 'https://example.com/path?q=1', 'http link href should exclude trailing punctuation', payload);
+  assert(payload.readerText.includes('https://example.com/path?q=1.'), 'trailing punctuation should remain visible after the link', payload);
+  assert(www && www.href === 'https://www.example.org/docs', 'www link should normalize to https href', payload);
+  assert(torob && torob.decodedHref.includes('query=مودم'), 'unicode query link was not preserved', payload);
+  assert(persian && persian.decodedHref.includes('/product/مودم-4g-lte-قابل-حمل/'), 'Persian path link was not preserved', payload);
+  for (const link of [example, www, torob, persian]) {
+    assert(link.target === '_blank', 'readable terminal links must open in a new tab', payload);
+    assert(link.rel.includes('noopener') && link.rel.includes('noreferrer'), 'readable terminal links need safe rel attributes', payload);
+    assert(link.dir === 'ltr', 'readable terminal links should render as LTR islands', payload);
+    assert(link.textDecorationLine.includes('underline') && link.cursor === 'pointer', 'readable terminal links should look clickable', payload);
+  }
+
+  return { ok: true, anchors: payload.anchors.map((link) => ({ text: link.text, href: link.href, target: link.target })) };
+}
+
 async function testEmptyReaderDoesNotBlankTerminal(page) {
   const payload = await page.eval(`(() => {
     const reader = document.getElementById('bidiReader');
@@ -495,6 +552,7 @@ async function main() {
   const health = await api('/healthz');
 
   const hermesPaletteStyles = await testHermesPaletteStyles(page);
+  const readableLinks = await testReadableLinksOpenNewTabs(page);
   const emptyReaderGuard = await testEmptyReaderDoesNotBlankTerminal(page);
   const longHermesScrollback = await testLongHermesScrollbackIsReadable(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
@@ -512,6 +570,7 @@ async function main() {
     },
     regressions: {
       hermesPaletteStyles,
+      readableLinks,
       emptyReaderGuard,
       longHermesScrollback: {
         lineCount: longHermesScrollback.lineCount,
