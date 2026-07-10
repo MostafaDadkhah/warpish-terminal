@@ -14,6 +14,7 @@ const renameSessionButton = document.getElementById('renameSession');
 const blocksToggleButton = document.getElementById('blocksToggle');
 const copySelection = document.getElementById('copySelection');
 const bidiToggleButton = document.getElementById('bidiToggle');
+const mouseModeToggleButton = document.getElementById('mouseModeToggle');
 const bidiReader = document.getElementById('bidiReader');
 const bidiReaderLines = document.getElementById('bidiReaderLines');
 const detachSessionButton = document.getElementById('detachSession');
@@ -65,6 +66,7 @@ let refreshTimer = null;
 let blockFilter = '';
 let blocksOpen = localStorage.getItem('warpish_blocks_open') === 'on';
 let bidiReaderEnabled = localStorage.getItem('warpish_readable_terminal_v1') !== 'off';
+let readerMouseMode = localStorage.getItem('warpish_reader_mouse_mode_v1') === 'raw' ? 'raw' : 'reader';
 let bidiReaderUpdatePending = false;
 
 const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
@@ -786,6 +788,25 @@ function applyBidiMode() {
   refitTerminal();
 }
 
+function applyReaderMouseMode() {
+  const raw = readerMouseMode === 'raw';
+  document.body.classList.toggle('reader-mouse-raw', raw);
+  document.body.classList.toggle('reader-mouse-reader', !raw);
+  if (mouseModeToggleButton) {
+    mouseModeToggleButton.textContent = `Mouse: ${raw ? 'raw' : 'reader'}`;
+    mouseModeToggleButton.title = raw
+      ? 'Mouse goes through the readable overlay to raw xterm/TUI apps; switch to reader for selection and links.'
+      : 'Mouse selects/scrolls readable text and opens links; switch to raw for mouse-enabled TUI apps.';
+  }
+}
+
+function setReaderMouseMode(mode) {
+  readerMouseMode = mode === 'raw' ? 'raw' : 'reader';
+  localStorage.setItem('warpish_reader_mouse_mode_v1', readerMouseMode);
+  applyReaderMouseMode();
+  focusTerminalSoon();
+}
+
 function focusTerminalSoon() {
   setTimeout(() => focusTerminalReliably(), 0);
 }
@@ -814,37 +835,48 @@ function handleTerminalInput(data) {
   sendRaw(data);
 }
 
-function getCookie(name) {
-  return document.cookie
-    .split(';')
-    .map((value) => value.trim())
-    .find((value) => value.startsWith(`${name}=`))
-    ?.slice(name.length + 1);
-}
-
 const initialParams = new URLSearchParams(window.location.search);
 const initialToken = initialParams.get('token');
 if (initialToken) {
   window.history.replaceState({}, document.title, window.location.pathname);
 }
 
-function authToken() {
-  return initialToken || decodeURIComponent(getCookie('warpish_token') || '');
+function authHeaders(options = {}) {
+  return {
+    ...(initialToken ? { 'x-warpish-token': initialToken } : {}),
+    ...(options.body ? { 'content-type': 'application/json' } : {}),
+    ...(options.headers || {}),
+  };
+}
+
+async function parseApiResponse(response) {
+  const text = await response.text();
+  const contentType = response.headers.get('content-type') || '';
+  const isJson = contentType.includes('application/json');
+  let payload = {};
+  if (text && isJson) {
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      payload = { error: `Invalid JSON response: ${error.message}` };
+    }
+  } else if (text) {
+    payload = { error: text };
+  }
+  if (!response.ok) {
+    const message = payload.error || payload.message || text || `HTTP ${response.status}`;
+    throw new Error(`HTTP ${response.status}: ${message}`);
+  }
+  return payload;
 }
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
-    headers: {
-      'x-warpish-token': authToken(),
-      ...(options.body ? { 'content-type': 'application/json' } : {}),
-      ...(options.headers || {}),
-    },
+    credentials: 'same-origin',
+    headers: authHeaders(options),
   });
-  const text = await response.text();
-  const payload = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(payload.error || payload.message || `HTTP ${response.status}`);
-  return payload;
+  return parseApiResponse(response);
 }
 
 function setStatus(kind, text, detail) {
@@ -908,7 +940,7 @@ function updateSessionHistoryActions() {
 }
 
 function renderSessions() {
-  sessionList.innerHTML = '';
+  sessionList.replaceChildren();
   updateSessionHistoryActions();
   if (!sessions.length) {
     const empty = document.createElement('div');
@@ -936,7 +968,11 @@ function renderSessions() {
 
     const meta = document.createElement('div');
     meta.className = 'session-meta';
-    meta.innerHTML = `<span>${formatRelative(session.lastOpenedAt || session.createdAt)}</span><span>${session.cwd || '~'}</span>`;
+    const whenSpan = document.createElement('span');
+    whenSpan.textContent = formatRelative(session.lastOpenedAt || session.createdAt);
+    const cwdSpan = document.createElement('span');
+    cwdSpan.textContent = session.cwd || '~';
+    meta.append(whenSpan, cwdSpan);
 
     const preview = document.createElement('div');
     preview.className = 'session-preview';
@@ -982,7 +1018,7 @@ function renderBlocks() {
     return;
   }
 
-  blockList.innerHTML = '';
+  blockList.replaceChildren();
 
   if (!currentSessionId) {
     const empty = document.createElement('div');
@@ -1120,7 +1156,6 @@ function socketUrl(sessionId) {
   const { cols, rows } = currentDims();
   const url = new URL('/ws', window.location.href);
   url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  url.searchParams.set('token', authToken());
   url.searchParams.set('sessionId', sessionId);
   url.searchParams.set('cols', String(cols));
   url.searchParams.set('rows', String(rows));
@@ -1232,18 +1267,44 @@ function connectToSession(sessionId) {
   });
 }
 
-function sendRaw(data, { directTmux = false } = {}) {
+function sendRaw(data, { directTmux = false, retry = 0 } = {}) {
   if (!currentSessionId) {
     term.writeln('\r\n\x1b[31mNo session selected. Create or select a terminal first.\x1b[0m');
     scheduleBidiReaderUpdate();
     return;
   }
   if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (retry >= 3) {
+      setStatus('bad', 'send failed', 'terminal is not connected after retrying');
+      return;
+    }
     connectToSession(currentSessionId);
-    setTimeout(() => sendRaw(data, { directTmux }), 500);
+    setTimeout(() => sendRaw(data, { directTmux, retry: retry + 1 }), 500);
     return;
   }
   ws.send(JSON.stringify({ type: 'input', data, directTmux }));
+}
+
+function selectedReadableText() {
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed || !bidiReaderLines) return '';
+  const text = selection.toString();
+  if (!text) return '';
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    const range = selection.getRangeAt(index);
+    const node = range.commonAncestorContainer?.nodeType === Node.ELEMENT_NODE
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer?.parentElement;
+    if (node && bidiReaderLines.contains(node)) return text;
+  }
+  return '';
+}
+
+async function copyTerminalSelection() {
+  const text = term.getSelection() || selectedReadableText();
+  if (!text) return;
+  await navigator.clipboard.writeText(text);
+  setStatus('ok', 'copied', text.length > 80 ? `${text.length} chars` : 'selection copied');
 }
 
 function isXtermHelperTarget(target) {
@@ -1466,13 +1527,12 @@ renameSessionButton.addEventListener('click', async () => {
   renderSessions();
 });
 
-copySelection.addEventListener('click', async () => {
-  const text = term.getSelection();
-  if (!text) return;
-  await navigator.clipboard.writeText(text);
+copySelection.addEventListener('click', () => {
+  copyTerminalSelection().catch((error) => setStatus('bad', 'copy failed', error.message));
 });
 
 blocksToggleButton?.addEventListener('click', () => setBlocksOpen(!blocksOpen));
+mouseModeToggleButton?.addEventListener('click', () => setReaderMouseMode(readerMouseMode === 'raw' ? 'reader' : 'raw'));
 
 bidiToggleButton.addEventListener('click', () => {
   bidiReaderEnabled = !bidiReaderEnabled;
@@ -1508,6 +1568,7 @@ window.addEventListener('keydown', (event) => {
 });
 
 applyPanelMode();
+applyReaderMouseMode();
 applyBidiMode();
 
 refreshSessions({ createIfEmpty: true }).catch((error) => {

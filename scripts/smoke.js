@@ -1,12 +1,13 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import WebSocket from 'ws';
 
-const port = Number(process.env.PORT || 8876);
+const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
 const projectRoot = new URL('..', import.meta.url).pathname;
 const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'warpish-smoke-'));
 const smokeDataDir = path.join(smokeRoot, 'data');
@@ -39,6 +40,17 @@ child.stdout.on('data', (chunk) => {
 child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const address = srv.address();
+      srv.close(() => resolve(address.port));
+    });
+    srv.on('error', reject);
+  });
+}
 
 async function waitForServer() {
   for (let i = 0; i < 100; i += 1) {
@@ -155,6 +167,7 @@ try {
   const parsed = new URL(tokenUrl);
   const token = parsed.searchParams.get('token');
   const health = await httpJson('/healthz');
+  const readiness = await httpJson('/readyz', { token });
   const indexHtml = await httpText('/', { token });
   const appJs = await httpText('/app.js', { token });
   const stylesCss = await httpText('/styles.css', { token });
@@ -164,10 +177,15 @@ try {
     && indexHtml.includes('clearStoppedSessions')
     && indexHtml.includes('blocksToggle')
     && indexHtml.includes('Readable: on')
+    && indexHtml.includes('mouseModeToggle')
     && appJs.includes('terminal-native-mode')
     && appJs.includes('warpish_readable_terminal_v1')
+    && appJs.includes('warpish_reader_mouse_mode_v1')
     && appJs.includes('warpish_blocks_open')
     && appJs.includes('function handleTerminalInput(data)')
+    && appJs.includes('function parseApiResponse(response)')
+    && appJs.includes('function selectedReadableText()')
+    && appJs.includes('function applyReaderMouseMode()')
     && appJs.includes('sendRaw(data)')
     && appJs.includes('directTmux')
     && appJs.includes('TERMINAL_LINK_RE')
@@ -240,6 +258,7 @@ try {
     && stylesCss.includes('.bidi-style-run')
     && stylesCss.includes('--reader-fg')
     && stylesCss.includes('pointer-events: auto')
+    && stylesCss.includes('body.reader-mouse-raw .bidi-reader')
     && stylesCss.includes('overscroll-behavior: contain')
     && stylesCss.includes('max-height: calc(100vh - 230px)')
     && stylesCss.includes('.bidi-link')
@@ -344,6 +363,7 @@ try {
   console.log(JSON.stringify({
     ok: true,
     health,
+    readinessOk: readiness.ok,
     createdSession: smokeSessionId,
     resumeVerified: Boolean(listedSession?.alive),
     sidebarPreviewHasMarker: Boolean(listedSession?.preview?.includes('__WARPISH_SMOKE__')),

@@ -32,7 +32,7 @@ Never add these to git:
 If you touch `.gitignore`, verify ignored files with:
 
 ```bash
-git check-ignore -v .auth-token .server.pid .warpish/sessions.json node_modules/.package-lock.json
+git check-ignore -v .auth-token .server.pid .warpish/sessions.json node_modules/.package-lock.json scripts/__pycache__/x.pyc
 ```
 
 ## Core commands
@@ -76,7 +76,10 @@ Syntax checks:
 node --check server.js
 node --check public/app.js
 node --check scripts/smoke.js
+node --check scripts/browser-regressions.js
+python3 -m py_compile scripts/pty-worker.py
 zsh -n scripts/warpish-shell-integration.zsh
+bash -n start.sh stop.sh
 ```
 
 ## Architecture map
@@ -119,7 +122,7 @@ zsh -n scripts/warpish-shell-integration.zsh
 - `scripts/browser-regressions.js`
   - Headless Chrome/CDP regression test.
   - Runs against a temporary `WARPISH_DATA_DIR`, token file, session prefix, and Chrome profile.
-  - Must keep proving readable-terminal Hermes palette ANSI styles, clickable new-tab links, empty-reader fail-safe, long Hermes scrollback readability, and no stale-capture flicker while typing.
+  - Must keep proving readable-terminal Hermes palette ANSI styles, safe clickable new-tab links, session-metadata XSS resistance, API plain-text error handling, mobile toolbar/blocks layout, explicit reader/raw mouse modes, empty-reader fail-safe, long Hermes scrollback readability, and no stale-capture flicker while typing.
 
 ## Critical behavior to preserve
 
@@ -130,7 +133,7 @@ zsh -n scripts/warpish-shell-integration.zsh
 - Keep the primary workspace terminal-native: command blocks must be collapsed/hidden by default so input and output stay in one large terminal surface.
 - Do not add a separate input-mask/composer section; one goal of this project is a readable terminal, so terminal input echo and terminal output should be masked/readable by default.
 - Cmd/Ctrl+K should focus the terminal, not open a separate command mask.
-- Readable overlay/focus/scroll regression guard: the overlay must not steal typing. Keep explicit focus handlers on the terminal surface/card so that after toolbar blur or old-session reattach, clicking the terminal/readable area focuses xterm. When readable mode is on, bridge keydown/paste from the readable surface directly to the backing tmux pane (`directTmux`) so old attach-session clients cannot swallow input; for stale prompt-only shell rows, a conservative `C-g C-u` recovery before the first printable key is allowed. Wheel over the readable surface should scroll the readable/tmux-captured history and stop propagation so it never turns into shell history/navigation input.
+- Readable overlay/focus/scroll/mouse regression guard: the overlay must not steal typing. Keep explicit focus handlers on the terminal surface/card so that after toolbar blur or old-session reattach, clicking the terminal/readable area focuses xterm. When readable mode is on, bridge keydown/paste from the readable surface directly to the backing tmux pane (`directTmux`) so old attach-session clients cannot swallow input; for stale prompt-only shell rows, a conservative `C-g C-u` recovery before the first printable key is allowed. Wheel over the readable surface should scroll the readable/tmux-captured history and stop propagation in reader mouse mode; raw mouse mode must pass pointer events through to xterm for mouse-enabled TUIs.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
 - Keep the readable terminal mask available as the default surface/toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML, splits LTR prompts from RTL suffix segments, isolates English/code/path runs as LTR, preserves live xterm and ANSI-preserving tmux-captured foreground/background/bold styling, dims inline suggestion text after the cursor, and throttles/cache-skips fast redraws so Hermes streaming output does not flicker. If a full-screen/alternate-screen terminal app leaves xterm scrollback at `baseY=0` or exposes only sparse/control-key artifacts, prefer tmux-captured reader content and do not hide raw xterm unless the reader has real content (`bidi-reader-has-content`); wheel should refresh/update this tmux-backed readable layer rather than trying to split the terminal layout or sending history/navigation input to the shell.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
@@ -152,15 +155,17 @@ zsh -n scripts/warpish-shell-integration.zsh
 - Rerun must send the recorded command back into the same selected session.
 - Search/copy actions are browser-only conveniences and must not mutate session state.
 - Do not rely only on OSC markers. tmux can filter or replay control sequences.
-- Do not blindly append every WebSocket output chunk to the active block; tmux redraw/replay can pollute block output.
+- If streaming output into the active block, append only while an explicit shell-integration start/end marker says a block is running, keep output capped, and test repeated commands/redraws; tmux redraw/replay can pollute block output.
 - If output extraction changes, update `npm run smoke` to catch regressions.
 
 ### Security
 
-- Default bind should stay local (`127.0.0.1`).
-- The token must stay secret and untracked.
+- Default bind should stay local (`127.0.0.1`); code must refuse non-loopback binds unless an explicit unsafe/remote opt-in flag is set.
+- The token must stay secret and untracked. Bootstrap query tokens may be used only to set an authenticated same-site cookie; frontend code should not keep relying on readable cookies or WebSocket query tokens.
 - Treat this app as equivalent to Terminal.app access.
 - Do not add public binding, remote tunneling, or phone access without stronger auth/TLS/network controls and explicit approval.
+- Never insert runtime/user/terminal metadata with `innerHTML` or HTML template strings. Session title, cwd, preview, command text, output, and status must be rendered via DOM nodes and `textContent`/safe link builders only.
+- Every security-sensitive UI fix needs a browser regression: hostile cwd/title must render literally, create no HTML nodes, and leave `window.__warpishXss` unset.
 
 ## Verification checklist before committing code changes
 
@@ -170,7 +175,9 @@ For backend/terminal/session changes:
 node --check server.js
 node --check scripts/smoke.js
 node --check scripts/browser-regressions.js
+python3 -m py_compile scripts/pty-worker.py
 zsh -n scripts/warpish-shell-integration.zsh
+bash -n start.sh stop.sh
 npm test
 ```
 
@@ -193,7 +200,7 @@ Then open the app in Chrome and verify at least:
 - terminal input echo/output are displayed through the default readable terminal mask without an input-mask section,
 - command blocks are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
 - clearing stopped session history removes stopped sidebar entries and keeps live sessions alive,
-- `hermes --resume 20260706_010032_731a69` leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured Hermes text rather than freezing or splitting the layout,
+- a disposable full-screen/resume-style terminal fixture leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured text rather than freezing or splitting the layout,
 - browser console has no JavaScript errors.
 
 For docs-only changes, at minimum verify:
@@ -214,7 +221,23 @@ git diff --cached --stat
 ```
 
 - Do not include runtime files or secrets.
-- If adding a GitHub/GitLab remote later, scan tracked files first and keep the repo private unless explicitly told otherwise.
+- The repo has a GitHub `origin`; scan tracked files before pushing and keep the repo private unless explicitly told otherwise.
+
+## Preventing repeat bugs
+
+These are hard rules for future development:
+
+1. Runtime metadata is hostile input. Do not use `innerHTML`, `insertAdjacentHTML`, or template-generated HTML for session/title/cwd/preview/block/terminal data. Prefer `replaceChildren()`, `document.createElement()`, `textContent`, and the existing safe linkifier.
+2. Any bug that lets same-origin JavaScript run is a shell-execution bug. Prove hostile metadata cannot execute before claiming a browser-terminal security fix is done.
+3. Auth changes must keep tokens out of long-lived frontend-readable storage. API/WS should work via same-origin cookies after bootstrap, with Origin checks and localhost bind guards preserved.
+4. Test servers must use isolated `WARPISH_DATA_DIR`, token files, session prefixes, and dynamic ports. Never let smoke/regression tests pollute the user's real `.warpish` sidebar or tmux sessions.
+5. Responsive UI must never hide destructive/critical controls (`Kill`, `Detach`, `Readable`, `Mouse`, `Blocks`, `Copy`) without an accessible replacement.
+6. Readable overlay changes must preserve both modes: reader mouse mode for selection/links/scrollback and raw mouse passthrough for mouse-enabled TUIs.
+7. API clients must handle non-JSON errors and preserve HTTP status in the displayed message.
+8. Start/stop scripts must validate process identity; do not kill arbitrary listeners just because they occupy the configured port.
+9. Durable docs must not contain private resume IDs, tokens, transient ports, or stale runtime claims. Use reproducible fixtures or placeholders.
+10. Before handoff, run `npm test` plus the syntax/check commands, then verify final `git status --short`.
+
 
 ## Known pitfalls
 

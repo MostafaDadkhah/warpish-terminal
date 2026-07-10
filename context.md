@@ -47,7 +47,7 @@ Main files:
 - `public/app.js` — browser state, WebSocket handling, xterm.js integration, session list, command blocks UI.
 - `public/styles.css` — visual design for sidebar, terminal, default bidi/plaintext terminal styling, reader overlay, and block panel.
 - `scripts/smoke.js` — end-to-end smoke test for server health, isolated session creation, reconnect/resume, command-block capture, bidi output, and stopped-history cleanup.
-- `scripts/browser-regressions.js` — headless Chrome/CDP regression suite that starts an isolated server and verifies readable-terminal Hermes palette ANSI styles, clickable new-tab links, empty-reader non-blanking, long Hermes scrollback readability, and no stale-capture flicker while typing.
+- `scripts/browser-regressions.js` — headless Chrome/CDP regression suite that starts an isolated server and verifies readable-terminal Hermes palette ANSI styles, safe clickable links, XSS-safe session metadata, API error handling, mobile toolbar/blocks layout, mouse-mode passthrough, empty-reader non-blanking, long Hermes scrollback readability, and no stale-capture flicker while typing.
 - `start.sh` / `stop.sh` — local lifecycle helpers.
 - `README.md` — user-facing run/security notes.
 - `.gitignore` — excludes runtime state, token, logs, and dependencies.
@@ -107,7 +107,7 @@ This is especially important for Hermes/Persian output, where raw terminal order
 
 ### 5. Security defaults are intentionally local
 
-The app binds to `127.0.0.1` by default and requires a random local token. Do not expose it publicly as plain HTTP. If remote/mobile access is added later, put it behind an authenticated private network or gateway with stronger auth/TLS/allowlisting.
+The app binds to `127.0.0.1` by default and requires a random local token. Non-loopback binds are refused in code unless `WARPISH_ALLOW_REMOTE=1` is explicitly set; if remote/mobile access is added later, put it behind an authenticated private network or gateway with stronger auth/TLS/allowlisting.
 
 ### 6. Git hygiene
 
@@ -137,7 +137,7 @@ Browser QA also verified:
 - direct terminal input executes in the real shell,
 - the readable terminal mask is default-on and covers the terminal surface without adding a separate input section,
 - Direct xterm typing of `hermes chat` was dogfooded with headless Chrome/CDP and screenshot evidence; it stayed in the terminal workflow while command blocks stayed hidden by default,
-- `hermes --resume 20260706_010032_731a69` was dogfooded in a disposable Warpish session: the backend stayed connected after resume, and wheel over a no-scrollback Hermes full-screen view opened a tmux-backed Bidi reader overlay instead of freezing the UI,
+- a disposable Hermes resume/full-screen-style fixture was dogfooded: the backend stayed connected after resume-style interaction, and wheel over a no-scrollback full-screen view opened a tmux-backed Bidi reader overlay instead of freezing the UI,
 - terminal-native layout was verified with a 1072×780 terminal viewport in browser QA,
 - block panel renders block count and block cards,
 - rerun creates another successful block,
@@ -154,4 +154,4 @@ Browser QA also verified:
 - Direct terminal typing is the only default input path; no input-mask section should split commands away from output. The readable mask is default-on, while raw xterm and blocks remain toggles so the terminal remains usable as a daily driver.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.
-- No GitHub remote is configured yet unless one is added later.
+- Git remote `origin` points at the project GitHub repository; keep the repo private unless explicitly told otherwise.

@@ -553,6 +553,78 @@ async function testTypingDoesNotRevertToStaleCapture(page) {
   return payload;
 }
 
+
+async function testSessionMetadataXssGuard(page) {
+  const payloadText = '<img src=x onerror=window.__warpishXss=1>';
+  const hostileCwd = path.join(runtimeRoot, `cwd-${payloadText}`);
+  fs.mkdirSync(hostileCwd, { recursive: true });
+  await createSession(`XSS title ${payloadText}`, hostileCwd);
+  await delay(500);
+  await page.navigate(`${tokenUrl}&case=xss-guard`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('XSS title')`, 15000, 'xss session selected');
+  const result = await page.eval(`(() => {
+    const card = [...document.querySelectorAll('.session-card')].find((node) => node.textContent.includes('XSS title'));
+    return {
+      xss: window.__warpishXss || 0,
+      imageCount: card ? card.querySelectorAll('img').length : -1,
+      cardText: card?.textContent || '',
+      metaHtml: card?.querySelector('.session-meta')?.innerHTML || '',
+    };
+  })()`);
+  assert(result.xss === 0, 'hostile session metadata executed JavaScript', result);
+  assert(result.imageCount === 0, 'hostile session metadata created HTML nodes', result);
+  assert(result.cardText.includes(payloadText), 'hostile metadata should render as literal text', result);
+  return result;
+}
+
+async function testApiPlainTextErrorHandling(page) {
+  const result = await page.eval(`(async () => {
+    try {
+      await api('/definitely-missing-route-for-api-error-test');
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: error.message };
+    }
+  })()`);
+  assert(result.ok === false, 'missing API route unexpectedly succeeded', result);
+  assert(result.message.includes('HTTP 404'), 'plain-text/html API error did not preserve HTTP status', result);
+  assert(!result.message.includes('Unexpected token'), 'API error handling leaked JSON.parse failure instead of real status', result);
+  return result;
+}
+
+async function testMouseModeAndMobileLayout(page) {
+  await page.send('Emulation.setDeviceMetricsOverride', { width: 820, height: 780, deviceScaleFactor: 1, mobile: false });
+  await page.navigate(`${tokenUrl}&case=mobile-layout`);
+  const mobile = await page.waitFor(`(() => {
+    document.body.classList.add('blocks-open');
+    const toolbar = document.querySelector('.toolbar-actions');
+    const grid = document.querySelector('.terminal-grid');
+    const mouseButton = document.getElementById('mouseModeToggle');
+    if (!toolbar || !grid || !mouseButton) return false;
+    return {
+      toolbarDisplay: getComputedStyle(toolbar).display,
+      toolbarOverflowX: getComputedStyle(toolbar).overflowX,
+      gridColumns: getComputedStyle(grid).gridTemplateColumns,
+      mouseText: mouseButton.textContent,
+    };
+  })()`, 15000, 'mobile toolbar and blocks layout');
+  assert(mobile.toolbarDisplay !== 'none', 'critical toolbar controls are hidden on narrow viewport', mobile);
+  assert(!mobile.gridColumns.includes('360px'), 'blocks-open mobile grid still forces a desktop second column', mobile);
+  const raw = await page.eval(`(() => {
+    document.getElementById('mouseModeToggle')?.click();
+    const reader = document.getElementById('bidiReader');
+    return {
+      bodyClass: document.body.className,
+      readerPointerEvents: reader ? getComputedStyle(reader).pointerEvents : '',
+      text: document.getElementById('mouseModeToggle')?.textContent || '',
+    };
+  })()`);
+  assert(raw.bodyClass.includes('reader-mouse-raw'), 'mouse raw passthrough mode did not activate', raw);
+  assert(raw.readerPointerEvents === 'none', 'raw mouse mode must pass pointer events through the readable overlay', raw);
+  await page.send('Emulation.clearDeviceMetricsOverride');
+  return { mobile, raw };
+}
+
 async function main() {
   assert(fs.existsSync(chromePath), `Chrome binary not found at ${chromePath}`);
   await startServer();
@@ -565,6 +637,9 @@ async function main() {
   const emptyReaderGuard = await testEmptyReaderDoesNotBlankTerminal(page);
   const longHermesScrollback = await testLongHermesScrollbackIsReadable(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
+  const sessionMetadataXssGuard = await testSessionMetadataXssGuard(page);
+  const apiPlainTextErrorHandling = await testApiPlainTextErrorHandling(page);
+  const mouseModeAndMobileLayout = await testMouseModeAndMobileLayout(page);
 
   console.log(JSON.stringify({
     ok: true,
@@ -593,6 +668,12 @@ async function main() {
         markerSampleCount: typingNoFlicker.markerSampleCount,
         sampleCount: typingNoFlicker.sampleCount,
       },
+      sessionMetadataXssGuard: {
+        imageCount: sessionMetadataXssGuard.imageCount,
+        xss: sessionMetadataXssGuard.xss,
+      },
+      apiPlainTextErrorHandling,
+      mouseModeAndMobileLayout,
     },
   }, null, 2));
 

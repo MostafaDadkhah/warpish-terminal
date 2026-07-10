@@ -11,6 +11,7 @@ import { WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const APP_NAME = 'warpish-terminal';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8765);
@@ -25,9 +26,11 @@ const EVENTS_DIR = path.join(DATA_DIR, 'events');
 const SHELL_INTEGRATION = path.join(__dirname, 'scripts/warpish-shell-integration.zsh');
 const MAX_BLOCKS_PER_SESSION = 300;
 const MAX_BLOCK_OUTPUT_CHARS = 24000;
+const MAX_CAPTURE_CHARS = 500_000;
 const TOKEN_FILE = path.resolve(process.env.WARPISH_TOKEN_FILE || path.join(__dirname, '.auth-token'));
-const TOKEN = process.env.WARPISH_TOKEN || readOrCreateToken(TOKEN_FILE);
 
+ensureLocalBindAllowed();
+const TOKEN = process.env.WARPISH_TOKEN || readOrCreateToken(TOKEN_FILE);
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(EVENTS_DIR, { recursive: true });
 
@@ -39,6 +42,59 @@ function findExecutable(candidates, fallback) {
   }
   return fallback;
 }
+
+function isLoopbackHost(host) {
+  const value = String(host || '').toLowerCase();
+  return ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(value);
+}
+
+function ensureLocalBindAllowed() {
+  if (isLoopbackHost(HOST)) return;
+  if (process.env.WARPISH_ALLOW_REMOTE === '1') return;
+  console.error(`Refusing to bind Warpish Terminal to non-loopback host "${HOST}".`);
+  console.error('This app is equivalent to Terminal.app access. Set WARPISH_ALLOW_REMOTE=1 only behind strong auth/TLS/network allowlisting.');
+  process.exit(1);
+}
+
+function sameOriginForReq(req) {
+  const protocol = req.headers['x-forwarded-proto'] || (req.socket?.encrypted ? 'https' : 'http');
+  return `${protocol}://${req.headers.host || `${HOST}:${PORT}`}`;
+}
+
+function isAllowedOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).origin === new URL(sameOriginForReq(req)).origin;
+  } catch {
+    return false;
+  }
+}
+
+function forbidden(res, message = 'Forbidden origin') {
+  res.statusCode = 403;
+  res.setHeader('content-type', 'text/plain; charset=utf-8');
+  res.end(message);
+}
+
+function isSecureRequest(req) {
+  return Boolean(req.socket?.encrypted || req.headers['x-forwarded-proto'] === 'https');
+}
+
+function cookieOptions(req) {
+  return {
+    httpOnly: true,
+    sameSite: 'strict',
+    secure: isSecureRequest(req),
+    maxAge: 1000 * 60 * 60 * 12,
+  };
+}
+
+function limitText(value, maxChars = MAX_CAPTURE_CHARS) {
+  const text = String(value || '');
+  return text.length > maxChars ? text.slice(-maxChars) : text;
+}
+
 
 function readOrCreateToken(file) {
   try {
@@ -83,11 +139,45 @@ function isValidSessionId(id) {
   return typeof id === 'string' && id.startsWith(PREFIX) && /^[a-z0-9-]+$/.test(id);
 }
 
+function defaultMetadata() {
+  return { sessions: {}, nextIndex: 1 };
+}
+
+function normalizeMetadata(meta) {
+  if (!meta || typeof meta !== 'object') return defaultMetadata();
+  if (!meta.sessions || typeof meta.sessions !== 'object' || Array.isArray(meta.sessions)) meta.sessions = {};
+  const nextIndex = Number(meta.nextIndex);
+  meta.nextIndex = Number.isFinite(nextIndex) && nextIndex > 0 ? Math.floor(nextIndex) : Object.keys(meta.sessions).length + 1;
+  for (const [id, record] of Object.entries(meta.sessions)) {
+    if (!record || typeof record !== 'object') {
+      delete meta.sessions[id];
+      continue;
+    }
+    record.id = record.id || id;
+    if (!Array.isArray(record.blocks)) record.blocks = [];
+  }
+  return meta;
+}
+
+function quarantineCorruptMetadata(error) {
+  try {
+    if (!fs.existsSync(METADATA_FILE)) return;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const corruptPath = `${METADATA_FILE}.corrupt-${stamp}`;
+    fs.renameSync(METADATA_FILE, corruptPath);
+    console.error(`Warpish metadata was corrupt and was moved to ${corruptPath}: ${error.message || error}`);
+  } catch (moveError) {
+    console.error(`Warpish metadata is corrupt and could not be moved aside: ${moveError.message || moveError}`);
+  }
+}
+
 function readMetadata() {
   try {
-    return JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8'));
-  } catch {
-    return { sessions: {}, nextIndex: 1 };
+    return normalizeMetadata(JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return defaultMetadata();
+    quarantineCorruptMetadata(error);
+    return defaultMetadata();
   }
 }
 
@@ -401,6 +491,7 @@ function createOutputProcessor(sessionId, { onTerminalData, onBlockEvent }) {
     if (!text) return;
     const stripped = text.endsWith(tmuxPrefix) ? text.slice(0, -tmuxPrefix.length) : text;
     if (!stripped) return;
+    appendBlockOutput(sessionId, stripped);
     onTerminalData(Buffer.from(stripped, 'utf8'));
   }
 
@@ -760,23 +851,54 @@ function createPtyWorker({ sessionId, cwd, cols, rows }) {
 const app = express();
 
 app.use((req, res, next) => {
+  res.setHeader('x-content-type-options', 'nosniff');
+  res.setHeader('referrer-policy', 'no-referrer');
+  res.setHeader('content-security-policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; frame-ancestors 'none'");
+  next();
+});
+
+app.use((req, res, next) => {
+  if (!isAllowedOrigin(req)) return forbidden(res);
   if (req.path === '/healthz') return next();
   const token = tokenFromReq(req);
   if (!safeToken(token)) return unauthorized(res);
   if (req.query.token) {
-    res.cookie('warpish_token', token, {
-      httpOnly: false,
-      sameSite: 'strict',
-      maxAge: 1000 * 60 * 60 * 12,
-    });
+    res.cookie('warpish_token', token, cookieOptions(req));
   }
   next();
 });
 
 app.use(express.json({ limit: '64kb' }));
 
+function readinessReport() {
+  const checks = [];
+  const add = (name, ok, detail = '') => checks.push({ name, ok: Boolean(ok), detail });
+  add('shell-executable', fs.existsSync(SHELL), SHELL);
+  add('python-executable', fs.existsSync(PYTHON), PYTHON);
+  try {
+    const version = runTmux(['-V']).trim();
+    add('tmux-version', true, `${TMUX} ${version}`);
+  } catch (error) {
+    add('tmux-version', false, error.message || String(error));
+  }
+  add('data-dir-writable', (() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.accessSync(DATA_DIR, fs.constants.W_OK);
+      return true;
+    } catch { return false; }
+  })(), DATA_DIR);
+  add('pty-worker-present', fs.existsSync(path.join(__dirname, 'scripts/pty-worker.py')), 'scripts/pty-worker.py');
+  return { ok: checks.every((check) => check.ok), checks };
+}
+
 app.get('/healthz', (_req, res) => {
-  res.json({ ok: true, host: HOST, port: PORT, shell: SHELL, python: PYTHON, tmux: TMUX, platform: process.platform });
+  res.json({ app: APP_NAME, ok: true, host: HOST, port: PORT, shell: SHELL, python: PYTHON, tmux: TMUX, platform: process.platform });
+});
+
+app.get('/readyz', (_req, res) => {
+  const readiness = readinessReport();
+  res.status(readiness.ok ? 200 : 503).json({ app: APP_NAME, ...readiness });
 });
 
 app.get('/api/sessions', (_req, res) => {
@@ -812,7 +934,13 @@ app.get('/api/sessions/:id/capture', (req, res) => {
   const normal = capturePaneText(id, { lines, escape });
   const alternate = capturePaneText(id, { alternate: true, escape });
   const text = alternate.trim() ? alternate : normal;
-  res.json({ text, normal, alternate, usingAlternate: Boolean(alternate.trim()), ansi: escape });
+  res.json({
+    text: limitText(text),
+    normal: limitText(normal),
+    alternate: limitText(alternate),
+    usingAlternate: Boolean(alternate.trim()),
+    ansi: escape,
+  });
 });
 
 app.patch('/api/sessions/:id', (req, res) => {
@@ -847,6 +975,11 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
+  if (!isAllowedOrigin(req)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   const token = tokenFromReq(req);
   if (!safeToken(token)) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -990,7 +1123,7 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, HOST, () => {
   const url = `http://${HOST}:${PORT}/?token=${encodeURIComponent(TOKEN)}`;
-  console.log('Warpish Terminal is running local-only.');
+  console.log(isLoopbackHost(HOST) ? 'Warpish Terminal is running local-only.' : 'Warpish Terminal is running with explicit remote-bind opt-in.');
   console.log(`URL: ${url}`);
   console.log(`Shell: ${SHELL}`);
   console.log(`tmux: ${TMUX}`);

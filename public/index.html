@@ -24,7 +24,7 @@
           <span>Session history</span>
           <div class="session-history-actions">
             <button id="clearStoppedSessions" title="Clear stopped sessions from history; live tmux sessions are kept">Clear</button>
-            <button id="refreshSessions" title="Refresh session list">↻</button>
+            <button id="refreshSessions" title="Refresh session list" aria-label="Refresh session list">↻</button>
           </div>
         </div>
 
@@ -62,6 +62,7 @@
                 <button id="renameSession" title="Rename selected session">Rename</button>
                 <button id="copySelection" title="Copy selected terminal text">Copy</button>
                 <button id="bidiToggle" class="bidi-toggle" title="Toggle the default readable terminal mask">Readable: on</button>
+                <button id="mouseModeToggle" class="mouse-toggle" title="Switch readable overlay mouse handling between reader selection/links and raw xterm/TUI passthrough">Mouse: reader</button>
                 <button id="detachSession" title="Detach from this session; tmux keeps it alive">Detach</button>
                 <button id="killSession" class="danger" title="Kill selected tmux session">Kill session</button>
               </div>
@@ -72,7 +73,7 @@
                 <span>Readable terminal</span>
                 <small>Default masked terminal output for mixed RTL/LTR lines</small>
               </div>
-              <div id="bidiReaderLines" class="bidi-reader-lines" aria-label="Bidi-readable terminal mirror"></div>
+              <div id="bidiReaderLines" class="bidi-reader-lines" aria-label="Bidi-readable terminal mirror" tabindex="0"></div>
             </div>
           </section>
 
@@ -82,7 +83,7 @@
                 <span>Command blocks</span>
                 <small id="blocksCount">0 blocks</small>
               </div>
-              <button id="refreshBlocks" title="Refresh command blocks">↻</button>
+              <button id="refreshBlocks" title="Refresh command blocks" aria-label="Refresh command blocks">↻</button>
             </div>
             <input id="blockSearch" autocomplete="off" spellcheck="false" dir="auto" placeholder="Search blocks…" />
             <div id="blockList" class="block-list" aria-label="Command blocks"></div>
