@@ -327,7 +327,7 @@ function readableLinkDemoShellCommand() {
     'Docs: www.example.org/docs and encoded: https://api.torob.com/v4/base-product/search/?page=0&query=مودم',
     'Persian URL: https://samennetwork.ir/product/مودم-4g-lte-قابل-حمل/',
   ];
-  return `printf '%s\\n' ${lines.map((line) => shellQuote(line)).join(' ')}`;
+  return `printf '%b\\n' ${lines.map((line) => shellQuote(line)).join(' ')}`;
 }
 
 async function testReadableLinksOpenNewTabs(page) {
@@ -335,12 +335,21 @@ async function testReadableLinksOpenNewTabs(page) {
   await delay(500);
   await page.navigate(`${tokenUrl}&case=readable-links`);
   await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Readable Link Regression')`, 15000, 'readable-link session selected');
+  const controlPayload = await page.eval(`(() => {
+    const host = document.createElement('div');
+    renderBidiRuns(host, 'Control boundary: https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.19' + String.fromCharCode(27) + '\\\\Hermes');
+    const link = host.querySelector('a.bidi-link');
+    return { text: host.textContent, linkText: link?.textContent || '', href: link?.href || '', target: link?.target || '', rel: link?.rel || '' };
+  })()`);
+  assert(controlPayload.linkText === 'https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.19', 'control bytes or following text leaked into direct link text', controlPayload);
+  assert(controlPayload.href === 'https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.19', 'control bytes or following text leaked into direct link href', controlPayload);
+  assert(controlPayload.text.includes('v2026.6.19 Hermes'), 'control boundary should remain readable as a text boundary', controlPayload);
   await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'readable-link shell prompt visible');
   await page.eval(`window.sendRaw(${JSON.stringify(`clear; ${readableLinkDemoShellCommand()}\r`)}, { directTmux: true })`);
   const payload = await page.waitFor(`(() => {
     const readerText = document.querySelector('#bidiReaderLines')?.innerText || '';
     if (!readerText.includes('Readable link regression fixture.') || !readerText.includes('Persian URL:')) return false;
-    if (readerText.includes("printf '%s")) return false;
+    if (readerText.includes("printf '%")) return false;
     const anchors = [...document.querySelectorAll('#bidiReaderLines a.bidi-link')].map((node) => ({
       text: node.textContent,
       href: node.href,

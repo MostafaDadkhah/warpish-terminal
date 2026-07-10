@@ -171,6 +171,7 @@ try {
     && appJs.includes('sendRaw(data)')
     && appJs.includes('directTmux')
     && appJs.includes('TERMINAL_LINK_RE')
+    && appJs.includes('\\x00-\\x1f\\x7f')
     && appJs.includes('function appendTerminalLinkifiedText(element, text =')
     && appJs.includes("link.target = '_blank'")
     && appJs.includes("link.rel = 'noopener noreferrer'")

@@ -71,7 +71,7 @@ const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/@~#$%&+=\\'"`|^-]/u;
 const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
-const TERMINAL_LINK_RE = /(https?:\/\/[^\s<>"'`]+|www\.[^\s<>"'`]+)/giu;
+const TERMINAL_LINK_RE = /(https?:\/\/[^\s<>"'`\x00-\x1f\x7f]+|www\.[^\s<>"'`\x00-\x1f\x7f]+)/giu;
 const LINK_TRAILING_PUNCT_RE = /[.,;:!?،؛؟…]+$/u;
 const BIDI_READER_MAX_LINES = 2000;
 const BIDI_READER_RENDER_INTERVAL_MS = 70;
@@ -139,8 +139,16 @@ function terminalLinkHref(url = '') {
   return /^www\./i.test(value) ? `https://${value}` : value;
 }
 
+function cleanTerminalLinkText(text = '') {
+  return String(text || '')
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, ' ')
+    .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, ' ')
+    .replace(/\x1b\\/g, ' ')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ');
+}
+
 function appendTerminalLinkifiedText(element, text = '') {
-  const value = String(text || '');
+  const value = cleanTerminalLinkText(text);
   let cursor = 0;
   for (const match of value.matchAll(TERMINAL_LINK_RE)) {
     const raw = match[0] || '';
@@ -418,7 +426,12 @@ function parseAnsiCaptureEntries(text = '') {
   };
   const appendText = (value = '') => {
     if (!value) return;
-    const clean = String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+    const clean = String(value)
+      .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, ' ')
+      .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, ' ')
+      .replace(/\x1b\\/g, ' ')
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ');
     const parts = clean.split('\n');
     parts.forEach((part, index) => {
       if (index > 0) pushEntry();
