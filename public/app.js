@@ -71,9 +71,10 @@ const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const STRONG_CHAR_RE = /[A-Za-z\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
 const LTR_TOKEN_CHAR_RE = /[A-Za-z0-9_.\/@~#$%&+=\\'"`|^-]/u;
 const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
-const BIDI_READER_MAX_LINES = 360;
+const BIDI_READER_MAX_LINES = 2000;
 const BIDI_READER_RENDER_INTERVAL_MS = 70;
 const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 600;
+const BIDI_CAPTURE_SETTLE_DELAY_MS = 450;
 const BIDI_READER_BOTTOM_EPSILON = 10;
 const XTERM_COLOR_MODE_PALETTE = 0x1000000;
 const XTERM_COLOR_MODE_P256 = 0x2000000;
@@ -92,8 +93,10 @@ let lastBidiReaderRenderKey = '';
 let bidiReaderPinnedToBottom = true;
 let bidiReaderCaptureForScrollPending = false;
 let bidiReaderCaptureRefreshPending = false;
+let bidiReaderCaptureSettleTimer = null;
 let lastBidiReaderCaptureAt = 0;
 let lastCapturedReaderEntries = [];
+let bidiReaderHistoryModeUntil = 0;
 let stalePromptRecoverySent = false;
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
@@ -588,6 +591,14 @@ function renderBidiReader(input = getReadableTerminalEntries(), { force = false,
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
 }
 
+function isBidiReaderHistoryMode() {
+  return performance.now() < bidiReaderHistoryModeUntil;
+}
+
+function preferBidiReaderHistoryForScroll() {
+  bidiReaderHistoryModeUntil = performance.now() + 3000;
+}
+
 function flushBidiReaderUpdate() {
   bidiReaderUpdatePending = false;
   bidiReaderUpdateTimer = null;
@@ -595,9 +606,10 @@ function flushBidiReaderUpdate() {
   const entries = getReadableTerminalEntries();
   const xtermHasText = entriesHaveVisibleText(entries);
   const xtermIsSparse = isSparseReadableEntries(entries);
-  const shouldUseCapture = isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse);
+  const shouldUseCapture = (isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse))
+    || (isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length);
   if (shouldUseCapture) {
-    if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries);
+    if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll: isBidiReaderHistoryMode() });
     if (performance.now() - lastBidiReaderCaptureAt > BIDI_CAPTURE_REFRESH_INTERVAL_MS) {
       refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom }).catch(() => renderBidiReader(entries, { force: true }));
     }
@@ -614,6 +626,20 @@ function scheduleBidiReaderUpdate({ immediate = false } = {}) {
   bidiReaderUpdateTimer = window.setTimeout(() => requestAnimationFrame(flushBidiReaderUpdate), delay);
 }
 
+function scheduleBidiReaderCaptureAfterOutput() {
+  if (!bidiReaderEnabled || !currentSessionId) return;
+  if (bidiReaderCaptureSettleTimer) window.clearTimeout(bidiReaderCaptureSettleTimer);
+  bidiReaderCaptureSettleTimer = window.setTimeout(() => {
+    bidiReaderCaptureSettleTimer = null;
+    refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom, preferCapture: true }).catch(() => {});
+  }, BIDI_CAPTURE_SETTLE_DELAY_MS);
+}
+
+function handleTerminalWriteComplete() {
+  scheduleBidiReaderUpdate();
+  scheduleBidiReaderCaptureAfterOutput();
+}
+
 async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture = false } = {}) {
   if (bidiReaderCaptureRefreshPending) {
     if (preferCapture && lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll });
@@ -626,7 +652,7 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
   bidiReaderCaptureRefreshPending = true;
   lastBidiReaderCaptureAt = performance.now();
   try {
-    const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=1200&ansi=1`);
+    const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=5000&ansi=1`);
     const captureEntries = parseAnsiCaptureEntries(payload.text || '')
       .slice(-BIDI_READER_MAX_LINES);
     if (captureEntries.length) lastCapturedReaderEntries = captureEntries;
@@ -686,11 +712,13 @@ function applyBidiMode() {
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
   if (!bidiReaderEnabled) setBidiReaderHasContent(false);
   if (bidiReaderUpdateTimer) window.clearTimeout(bidiReaderUpdateTimer);
+  if (bidiReaderCaptureSettleTimer) window.clearTimeout(bidiReaderCaptureSettleTimer);
   bidiReaderUpdatePending = false;
   bidiReaderUpdateTimer = null;
+  bidiReaderCaptureSettleTimer = null;
   lastBidiReaderRenderKey = '';
   bidiReaderPinnedToBottom = true;
-  if (bidiReaderEnabled) refreshBidiReaderFromCapture().catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
+  if (bidiReaderEnabled) refreshBidiReaderFromCapture({ preferCapture: true }).catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
   refitTerminal();
 }
 
@@ -1044,11 +1072,11 @@ function disconnectCurrent({ quiet = false } = {}) {
   ws = null;
 }
 
-function refreshReadableFromTmuxSoon(delay = 250) {
+function refreshReadableFromTmuxSoon(delay = 250, preferCapture = false) {
   if (!bidiReaderEnabled || !currentSessionId) return;
   setTimeout(() => {
     if (!bidiReaderEnabled || !currentSessionId) return;
-    refreshBidiReaderFromCapture().catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
+    refreshBidiReaderFromCapture({ preferCapture }).catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
   }, delay);
 }
 
@@ -1071,7 +1099,7 @@ function connectToSession(sessionId) {
   lastBidiReaderRenderKey = '';
   bidiReaderPinnedToBottom = true;
   scheduleBidiReaderUpdate({ immediate: true });
-  refreshReadableFromTmuxSoon(350);
+  refreshReadableFromTmuxSoon(350, true);
   focusTerminalSoon();
   setStatus('warn', 'attaching…', session.title);
 
@@ -1083,14 +1111,15 @@ function connectToSession(sessionId) {
     setStatus('ok', 'connected', `${session.title} • tmux resumable`);
     const { cols, rows } = currentDims();
     ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-    refreshReadableFromTmuxSoon(200);
+    refreshReadableFromTmuxSoon(200, true);
     focusPreferredInput();
   });
 
   ws.addEventListener('message', (event) => {
     if (serial !== connectionSerial) return;
     if (event.data instanceof ArrayBuffer) {
-      term.write(new Uint8Array(event.data), scheduleBidiReaderUpdate);
+      scheduleBidiReaderCaptureAfterOutput();
+      term.write(new Uint8Array(event.data), handleTerminalWriteComplete);
       return;
     }
 
@@ -1098,13 +1127,14 @@ function connectToSession(sessionId) {
     try {
       msg = JSON.parse(event.data);
     } catch {
-      term.write(event.data, scheduleBidiReaderUpdate);
+      scheduleBidiReaderCaptureAfterOutput();
+      term.write(event.data, handleTerminalWriteComplete);
       return;
     }
 
     if (msg.type === 'hello') {
       setStatus('ok', 'connected', `tmux ${msg.sessionId} • attach pid ${msg.pid}`);
-      refreshReadableFromTmuxSoon(200);
+      refreshReadableFromTmuxSoon(200, true);
       focusPreferredInput();
     } else if (msg.type === 'server-error') {
       setStatus('bad', 'error', msg.message || 'server error');
@@ -1275,14 +1305,20 @@ function shouldOpenReaderOnTrappedScroll() {
 
 function handleBidiReaderScroll() {
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
+  if (!bidiReaderEnabled || !currentSessionId || bidiReaderCaptureForScrollPending) return;
+  if (performance.now() - lastBidiReaderCaptureAt <= BIDI_CAPTURE_REFRESH_INTERVAL_MS) return;
+  preferBidiReaderHistoryForScroll();
+  refreshBidiReaderForScroll(0).catch(() => {});
 }
 
 async function refreshBidiReaderForScroll(deltaY) {
   if (bidiReaderCaptureForScrollPending || !currentSessionId || !bidiReaderLines) return;
   bidiReaderCaptureForScrollPending = true;
+  preferBidiReaderHistoryForScroll();
   const wasNearBottom = isBidiReaderNearBottom();
   try {
-    await refreshBidiReaderFromCapture({ keepScroll: true });
+    await refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true });
+    preferBidiReaderHistoryForScroll();
     if (wasNearBottom && deltaY < 0) {
       bidiReaderLines.scrollTop = Math.max(0, bidiReaderLines.scrollHeight - bidiReaderLines.clientHeight + deltaY);
     }
@@ -1296,7 +1332,7 @@ function handleBidiReaderWheel(event) {
   if (!bidiReaderEnabled || !bidiReaderLines) return;
   event.preventDefault();
   event.stopPropagation();
-  const needsTmuxHistory = event.deltaY < 0 && (term.buffer?.active?.baseY ?? 0) === 0;
+  const needsTmuxHistory = event.deltaY !== 0;
   if (needsTmuxHistory) refreshBidiReaderForScroll(event.deltaY).catch(() => {});
   bidiReaderLines.scrollTop += event.deltaY;
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();

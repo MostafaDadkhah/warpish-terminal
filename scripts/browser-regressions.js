@@ -234,6 +234,17 @@ class CdpPage {
     throw new Error(`timed out waiting for ${label}. last=${JSON.stringify(last)}`);
   }
 
+  async wheelAt(x, y, deltaY, deltaX = 0) {
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x,
+      y,
+      deltaX,
+      deltaY,
+      modifiers: 0,
+    });
+  }
+
   close() {
     try { this.ws?.close(); } catch {}
   }
@@ -327,10 +338,107 @@ async function testEmptyReaderDoesNotBlankTerminal(page) {
   return payload;
 }
 
+function longHermesScrollbackCommand({ topMarker, bottomMarker, lines = 650 }) {
+  const script = [
+    'import sys,time',
+    `print(${JSON.stringify(`${topMarker} Welcome to Hermes Agent long readable answer`)})`,
+    `for i in range(1, ${Number(lines) + 1}):`,
+    `    print(f"Hermes long answer line {i:04d}: مودم همراه دو سیم کارته / dual-SIM MiFi explanation continues")`,
+    `print(${JSON.stringify(bottomMarker)})`,
+    'sys.stdout.flush()',
+    'time.sleep(90)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+async function testLongHermesScrollbackIsReadable(page) {
+  const appJs = await httpText('/app.js');
+  assert(appJs.includes('const BIDI_READER_MAX_LINES = 2000'), 'readable terminal line cap is too small for long Hermes answers');
+  assert(appJs.includes('capture?lines=5000&ansi=1'), 'tmux capture line count is too small for long Hermes answers');
+  assert(appJs.includes('refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })'), 'reader wheel does not prefer tmux capture for history scroll');
+
+  const topMarker = `__WARPISH_LONG_SCROLL_TOP_${Date.now().toString(36)}__`;
+  const bottomMarker = `__WARPISH_LONG_SCROLL_BOTTOM_${Date.now().toString(36)}__`;
+  const session = await createSession('Long Hermes Scroll Regression', path.join(runtimeRoot, 'long-scroll-cwd'));
+  await delay(500);
+  await page.navigate(`${tokenUrl}&case=long-scrollback`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Long Hermes Scroll Regression')`, 15000, 'long-scroll session selected');
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'long-scroll shell prompt visible');
+  await page.eval(`window.sendRaw(${JSON.stringify(`${longHermesScrollbackCommand({ topMarker, bottomMarker, lines: 650 })}\r`)}, { directTmux: true })`);
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(bottomMarker)})`, 20000, 'long-scroll bottom marker visible');
+
+  const wheelPoint = await page.eval(`(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    const rect = lines?.getBoundingClientRect();
+    return rect ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null;
+  })()`);
+  assert(wheelPoint, 'could not locate readable reader for wheel test');
+  for (let index = 0; index < 10; index += 1) {
+    await page.wheelAt(wheelPoint.x, wheelPoint.y, -900);
+    await delay(120);
+  }
+
+  let payload = null;
+  let lastState = null;
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    lastState = await page.eval(`(() => {
+      const topMarker = ${JSON.stringify(topMarker)};
+      const bottomMarker = ${JSON.stringify(bottomMarker)};
+      const lines = document.getElementById('bidiReaderLines');
+      const reader = document.getElementById('bidiReader');
+      const text = lines?.innerText || '';
+      const split = text ? text.split(String.fromCharCode(10)) : [];
+      if (!lines) return { hasLines: false };
+      if (!text.includes(topMarker) || !text.includes(bottomMarker)) {
+        return {
+          ready: false,
+          title: document.querySelector('#sessionTitle')?.textContent || '',
+          bodyClass: document.body.className,
+          readerDisplay: reader ? getComputedStyle(reader).display : null,
+          lineCount: split.length,
+          hasTop: text.includes(topMarker),
+          hasBottom: text.includes(bottomMarker),
+          head: split.slice(0, 3),
+          tail: split.slice(-3),
+          scrollTop: lines.scrollTop,
+          scrollHeight: lines.scrollHeight,
+          clientHeight: lines.clientHeight,
+        };
+      }
+      lines.scrollTop = 0;
+      const topLine = [...lines.querySelectorAll('.bidi-line')].find((line) => line.textContent.includes(topMarker));
+      const containerRect = lines.getBoundingClientRect();
+      const topRect = topLine?.getBoundingClientRect();
+      return {
+        ready: true,
+        hasTop: true,
+        hasBottom: true,
+        lineCount: split.length,
+        scrollTop: lines.scrollTop,
+        scrollHeight: lines.scrollHeight,
+        clientHeight: lines.clientHeight,
+        topVisible: Boolean(topRect && topRect.bottom >= containerRect.top && topRect.top <= containerRect.bottom),
+      };
+    })()`);
+    if (lastState?.ready) {
+      payload = lastState;
+      break;
+    }
+    await delay(150);
+  }
+
+  assert(payload, 'long Hermes output was truncated from readable reader', lastState);
+  assert(payload.lineCount >= 650, 'readable reader did not retain enough long-output lines', payload);
+  assert(payload.topVisible, 'scrolling to the top of a long Hermes answer does not reveal the beginning', payload);
+  return payload;
+}
+
 async function testTypingDoesNotRevertToStaleCapture(page) {
   const appJs = await httpText('/app.js');
   assert(!appJs.includes('isSparseReadableEntries(entries) || lastCapturedReaderEntries.length > 0'), 'old captured-reader fast-path regression returned');
-  assert(appJs.includes('const shouldUseCapture = isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse)'), 'xterm-first reader fast-path guard is missing');
+  assert(appJs.includes('const shouldUseCapture = (isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse))'), 'xterm-first reader fast-path guard is missing');
+  assert(appJs.includes('isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length'), 'history-scroll capture guard is missing');
 
   const session = await createSession('Typing Flicker Regression', path.join(runtimeRoot, 'typing-cwd'));
   await delay(800);
@@ -388,6 +496,7 @@ async function main() {
 
   const hermesPaletteStyles = await testHermesPaletteStyles(page);
   const emptyReaderGuard = await testEmptyReaderDoesNotBlankTerminal(page);
+  const longHermesScrollback = await testLongHermesScrollbackIsReadable(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
 
   console.log(JSON.stringify({
@@ -404,6 +513,12 @@ async function main() {
     regressions: {
       hermesPaletteStyles,
       emptyReaderGuard,
+      longHermesScrollback: {
+        lineCount: longHermesScrollback.lineCount,
+        scrollHeight: longHermesScrollback.scrollHeight,
+        clientHeight: longHermesScrollback.clientHeight,
+        topVisible: longHermesScrollback.topVisible,
+      },
       typingNoFlicker: {
         marker: typingNoFlicker.marker,
         firstWithMarker: typingNoFlicker.firstWithMarker,
