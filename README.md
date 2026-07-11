@@ -19,6 +19,7 @@ Requirements:
 - Node.js 20.12+ and npm 10+
 - Python 3
 - `tmux`
+- zsh at `/bin/zsh` by default. Set `WARPISH_SHELL=/path/to/zsh` only if you need a different zsh-compatible shell.
 - Google Chrome. Regression tests use `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` by default; set `CHROME_BIN=/path/to/chrome` for a nonstandard install.
 
 Run:

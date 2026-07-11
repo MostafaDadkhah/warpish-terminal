@@ -276,6 +276,7 @@ try {
     && stylesCss.includes('unicode-bidi: plaintext')
     && appJs.includes('scrollLines')
     && appJs.includes('BLOCK_OUTPUT_PREVIEW_CHARS')
+    && serverJs.includes("const SHELL = process.env.WARPISH_SHELL || '/bin/zsh'")
     && serverJs.includes("shellQuote(SHELL),\n    '-l',\n    '-i'")
     && !appJs.includes('isAlternateBufferActive');
   if (!terminalNativeUiVerified) {

@@ -15,7 +15,7 @@ const APP_NAME = 'warpish-terminal';
 
 const HOST = process.env.HOST || '127.0.0.1';
 const PORT = Number(process.env.PORT || 8765);
-const SHELL = process.env.SHELL || '/bin/zsh';
+const SHELL = process.env.WARPISH_SHELL || '/bin/zsh';
 const PYTHON = process.env.PYTHON || '/usr/bin/python3';
 const TMUX = process.env.TMUX_BIN || findExecutable(['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'], 'tmux');
 const PREFIX = (process.env.WARPISH_SESSION_PREFIX || 'warpish-').replace(/[^a-z0-9-]/gi, '').toLowerCase() || 'warpish-';

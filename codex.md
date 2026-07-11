@@ -150,7 +150,7 @@ bash -n start.sh stop.sh
 
 ### Command blocks
 
-- New sessions should launch with scoped shell integration enabled via an explicit interactive login zsh (`-l -i`), because CI/non-user shells may not load hooks reliably without `-i`.
+- New sessions should launch with scoped shell integration enabled via the project-selected zsh-compatible shell (`WARPISH_SHELL` or `/bin/zsh`) as an explicit interactive login zsh (`-l -i`). Do not inherit ambient `SHELL` blindly; GitHub Actions and other CI runners often set `SHELL=/bin/bash`, which bypasses the zsh hook file and makes command blocks disappear.
 - Blocks should record command, output preview, status, exit code, start/end times, and duration.
 - Rerun must send the recorded command back into the same selected session.
 - Search/copy actions are browser-only conveniences and must not mutate session state.
