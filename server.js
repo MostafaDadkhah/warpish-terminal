@@ -233,6 +233,7 @@ function warpishShellCommand(sessionId, eventFile) {
     `ZDOTDIR=${shellQuote(ZDOTDIR)}`,
     shellQuote(SHELL),
     '-l',
+    '-i',
   ].join(' ');
 }
 

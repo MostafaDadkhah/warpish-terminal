@@ -150,7 +150,7 @@ bash -n start.sh stop.sh
 
 ### Command blocks
 
-- New sessions should launch with scoped shell integration enabled.
+- New sessions should launch with scoped shell integration enabled via an explicit interactive login zsh (`-l -i`), because CI/non-user shells may not load hooks reliably without `-i`.
 - Blocks should record command, output preview, status, exit code, start/end times, and duration.
 - Rerun must send the recorded command back into the same selected session.
 - Search/copy actions are browser-only conveniences and must not mutate session state.

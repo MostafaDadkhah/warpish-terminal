@@ -276,6 +276,7 @@ try {
     && stylesCss.includes('unicode-bidi: plaintext')
     && appJs.includes('scrollLines')
     && appJs.includes('BLOCK_OUTPUT_PREVIEW_CHARS')
+    && serverJs.includes("shellQuote(SHELL),\n    '-l',\n    '-i'")
     && !appJs.includes('isAlternateBufferActive');
   if (!terminalNativeUiVerified) {
     throw new Error('terminal-native raw/default-readable UI source verification failed');
