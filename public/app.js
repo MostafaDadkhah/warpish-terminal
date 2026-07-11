@@ -94,14 +94,19 @@ let blockRenderPending = false;
 let bidiReaderUpdateTimer = null;
 let lastBidiReaderRenderAt = 0;
 let lastBidiReaderRenderKey = '';
+let lastBidiReaderRenderSource = 'xterm';
 let bidiReaderPinnedToBottom = true;
 let bidiReaderCaptureForScrollPending = false;
 let bidiReaderCaptureRefreshPending = false;
+let bidiReaderCaptureRefreshQueued = null;
 let bidiReaderCaptureSettleTimer = null;
 let lastBidiReaderCaptureAt = 0;
 let lastCapturedReaderEntries = [];
 let bidiReaderHistoryModeUntil = 0;
 let stalePromptRecoverySent = false;
+let terminalFocusTimer = null;
+let terminalFitRaf = null;
+let lastSentTerminalSize = '';
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
   const value = String(text || '');
@@ -626,15 +631,83 @@ function setBidiReaderHasContent(hasContent) {
   if (bidiReader) bidiReader.classList.toggle('has-content', Boolean(hasContent));
 }
 
-function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false } = {}) {
+function readableEntryComparableText(entry) {
+  return String(entry?.text || '').replace(/[\s\u00a0]+$/gu, '');
+}
+
+function mergeCapturedReaderEntriesWithLiveTail(capturedEntries = [], liveEntries = []) {
+  if (!capturedEntries.length) return liveEntries;
+  if (!liveEntries.length) return capturedEntries;
+  if (capturedEntries.length <= liveEntries.length) return liveEntries;
+
+  const capturedTexts = capturedEntries.map(readableEntryComparableText);
+  const liveTexts = liveEntries.map(readableEntryComparableText);
+  const searchStart = Math.max(0, capturedEntries.length - liveEntries.length - 100);
+  let bestIndex = -1;
+  let bestMatched = 0;
+  for (let index = searchStart; index < capturedEntries.length; index += 1) {
+    let matched = 0;
+    for (let liveIndex = 0; liveIndex < liveTexts.length && index + liveIndex < capturedTexts.length; liveIndex += 1) {
+      if (capturedTexts[index + liveIndex] !== liveTexts[liveIndex]) break;
+      matched += 1;
+    }
+    if (matched > bestMatched) {
+      bestMatched = matched;
+      bestIndex = index;
+    }
+  }
+
+  const minimumOverlap = Math.min(3, liveEntries.length);
+  if (bestIndex >= 0 && bestMatched >= minimumOverlap) {
+    return capturedEntries.slice(0, bestIndex).concat(liveEntries);
+  }
+
+  const tailLength = Math.min(liveEntries.length, Math.max(12, Math.min(term?.rows || 36, 80)));
+  return capturedEntries.concat(liveEntries.slice(-tailLength));
+}
+
+function captureBidiReaderAnchor() {
+  if (!bidiReaderLines) return null;
+  const containerRect = bidiReaderLines.getBoundingClientRect();
+  const lines = [...bidiReaderLines.querySelectorAll('.bidi-line')];
+  const node = lines.find((line) => {
+    const rect = line.getBoundingClientRect();
+    return rect.bottom > containerRect.top + 4 && rect.top < containerRect.bottom - 4;
+  });
+  if (!node) return null;
+  return {
+    index: lines.indexOf(node),
+    text: node.dataset.logicalText || node.textContent || '',
+    offset: node.getBoundingClientRect().top - containerRect.top,
+  };
+}
+
+function restoreBidiReaderAnchor(anchor) {
+  if (!anchor || !bidiReaderLines) return false;
+  const lines = [...bidiReaderLines.querySelectorAll('.bidi-line')];
+  if (!lines.length) return false;
+  const exact = lines.find((line) => (line.dataset.logicalText || line.textContent || '') === anchor.text);
+  const fallback = lines[Math.min(anchor.index, lines.length - 1)];
+  const node = exact || fallback;
+  if (!node) return false;
+  const containerRect = bidiReaderLines.getBoundingClientRect();
+  const delta = node.getBoundingClientRect().top - containerRect.top - anchor.offset;
+  if (Math.abs(delta) > 0.5) bidiReaderLines.scrollTop += delta;
+  return true;
+}
+
+function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false, source = 'xterm' } = {}) {
   if (!bidiReaderLines) return;
   const entries = normalizeReadableEntries(input);
   const hasContent = entries.length > 0;
   const key = `${hasContent ? 'content' : 'empty'}\n${readableEntriesKey(entries)}`;
   if (!force && key === lastBidiReaderRenderKey) return;
-  const wasPinned = keepScroll ? false : (bidiReaderPinnedToBottom || isBidiReaderNearBottom());
+  const previousNearBottom = isBidiReaderNearBottom();
+  const wasPinned = previousNearBottom || (!keepScroll && bidiReaderPinnedToBottom);
   const previousScrollTop = bidiReaderLines.scrollTop;
+  const anchor = keepScroll && !wasPinned ? captureBidiReaderAnchor() : null;
   lastBidiReaderRenderKey = key;
+  lastBidiReaderRenderSource = source;
   setBidiReaderHasContent(hasContent);
 
   const fragment = document.createDocumentFragment();
@@ -653,7 +726,10 @@ function renderBidiReader(input = getReadableTerminalEntries(), { force = false,
 
   bidiReaderLines.replaceChildren(fragment);
   if (wasPinned) bidiReaderLines.scrollTop = bidiReaderLines.scrollHeight;
-  else bidiReaderLines.scrollTop = Math.min(previousScrollTop, bidiReaderLines.scrollHeight);
+  else if (!restoreBidiReaderAnchor(anchor)) {
+    const maxScrollTop = Math.max(0, bidiReaderLines.scrollHeight - bidiReaderLines.clientHeight);
+    bidiReaderLines.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+  }
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
 }
 
@@ -672,16 +748,25 @@ function flushBidiReaderUpdate() {
   const entries = getReadableTerminalEntries();
   const xtermHasText = entriesHaveVisibleText(entries);
   const xtermIsSparse = isSparseReadableEntries(entries);
+  const readerIsScrolledInCaptureHistory = !bidiReaderPinnedToBottom && lastBidiReaderRenderSource === 'capture' && lastCapturedReaderEntries.length > 0;
+  const readerHasRicherCapture = lastCapturedReaderEntries.length >= entries.length + 80 && entriesHaveVisibleText(lastCapturedReaderEntries);
   const shouldUseCapture = (isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse))
-    || (isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length);
+    || readerIsScrolledInCaptureHistory
+    || (isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length)
+    || readerHasRicherCapture;
   if (shouldUseCapture) {
-    if (lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll: isBidiReaderHistoryMode() });
+    if (lastCapturedReaderEntries.length) {
+      const renderEntries = xtermHasText
+        ? mergeCapturedReaderEntriesWithLiveTail(lastCapturedReaderEntries, entries)
+        : lastCapturedReaderEntries;
+      renderBidiReader(renderEntries, { keepScroll: readerIsScrolledInCaptureHistory || isBidiReaderHistoryMode() || !bidiReaderPinnedToBottom, source: 'capture' });
+    }
     if (performance.now() - lastBidiReaderCaptureAt > BIDI_CAPTURE_REFRESH_INTERVAL_MS) {
-      refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom }).catch(() => renderBidiReader(entries, { force: true }));
+      refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom }).catch(() => renderBidiReader(entries, { force: true, source: 'xterm' }));
     }
     return;
   }
-  renderBidiReader(entries);
+  renderBidiReader(entries, { source: 'xterm' });
 }
 
 function scheduleBidiReaderUpdate({ immediate = false } = {}) {
@@ -702,13 +787,22 @@ function scheduleBidiReaderCaptureAfterOutput() {
 }
 
 function handleTerminalWriteComplete() {
+  if (!bidiReaderPinnedToBottom && lastCapturedReaderEntries.length) {
+    scheduleBidiReaderCaptureAfterOutput();
+    return;
+  }
   scheduleBidiReaderUpdate();
   scheduleBidiReaderCaptureAfterOutput();
 }
 
 async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture = false } = {}) {
   if (bidiReaderCaptureRefreshPending) {
-    if (preferCapture && lastCapturedReaderEntries.length) renderBidiReader(lastCapturedReaderEntries, { keepScroll });
+    if (preferCapture || keepScroll) {
+      bidiReaderCaptureRefreshQueued = {
+        keepScroll: keepScroll || Boolean(bidiReaderCaptureRefreshQueued?.keepScroll),
+        preferCapture: preferCapture || Boolean(bidiReaderCaptureRefreshQueued?.preferCapture),
+      };
+    }
     return;
   }
   if (!bidiReaderEnabled || !currentSessionId) {
@@ -734,27 +828,46 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
       )
     );
 
-    const renderEntries = shouldUseCapture
-      ? captureEntries
-      : (xtermHasText ? xtermEntries : captureEntries);
-    renderBidiReader(renderEntries, { force: true, keepScroll });
+    const captureIsRicherHistory = captureEntries.length >= xtermEntries.length + 80;
+    const renderEntries = captureIsRicherHistory && xtermHasText
+      ? mergeCapturedReaderEntriesWithLiveTail(captureEntries, xtermEntries)
+      : (shouldUseCapture ? captureEntries : (xtermHasText ? xtermEntries : captureEntries));
+    const renderSource = (captureIsRicherHistory || shouldUseCapture || !xtermHasText) ? 'capture' : 'xterm';
+    renderBidiReader(renderEntries, { force: true, keepScroll, source: renderSource });
   } catch {
     const xtermEntries = getReadableTerminalEntries();
-    const fallbackEntries = lastCapturedReaderEntries.length && (preferCapture || isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries))
+    const useCaptureFallback = lastCapturedReaderEntries.length && (preferCapture || isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries));
+    const fallbackEntries = useCaptureFallback
       ? lastCapturedReaderEntries
       : xtermEntries;
-    renderBidiReader(fallbackEntries, { force: true, keepScroll });
+    renderBidiReader(fallbackEntries, { force: true, keepScroll, source: useCaptureFallback ? 'capture' : 'xterm' });
   } finally {
     bidiReaderCaptureRefreshPending = false;
+    if (bidiReaderCaptureRefreshQueued) {
+      const queued = bidiReaderCaptureRefreshQueued;
+      bidiReaderCaptureRefreshQueued = null;
+      window.setTimeout(() => refreshBidiReaderFromCapture(queued).catch(() => {}), 0);
+    }
+  }
+}
+
+function sendResizeIfChanged(cols = term.cols || 120, rows = term.rows || 36) {
+  const key = `${cols}x${rows}`;
+  if (key === lastSentTerminalSize) return;
+  lastSentTerminalSize = key;
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'resize', cols, rows }));
   }
 }
 
 function refitTerminal() {
-  requestAnimationFrame(() => {
+  if (terminalFitRaf) return;
+  terminalFitRaf = requestAnimationFrame(() => {
+    terminalFitRaf = null;
+    const anchor = captureBidiReaderAnchor();
     try { if (fitAddon) fitAddon.fit(); } catch {}
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'resize', cols: term.cols || 120, rows: term.rows || 36 }));
-    }
+    if (!bidiReaderPinnedToBottom) restoreBidiReaderAnchor(anchor);
+    sendResizeIfChanged();
   });
 }
 
@@ -782,7 +895,9 @@ function applyBidiMode() {
   bidiReaderUpdatePending = false;
   bidiReaderUpdateTimer = null;
   bidiReaderCaptureSettleTimer = null;
+  bidiReaderCaptureRefreshQueued = null;
   lastBidiReaderRenderKey = '';
+  lastBidiReaderRenderSource = 'xterm';
   bidiReaderPinnedToBottom = true;
   if (bidiReaderEnabled) refreshBidiReaderFromCapture({ preferCapture: true }).catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
   refitTerminal();
@@ -807,15 +922,48 @@ function setReaderMouseMode(mode) {
   focusTerminalSoon();
 }
 
+function preserveViewportAndReaderScroll(callback) {
+  const pageX = window.scrollX;
+  const pageY = window.scrollY;
+  const readerScrollTop = bidiReaderLines?.scrollTop ?? null;
+  try {
+    callback();
+  } finally {
+    if (readerScrollTop !== null && bidiReaderLines && !bidiReaderPinnedToBottom) {
+      bidiReaderLines.scrollTop = readerScrollTop;
+    }
+    if (window.scrollX !== pageX || window.scrollY !== pageY) {
+      window.scrollTo(pageX, pageY);
+    }
+  }
+}
+
+function focusTerminalOnceWithoutScroll() {
+  preserveViewportAndReaderScroll(() => {
+    const helper = terminalEl?.querySelector?.('.xterm-helper-textarea');
+    if (helper?.focus) {
+      try {
+        helper.focus({ preventScroll: true });
+        return;
+      } catch {}
+    }
+    term.focus();
+  });
+}
+
 function focusTerminalSoon() {
-  setTimeout(() => focusTerminalReliably(), 0);
+  if (terminalFocusTimer) return;
+  terminalFocusTimer = setTimeout(() => {
+    terminalFocusTimer = null;
+    focusTerminalReliably();
+  }, 0);
 }
 
 function focusTerminalReliably() {
-  term.focus();
-  requestAnimationFrame(() => term.focus());
-  setTimeout(() => term.focus(), 80);
-  setTimeout(() => term.focus(), 240);
+  focusTerminalOnceWithoutScroll();
+  requestAnimationFrame(() => focusTerminalOnceWithoutScroll());
+  setTimeout(() => focusTerminalOnceWithoutScroll(), 80);
+  setTimeout(() => focusTerminalOnceWithoutScroll(), 240);
 }
 
 function shouldPreserveControlFocus(event) {
@@ -1190,6 +1338,8 @@ function connectToSession(sessionId) {
   stalePromptRecoverySent = false;
   lastCapturedReaderEntries = [];
   lastBidiReaderCaptureAt = 0;
+  bidiReaderCaptureRefreshQueued = null;
+  lastBidiReaderRenderSource = 'xterm';
   blocks = [];
   renderSessions();
   renderBlocks();
@@ -1412,16 +1562,11 @@ function handleReadableTerminalPaste(event) {
 
 term.onData((data) => handleTerminalInput(data));
 term.onResize(({ cols, rows }) => {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-  }
+  sendResizeIfChanged(cols, rows);
 });
 
 const resizeObserver = new ResizeObserver(() => {
-  const { cols, rows } = currentDims();
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-  }
+  refitTerminal();
 });
 function shouldOpenReaderOnTrappedScroll() {
   const text = getReadableTerminalLines(40).join('\n');
@@ -1430,9 +1575,10 @@ function shouldOpenReaderOnTrappedScroll() {
 
 function handleBidiReaderScroll() {
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
-  if (!bidiReaderEnabled || !currentSessionId || bidiReaderCaptureForScrollPending) return;
-  if (performance.now() - lastBidiReaderCaptureAt <= BIDI_CAPTURE_REFRESH_INTERVAL_MS) return;
+  if (!bidiReaderEnabled || !currentSessionId) return;
   preferBidiReaderHistoryForScroll();
+  if (bidiReaderCaptureForScrollPending) return;
+  if (performance.now() - lastBidiReaderCaptureAt <= BIDI_CAPTURE_REFRESH_INTERVAL_MS) return;
   refreshBidiReaderForScroll(0).catch(() => {});
 }
 
@@ -1441,10 +1587,12 @@ async function refreshBidiReaderForScroll(deltaY) {
   bidiReaderCaptureForScrollPending = true;
   preferBidiReaderHistoryForScroll();
   const wasNearBottom = isBidiReaderNearBottom();
+  const scrollTopAtStart = bidiReaderLines.scrollTop;
   try {
     await refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true });
     preferBidiReaderHistoryForScroll();
-    if (wasNearBottom && deltaY < 0) {
+    const userMovedDuringCapture = Math.abs(bidiReaderLines.scrollTop - scrollTopAtStart) > 2;
+    if (!userMovedDuringCapture && wasNearBottom && deltaY < 0) {
       bidiReaderLines.scrollTop = Math.max(0, bidiReaderLines.scrollHeight - bidiReaderLines.clientHeight + deltaY);
     }
     bidiReaderPinnedToBottom = isBidiReaderNearBottom();
@@ -1461,7 +1609,6 @@ function handleBidiReaderWheel(event) {
   if (needsTmuxHistory) refreshBidiReaderForScroll(event.deltaY).catch(() => {});
   bidiReaderLines.scrollTop += event.deltaY;
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
-  focusTerminalSoon();
 }
 
 resizeObserver.observe(terminalEl);
@@ -1563,7 +1710,7 @@ killSessionButton.addEventListener('click', async () => {
 window.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
     event.preventDefault();
-    term.focus();
+    focusTerminalReliably();
   }
 });
 

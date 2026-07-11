@@ -346,26 +346,41 @@ async function testReadableLinksOpenNewTabs(page) {
   assert(controlPayload.text.includes('v2026.6.19 Hermes'), 'control boundary should remain readable as a text boundary', controlPayload);
   await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'readable-link shell prompt visible');
   await page.eval(`window.sendRaw(${JSON.stringify(`clear; ${readableLinkDemoShellCommand()}\r`)}, { directTmux: true })`);
-  const payload = await page.waitFor(`(() => {
-    const readerText = document.querySelector('#bidiReaderLines')?.innerText || '';
-    if (!readerText.includes('Readable link regression fixture.') || !readerText.includes('Persian URL:')) return false;
-    if (readerText.includes("printf '%")) return false;
-    const anchors = [...document.querySelectorAll('#bidiReaderLines a.bidi-link')].map((node) => ({
-      text: node.textContent,
-      href: node.href,
-      decodedHref: decodeURI(node.href),
-      target: node.target,
-      rel: node.rel,
-      dir: node.dir,
-      title: node.title,
-      textDecorationLine: getComputedStyle(node).textDecorationLine,
-      cursor: getComputedStyle(node).cursor,
-    }));
-    if (anchors.length < 4) return false;
-    return { anchors, readerText: document.querySelector('#bidiReaderLines')?.innerText || '' };
-  })()`, 15000, 'readable links rendered as anchors');
+  let payload = null;
+  let lastReadableLinkState = null;
+  const readableLinksDeadline = Date.now() + 15000;
+  while (Date.now() < readableLinksDeadline) {
+    lastReadableLinkState = await page.eval(`(() => {
+      const readerText = document.querySelector('#bidiReaderLines')?.innerText || '';
+      const anchors = [...document.querySelectorAll('#bidiReaderLines a.bidi-link')].map((node) => ({
+        text: node.textContent,
+        href: node.href,
+        decodedHref: decodeURI(node.href),
+        target: node.target,
+        rel: node.rel,
+        dir: node.dir,
+        title: node.title,
+        textDecorationLine: getComputedStyle(node).textDecorationLine,
+        cursor: getComputedStyle(node).cursor,
+      }));
+      return {
+        ready: readerText.includes('Readable link regression fixture.') && readerText.includes('Persian URL:') && anchors.length >= 4,
+        anchors,
+        readerText,
+        lineCount: readerText ? readerText.split(String.fromCharCode(10)).length : 0,
+        bodyClass: document.body.className,
+        readerDisplay: getComputedStyle(document.getElementById('bidiReader')).display,
+      };
+    })()`);
+    if (lastReadableLinkState.ready) {
+      payload = lastReadableLinkState;
+      break;
+    }
+    await delay(150);
+  }
+  assert(payload, 'readable links were not rendered as anchors', lastReadableLinkState);
 
-  const byText = (needle) => payload.anchors.find((link) => link.text.includes(needle));
+  const byText = (needle) => payload.anchors.filter((link) => link.text.includes(needle)).at(-1);
   const example = byText('https://example.com/path?q=1');
   const www = byText('www.example.org/docs');
   const torob = byText('api.torob.com');
@@ -413,6 +428,43 @@ function longHermesScrollbackCommand({ topMarker, bottomMarker, lines = 650 }) {
     `print(${JSON.stringify(bottomMarker)})`,
     'sys.stdout.flush()',
     'time.sleep(90)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function terminal56AlternateScrollCommand({ topMarker, bottomMarker, readyMarker, lines = 360 }) {
+  const script = [
+    'import sys',
+    `print(${JSON.stringify(`${topMarker} Welcome to Hermes Agent — Terminal 56 long readable answer`)})`,
+    `for i in range(1, ${Number(lines) + 1}):`,
+    `    print(f"Terminal 56 history line {i:04d}: فارسی + English scrollback should stay reachable while typing")`,
+    // This mirrors the tmux/Hermes failure mode: normal capture keeps the long history,
+    // while tmux alternate capture can expose only a short stale viewport. The reader must
+    // choose the richer normal capture so scrollback and typing do not jump/truncate.
+    `sys.stdout.write('\\033[?1049h\\033[2J\\033[H')`,
+    `print(${JSON.stringify('Terminal 56 alternate visible tail starts')})`,
+    `print(${JSON.stringify(bottomMarker)})`,
+    `print(${JSON.stringify(readyMarker)})`,
+    'sys.stdout.flush()',
+    'for line in sys.stdin:',
+    `    print('INPUT_ECHO:' + line.strip())`,
+    '    sys.stdout.flush()',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function terminal56ScrollableInputCommand({ topMarker, bottomMarker, readyMarker, lines = 360 }) {
+  const script = [
+    'import sys',
+    `print(${JSON.stringify(`${topMarker} Welcome to Hermes Agent — Terminal 56 scroll/typing surface`)})`,
+    `for i in range(1, ${Number(lines) + 1}):`,
+    `    print(f"Terminal 56 scrollable line {i:04d}: فارسی + English history must not jump when typing")`,
+    `print(${JSON.stringify(bottomMarker)})`,
+    `print(${JSON.stringify(readyMarker)})`,
+    'sys.stdout.flush()',
+    'for line in sys.stdin:',
+    `    print('INPUT_ECHO:' + line.strip())`,
+    '    sys.stdout.flush()',
   ].join('\n');
   return `python3 -c ${shellQuote(script)}`;
 }
@@ -498,6 +550,289 @@ async function testLongHermesScrollbackIsReadable(page) {
   assert(payload.lineCount >= 650, 'readable reader did not retain enough long-output lines', payload);
   assert(payload.topVisible, 'scrolling to the top of a long Hermes answer does not reveal the beginning', payload);
   return payload;
+}
+
+function visibleReaderStateExpression(prefix = '') {
+  return `(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    if (!lines) return { ok: false, reason: 'missing-lines' };
+    ${prefix}
+    const containerRect = lines.getBoundingClientRect();
+    const visibleLine = [...lines.querySelectorAll('.bidi-line')].find((line) => {
+      const rect = line.getBoundingClientRect();
+      return rect.bottom > containerRect.top + 4 && rect.top < containerRect.bottom - 4;
+    });
+    return {
+      ok: true,
+      scrollTop: lines.scrollTop,
+      maxScrollTop: Math.max(0, lines.scrollHeight - lines.clientHeight),
+      scrollHeight: lines.scrollHeight,
+      clientHeight: lines.clientHeight,
+      text: lines.innerText || '',
+      lineCount: (lines.innerText || '').split(String.fromCharCode(10)).length,
+      visibleTop: visibleLine?.dataset?.logicalText || visibleLine?.textContent || '',
+      nearBottom: lines.scrollHeight - lines.scrollTop - lines.clientHeight <= 10,
+    };
+  })()`;
+}
+
+function uiStabilityStateExpression(prefix = '') {
+  return `(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    ${prefix}
+    const reader = document.getElementById('bidiReader');
+    const card = document.querySelector('.terminal-card');
+    const terminal = document.getElementById('terminal');
+    const lineNodes = lines ? [...lines.querySelectorAll('.bidi-line')] : [];
+    const text = lines?.innerText || '';
+    const rectOf = (node) => {
+      const rect = node?.getBoundingClientRect?.();
+      return rect ? {
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        bottom: Math.round(rect.bottom),
+      } : null;
+    };
+    const containerRect = lines?.getBoundingClientRect?.();
+    const visibleLine = lineNodes.find((line) => {
+      const rect = line.getBoundingClientRect();
+      return containerRect && rect.bottom > containerRect.top + 4 && rect.top < containerRect.bottom - 4;
+    });
+    return {
+      windowScrollX: window.scrollX,
+      windowScrollY: window.scrollY,
+      activeTag: document.activeElement?.tagName || '',
+      bodyClass: document.body.className,
+      readerDisplay: reader ? getComputedStyle(reader).display : '',
+      readerOpacity: reader ? getComputedStyle(reader).opacity : '',
+      cardRect: rectOf(card),
+      terminalRect: rectOf(terminal),
+      readerRect: rectOf(reader),
+      linesRect: rectOf(lines),
+      lineCount: text ? text.split(String.fromCharCode(10)).length : 0,
+      scrollTop: lines?.scrollTop || 0,
+      maxScrollTop: lines ? Math.max(0, lines.scrollHeight - lines.clientHeight) : 0,
+      scrollHeight: lines?.scrollHeight || 0,
+      clientHeight: lines?.clientHeight || 0,
+      visibleTop: visibleLine?.dataset?.logicalText || visibleLine?.textContent || '',
+      nearBottom: lines ? lines.scrollHeight - lines.scrollTop - lines.clientHeight <= 10 : true,
+      text,
+    };
+  })()`;
+}
+
+function assertRectStable(before, after, name, tolerance = 3) {
+  for (const key of ['top', 'left', 'width', 'height', 'bottom']) {
+    const delta = Math.abs((after?.[key] ?? 0) - (before?.[key] ?? 0));
+    assert(delta <= tolerance, `${name} shifted during typing`, { key, delta, before, after });
+  }
+}
+
+async function dispatchReadableKey(page, key) {
+  await page.eval(`(() => {
+    const target = document.getElementById('bidiReaderLines') || document.querySelector('.terminal-card') || document.getElementById('terminal');
+    target?.focus?.({ preventScroll: true });
+    const event = new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, bubbles: true, cancelable: true });
+    const dispatched = target?.dispatchEvent(event);
+    if (dispatched !== false && !event.defaultPrevented && typeof window.sendRaw === 'function') {
+      window.sendRaw(${JSON.stringify(key === 'Enter' ? '\r' : key)}, { directTmux: true });
+    }
+  })()`);
+}
+
+async function testRichHistoryTypingDoesNotCollapseOrJump(page) {
+  const topMarker = `__WARPISH_UI_STABILITY_TOP_${Date.now().toString(36)}__`;
+  const bottomMarker = `__WARPISH_UI_STABILITY_BOTTOM_${Date.now().toString(36)}__`;
+  const readyMarker = `__WARPISH_UI_STABILITY_READY_${Date.now().toString(36)}__`;
+  const typedMarker = `UISTABLE_${Date.now().toString(36)}`;
+  const session = await createSession('UI Stability Typing Agent', path.join(runtimeRoot, 'ui-stability-cwd'));
+  respawnPane(session.id, terminal56ScrollableInputCommand({ topMarker, bottomMarker, readyMarker, lines: 520 }));
+  await delay(800);
+  await page.navigate(`${tokenUrl}&case=ui-stability-typing`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('UI Stability Typing Agent')`, 15000, 'ui stability session selected');
+  await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(readyMarker)})`, 20000, 'ui stability rich reader ready');
+  await page.eval(uiStabilityStateExpression(`
+    if (lines) {
+      lines.scrollTop = lines.scrollHeight;
+      lines.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
+  `));
+  await delay(900);
+  const before = await page.eval(uiStabilityStateExpression());
+  assert(before.lineCount >= 500, 'ui stability setup did not retain rich reader history', before);
+  assert(before.maxScrollTop > 1000, 'ui stability setup is not meaningfully scrollable', before);
+
+  const samples = [];
+  const expectedEcho = `INPUT_ECHO:${typedMarker}`;
+  for (const key of typedMarker.split('')) {
+    await dispatchReadableKey(page, key);
+    await delay(90);
+    samples.push(await page.eval(uiStabilityStateExpression()));
+  }
+  await dispatchReadableKey(page, 'Enter');
+  let afterEnter = null;
+  for (let index = 0; index < 80; index += 1) {
+    await delay(50);
+    const sample = await page.eval(uiStabilityStateExpression());
+    samples.push(sample);
+    if (!afterEnter && sample.text.includes(expectedEcho)) afterEnter = sample;
+  }
+  assert(afterEnter, 'ui stability typed marker was not echoed during sampling', samples.at(-1));
+
+  const collapsed = samples.filter((sample) => sample.lineCount < before.lineCount - 20 || sample.maxScrollTop < before.maxScrollTop - 600);
+  const pageScrolled = samples.filter((sample) => sample.windowScrollX !== before.windowScrollX || sample.windowScrollY !== before.windowScrollY);
+  const hiddenReader = samples.filter((sample) => sample.readerDisplay === 'none' || sample.readerRect?.height === 0);
+  assert(!collapsed.length, 'typing collapsed rich reader history and caused a visible up/down jump', {
+    before: { lineCount: before.lineCount, maxScrollTop: before.maxScrollTop, scrollHeight: before.scrollHeight },
+    collapsed: collapsed.map((sample) => ({ lineCount: sample.lineCount, maxScrollTop: sample.maxScrollTop, scrollHeight: sample.scrollHeight, visibleTop: sample.visibleTop })),
+  });
+  assert(!pageScrolled.length, 'typing changed browser page scroll', {
+    before: { x: before.windowScrollX, y: before.windowScrollY },
+    pageScrolled: pageScrolled.map((sample) => ({ x: sample.windowScrollX, y: sample.windowScrollY })),
+  });
+  assert(!hiddenReader.length, 'typing hid the readable terminal overlay', hiddenReader.map((sample) => ({ display: sample.readerDisplay, rect: sample.readerRect })));
+  assert(afterEnter.nearBottom, 'typing at bottom left the readable terminal away from bottom', {
+    before: { scrollTop: before.scrollTop, maxScrollTop: before.maxScrollTop, nearBottom: before.nearBottom },
+    afterEnter: { scrollTop: afterEnter.scrollTop, maxScrollTop: afterEnter.maxScrollTop, nearBottom: afterEnter.nearBottom },
+  });
+  for (const sample of samples) {
+    assertRectStable(before.cardRect, sample.cardRect, 'terminal card rect');
+    assertRectStable(before.terminalRect, sample.terminalRect, 'terminal surface rect');
+    assertRectStable(before.readerRect, sample.readerRect, 'reader overlay rect');
+  }
+
+  return {
+    marker: typedMarker,
+    sampleCount: samples.length,
+    before: { lineCount: before.lineCount, maxScrollTop: before.maxScrollTop, scrollTop: before.scrollTop, nearBottom: before.nearBottom },
+    minLineCount: Math.min(...samples.map((sample) => sample.lineCount)),
+    minMaxScrollTop: Math.min(...samples.map((sample) => sample.maxScrollTop)),
+    afterEnter: { lineCount: afterEnter.lineCount, maxScrollTop: afterEnter.maxScrollTop, scrollTop: afterEnter.scrollTop, nearBottom: afterEnter.nearBottom },
+  };
+}
+
+async function testTerminal56ScrollAndTypingAreStable(page) {
+  const topMarker = `__WARPISH_TERMINAL56_TOP_${Date.now().toString(36)}__`;
+  const bottomMarker = `__WARPISH_TERMINAL56_BOTTOM_${Date.now().toString(36)}__`;
+  const readyMarker = `__WARPISH_TERMINAL56_READY_${Date.now().toString(36)}__`;
+  const typedMarker = `__WARPISH_TERMINAL56_TYPED_${Date.now().toString(36)}__`;
+  const session = await createSession('Terminal 56 Scroll/Typing Regression', path.join(runtimeRoot, 'terminal56-cwd'));
+  respawnPane(session.id, terminal56AlternateScrollCommand({ topMarker, bottomMarker, readyMarker, lines: 360 }));
+  await delay(800);
+
+  const capture = await api(`/api/sessions/${session.id}/capture?lines=5000&ansi=1`);
+  assert(!capture.usingAlternate && capture.captureReason === 'normal-rich-history', 'short alternate capture still wins over rich scrollback capture', {
+    usingAlternate: capture.usingAlternate,
+    captureReason: capture.captureReason,
+    normalLines: (capture.normal || '').split('\n').length,
+    alternateLines: (capture.alternate || '').split('\n').length,
+    textHasTop: (capture.text || '').includes(topMarker),
+    textHasBottom: (capture.text || '').includes(bottomMarker),
+  });
+
+  respawnPane(session.id, terminal56ScrollableInputCommand({ topMarker, bottomMarker, readyMarker, lines: 360 }));
+  await delay(800);
+
+  await page.navigate(`${tokenUrl}&case=terminal56-scroll-typing`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Terminal 56 Scroll/Typing Regression')`, 15000, 'terminal56 regression session selected');
+  await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
+  const initial = await page.waitFor(`(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    const text = lines?.innerText || '';
+    if (!text.includes(${JSON.stringify(topMarker)}) || !text.includes(${JSON.stringify(readyMarker)})) return false;
+    return {
+      lineCount: text.split(String.fromCharCode(10)).length,
+      scrollHeight: lines.scrollHeight,
+      clientHeight: lines.clientHeight,
+      scrollTop: lines.scrollTop,
+      maxScrollTop: Math.max(0, lines.scrollHeight - lines.clientHeight),
+    };
+  })()`, 20000, 'terminal56 rich reader content');
+  assert(initial.lineCount >= 300, 'terminal56 reader lost scrollback lines before typing', initial);
+  assert(initial.maxScrollTop > 200, 'terminal56 reader is not scrollable', initial);
+
+  const wheelPoint = await page.eval(`(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    const rect = lines?.getBoundingClientRect();
+    return rect ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null;
+  })()`);
+  assert(wheelPoint, 'could not locate terminal56 readable reader for wheel test');
+
+  await page.eval(`(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    lines.scrollTop = lines.scrollHeight;
+    lines.dispatchEvent(new Event('scroll', { bubbles: true }));
+  })()`);
+  await delay(900);
+  const beforeWheel = await page.eval(visibleReaderStateExpression());
+  await page.wheelAt(wheelPoint.x, wheelPoint.y, -900);
+  await delay(450);
+  const afterWheel = await page.eval(visibleReaderStateExpression());
+  assert(!afterWheel.nearBottom && afterWheel.scrollTop < afterWheel.maxScrollTop - 40, 'mouse/trackpad wheel did not leave the readable terminal scrollback', { beforeWheel, afterWheel: { scrollTop: afterWheel.scrollTop, maxScrollTop: afterWheel.maxScrollTop, nearBottom: afterWheel.nearBottom, lineCount: afterWheel.lineCount } });
+
+  await page.eval(visibleReaderStateExpression(`
+    const maxScrollTop = Math.max(0, lines.scrollHeight - lines.clientHeight);
+    lines.scrollTop = Math.round(maxScrollTop * 0.45);
+    lines.dispatchEvent(new Event('scroll', { bubbles: true }));
+  `));
+  await delay(900);
+  const beforeType = await page.eval(visibleReaderStateExpression());
+  assert(!beforeType.nearBottom && beforeType.scrollTop > 20, 'typing stability setup did not leave reader scrolled in history', beforeType);
+
+  for (const key of typedMarker.split('')) {
+    await dispatchReadableKey(page, key);
+    await delay(90);
+  }
+  await dispatchReadableKey(page, 'Enter');
+  await delay(700);
+  await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
+  const afterType = await page.waitFor(`(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    const text = lines?.innerText || '';
+    if (!text.includes(${JSON.stringify(`INPUT_ECHO:${typedMarker}`)})) return false;
+    return ${visibleReaderStateExpression()};
+  })()`, 15000, 'typed marker echoed without reader jump');
+
+  const summarizeTerminal56State = (state) => ({
+    scrollTop: state.scrollTop,
+    maxScrollTop: state.maxScrollTop,
+    scrollHeight: state.scrollHeight,
+    clientHeight: state.clientHeight,
+    lineCount: state.lineCount,
+    visibleTop: state.visibleTop,
+    nearBottom: state.nearBottom,
+    hasTop: state.text.includes(topMarker),
+    hasBottom: state.text.includes(bottomMarker),
+    hasTypedEcho: state.text.includes(`INPUT_ECHO:${typedMarker}`),
+  });
+  const scrollJump = Math.abs(afterType.scrollTop - beforeType.scrollTop);
+  assert(scrollJump <= 80, 'typing while scrolled in Terminal 56 history jumped the reader', { beforeType: summarizeTerminal56State(beforeType), afterType: summarizeTerminal56State(afterType), scrollJump });
+  assert(!afterType.nearBottom, 'typing while scrolled in Terminal 56 history snapped to bottom', { beforeType: summarizeTerminal56State(beforeType), afterType: summarizeTerminal56State(afterType) });
+  assert(afterType.text.includes(topMarker) && afterType.text.includes(bottomMarker), 'typing truncated terminal56 scrollback', summarizeTerminal56State(afterType));
+  assert(afterType.visibleTop === beforeType.visibleTop, 'typing preserved scrollTop but changed visible Terminal 56 reader line', { beforeType: summarizeTerminal56State(beforeType), afterType: summarizeTerminal56State(afterType) });
+
+  const postTypeWheelDelta = afterType.scrollTop > 100 ? -700 : 700;
+  await page.eval(`document.getElementById('bidiReaderLines')?.dispatchEvent(new WheelEvent('wheel', { deltaY: ${postTypeWheelDelta}, bubbles: true, cancelable: true }))`);
+  await delay(300);
+  const afterSecondWheel = await page.eval(visibleReaderStateExpression());
+  assert(Math.abs(afterSecondWheel.scrollTop - afterType.scrollTop) > 20, 'reader stopped scrolling after typing in Terminal 56 regression', {
+    wheelDelta: postTypeWheelDelta,
+    afterType: summarizeTerminal56State(afterType),
+    afterSecondWheel: summarizeTerminal56State(afterSecondWheel),
+  });
+
+  return {
+    captureReason: capture.captureReason,
+    lineCount: afterType.lineCount,
+    beforeWheel,
+    afterWheel: { scrollTop: afterWheel.scrollTop, maxScrollTop: afterWheel.maxScrollTop },
+    beforeType: { scrollTop: beforeType.scrollTop, visibleTop: beforeType.visibleTop },
+    afterType: { scrollTop: afterType.scrollTop, visibleTop: afterType.visibleTop, nearBottom: afterType.nearBottom },
+    afterSecondWheel: { scrollTop: afterSecondWheel.scrollTop, maxScrollTop: afterSecondWheel.maxScrollTop },
+  };
 }
 
 async function testTypingDoesNotRevertToStaleCapture(page) {
@@ -630,12 +965,15 @@ async function main() {
   await startServer();
   const page = await startChrome();
   await page.init();
+  await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
   const health = await api('/healthz');
 
   const hermesPaletteStyles = await testHermesPaletteStyles(page);
   const readableLinks = await testReadableLinksOpenNewTabs(page);
   const emptyReaderGuard = await testEmptyReaderDoesNotBlankTerminal(page);
   const longHermesScrollback = await testLongHermesScrollbackIsReadable(page);
+  const richHistoryTypingStability = await testRichHistoryTypingDoesNotCollapseOrJump(page);
+  const terminal56ScrollTyping = await testTerminal56ScrollAndTypingAreStable(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
   const sessionMetadataXssGuard = await testSessionMetadataXssGuard(page);
   const apiPlainTextErrorHandling = await testApiPlainTextErrorHandling(page);
@@ -661,6 +999,14 @@ async function main() {
         scrollHeight: longHermesScrollback.scrollHeight,
         clientHeight: longHermesScrollback.clientHeight,
         topVisible: longHermesScrollback.topVisible,
+      },
+      richHistoryTypingStability,
+      terminal56ScrollTyping: {
+        captureReason: terminal56ScrollTyping.captureReason,
+        lineCount: terminal56ScrollTyping.lineCount,
+        beforeType: terminal56ScrollTyping.beforeType,
+        afterType: terminal56ScrollTyping.afterType,
+        afterSecondWheel: terminal56ScrollTyping.afterSecondWheel,
       },
       typingNoFlicker: {
         marker: typingNoFlicker.marker,

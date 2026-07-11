@@ -591,6 +591,62 @@ function capturePaneText(id, { lines = 600, alternate = false, escape = false } 
   }
 }
 
+function captureContentLines(text) {
+  return stripAnsi(text)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function alternateCaptureIsNormalTail(normal, alternate) {
+  const alternateLines = captureContentLines(alternate)
+    .filter((line) => !/^[~│╭╰╮╯─\s]+$/u.test(line))
+    .slice(-12);
+  if (!alternateLines.length) return false;
+  const normalClean = captureContentLines(normal).join('\n');
+  return alternateLines.filter((line) => normalClean.includes(line)).length / alternateLines.length >= 0.75;
+}
+
+function alternateCaptureLooksStandaloneTui(alternate) {
+  const lines = captureContentLines(alternate);
+  const joined = lines.join('\n');
+  const vimTildeLines = lines.filter((line) => /^~\s*$/u.test(line)).length;
+  return vimTildeLines >= 3
+    || /--\s*(?:INSERT|NORMAL|VISUAL|REPLACE)\s*--/u.test(joined)
+    || /\b(?:VIM - Vi IMproved|GNU nano|less\s+\d|htop|top -)\b/iu.test(joined);
+}
+
+function captureLooksLikeAgentScrollback(normal) {
+  return /Hermes Agent|⚕|\bctx --\b|❯|\bgpt-[\w.]+\b/u.test(stripAnsi(normal));
+}
+
+function choosePaneCapture({ normal = '', alternate = '' } = {}) {
+  if (!alternate.trim()) return { text: normal, usingAlternate: false, reason: 'normal-only' };
+  if (!normal.trim()) return { text: alternate, usingAlternate: true, reason: 'alternate-only' };
+
+  const normalLines = captureContentLines(normal).length;
+  const alternateLines = captureContentLines(alternate).length;
+  const normalHasHistory = normalLines >= Math.max(alternateLines + 20, alternateLines * 2);
+  const alternateLooksTui = alternateCaptureLooksStandaloneTui(alternate);
+  const alternateLooksLikeNormalTail = alternateCaptureIsNormalTail(normal, alternate);
+  const normalLooksLikeAgentScrollback = captureLooksLikeAgentScrollback(normal);
+
+  const agentScrollbackIsMuchRicher = normalLooksLikeAgentScrollback
+    && alternateLines <= 12
+    && normalLines >= Math.max(alternateLines + 40, alternateLines * 4);
+
+  // In Hermes/prompt-toolkit-like panes tmux can expose a tiny alternate capture that is
+  // only a stale/current viewport, while the normal capture contains the real scrollback.
+  // Prefer the richer normal capture when it is the same tail or a recognizable, much
+  // richer agent scrollback; keep true editor/TUI alternate screens (vim, less, htop,
+  // unknown full-screen apps with meaningful alternate content, etc.) intact.
+  if (normalHasHistory && !alternateLooksTui && (alternateLooksLikeNormalTail || agentScrollbackIsMuchRicher)) {
+    return { text: normal, usingAlternate: false, reason: 'normal-rich-history' };
+  }
+
+  return { text: alternate, usingAlternate: true, reason: 'alternate-active' };
+}
+
 function summarizeSessions() {
   const meta = readMetadata();
   const active = listActiveTmuxSessions();
@@ -934,12 +990,13 @@ app.get('/api/sessions/:id/capture', (req, res) => {
   const escape = req.query.ansi === '1' || req.query.escape === '1';
   const normal = capturePaneText(id, { lines, escape });
   const alternate = capturePaneText(id, { alternate: true, escape });
-  const text = alternate.trim() ? alternate : normal;
+  const selected = choosePaneCapture({ normal, alternate });
   res.json({
-    text: limitText(text),
+    text: limitText(selected.text),
     normal: limitText(normal),
     alternate: limitText(alternate),
-    usingAlternate: Boolean(alternate.trim()),
+    usingAlternate: selected.usingAlternate,
+    captureReason: selected.reason,
     ansi: escape,
   });
 });
