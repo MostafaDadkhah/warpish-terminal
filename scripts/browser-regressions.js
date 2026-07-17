@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -9,11 +9,16 @@ import WebSocket from 'ws';
 
 const projectRoot = new URL('..', import.meta.url).pathname;
 const chromePath = process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'warpish-browser-regressions-'));
+const runtimeRoot = process.env.WARPISH_BROWSER_RUNTIME_ROOT
+  ? path.resolve(process.env.WARPISH_BROWSER_RUNTIME_ROOT)
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'warpish-browser-regressions-'));
+fs.mkdirSync(runtimeRoot, { recursive: true });
 const dataDir = path.join(runtimeRoot, 'data');
 const tokenFile = path.join(runtimeRoot, 'token');
 const chromeProfile = path.join(runtimeRoot, 'chrome-profile');
-const sessionPrefix = `warpishreg-${process.pid.toString(36)}-`;
+const sessionPrefix = (process.env.WARPISH_SESSION_PREFIX || `warpishreg-${process.pid.toString(36)}-`)
+  .replace(/[^a-z0-9-]/gi, '')
+  .toLowerCase() || `warpishreg-${process.pid.toString(36)}-`;
 const createdSessions = [];
 
 let server;
@@ -22,6 +27,7 @@ let tokenUrl;
 let token;
 let port;
 let cdpPort;
+let chromeDiagnostics = { stdout: '', stderr: '', exit: null, error: null };
 
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -47,7 +53,16 @@ function freePort() {
   });
 }
 
-function httpRequest({ host = '127.0.0.1', port: requestPort, method = 'GET', pathname = '/', headers = {}, body, json = true }) {
+function httpRequest({
+  host = '127.0.0.1',
+  port: requestPort,
+  method = 'GET',
+  pathname = '/',
+  headers = {},
+  body,
+  json = true,
+  timeoutMs = 5000,
+}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
     const req = http.request({
@@ -76,6 +91,7 @@ function httpRequest({ host = '127.0.0.1', port: requestPort, method = 'GET', pa
       });
     });
     req.on('error', reject);
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`${method} ${host}:${requestPort}${pathname} timed out after ${timeoutMs}ms`)));
     if (payload) req.write(payload);
     req.end();
   });
@@ -122,6 +138,7 @@ async function startServer() {
       WARPISH_DATA_DIR: dataDir,
       WARPISH_TOKEN_FILE: tokenFile,
       WARPISH_SESSION_PREFIX: sessionPrefix,
+      WARPISH_SKIP_USER_ZSHRC: '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -134,6 +151,7 @@ async function startServer() {
 
 async function startChrome() {
   cdpPort = await freePort();
+  chromeDiagnostics = { stdout: '', stderr: '', exit: null, error: null };
   chrome = spawn(chromePath, [
     '--headless=new',
     '--disable-gpu',
@@ -145,15 +163,40 @@ async function startChrome() {
     'about:blank',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  for (let i = 0; i < 120; i += 1) {
+  const appendDiagnostic = (field, chunk) => {
+    chromeDiagnostics[field] = `${chromeDiagnostics[field]}${chunk.toString()}`.slice(-16_000);
+  };
+  chrome.stdout.on('data', (chunk) => appendDiagnostic('stdout', chunk));
+  chrome.stderr.on('data', (chunk) => appendDiagnostic('stderr', chunk));
+  chrome.on('error', (error) => { chromeDiagnostics.error = error.message || String(error); });
+  chrome.on('exit', (code, signal) => { chromeDiagnostics.exit = { code, signal }; });
+
+  let lastCdpError = '';
+  const startupDeadline = Date.now() + 30_000;
+  while (Date.now() < startupDeadline) {
     try {
-      const list = await httpRequest({ port: cdpPort, pathname: '/json/list' });
+      const remainingMs = Math.max(100, startupDeadline - Date.now());
+      const list = await httpRequest({
+        port: cdpPort,
+        pathname: '/json/list',
+        timeoutMs: Math.min(1000, remainingMs),
+      });
       const page = list.find((target) => target.type === 'page' && target.webSocketDebuggerUrl);
       if (page) return new CdpPage(page.webSocketDebuggerUrl);
-    } catch {}
+      lastCdpError = `CDP returned ${list.length} targets but no page target`;
+    } catch (error) {
+      lastCdpError = error.message || String(error);
+    }
+    if (chromeDiagnostics.exit || chromeDiagnostics.error) break;
     await delay(100);
   }
-  throw new Error('Chrome CDP target did not become available');
+  throw new Error(`Chrome CDP target did not become available\n${JSON.stringify({
+    chromePath,
+    cdpPort,
+    chromeProfile,
+    lastCdpError,
+    ...chromeDiagnostics,
+  }, null, 2)}`);
 }
 
 class CdpPage {
@@ -332,6 +375,7 @@ function readableLinkDemoShellCommand() {
 
 async function testReadableLinksOpenNewTabs(page) {
   const session = await createSession('Readable Link Regression', path.join(runtimeRoot, 'link-cwd'));
+  respawnPane(session.id, `${readableLinkDemoShellCommand()}; sleep 90`);
   await delay(500);
   await page.navigate(`${tokenUrl}&case=readable-links`);
   await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Readable Link Regression')`, 15000, 'readable-link session selected');
@@ -344,8 +388,8 @@ async function testReadableLinksOpenNewTabs(page) {
   assert(controlPayload.linkText === 'https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.19', 'control bytes or following text leaked into direct link text', controlPayload);
   assert(controlPayload.href === 'https://github.com/NousResearch/hermes-agent/releases/tag/v2026.6.19', 'control bytes or following text leaked into direct link href', controlPayload);
   assert(controlPayload.text.includes('v2026.6.19 Hermes'), 'control boundary should remain readable as a text boundary', controlPayload);
-  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'readable-link shell prompt visible');
-  await page.eval(`window.sendRaw(${JSON.stringify(`clear; ${readableLinkDemoShellCommand()}\r`)}, { directTmux: true })`);
+  await page.waitFor(`document.querySelector('#statusText')?.textContent.includes('connected')`, 15000, 'readable-link terminal connected');
+  await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
   let payload = null;
   let lastReadableLinkState = null;
   const readableLinksDeadline = Date.now() + 15000;
@@ -469,6 +513,48 @@ function terminal56ScrollableInputCommand({ topMarker, bottomMarker, readyMarker
   return `python3 -c ${shellQuote(script)}`;
 }
 
+function focusReportLeakDetectorCommand({ readyMarker }) {
+  const script = [
+    'import select, sys, termios, time, tty',
+    `sys.stdout.write('\\x1b[?1004h' + ${JSON.stringify(readyMarker)} + '\\n')`,
+    'sys.stdout.flush()',
+    'fd = sys.stdin.fileno()',
+    'old = termios.tcgetattr(fd)',
+    'tty.setraw(fd)',
+    'buf = b""',
+    'end = time.time() + 9',
+    'try:',
+    '    while time.time() < end:',
+    '        ready, _, _ = select.select([sys.stdin], [], [], 0.1)',
+    '        if not ready:',
+    '            continue',
+    '        data = sys.stdin.buffer.read(1)',
+    '        if not data:',
+    '            continue',
+    '        buf += data',
+    '        if data in (b"I", b"O") or len(buf) >= 8:',
+    '            sys.stdout.write("\\r\\nLEAK_BYTES:" + buf.hex() + "\\r\\n")',
+    '            sys.stdout.flush()',
+    '            buf = b""',
+    'finally:',
+    '    termios.tcsetattr(fd, termios.TCSADRAIN, old)',
+    `    sys.stdout.write('\\r\\n\\x1b[?1004l${readyMarker}:DONE\\n')`,
+    '    sys.stdout.flush()',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+async function clickSessionCard(page, sessionId, title) {
+  const clicked = await page.eval(`(() => {
+    const card = document.querySelector(${JSON.stringify(`.session-card[data-session-id="${sessionId}"]`)});
+    if (!card) return false;
+    card.click();
+    return true;
+  })()`);
+  assert(clicked, `session card was not found for ${title}`, { sessionId, title });
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes(${JSON.stringify(title)})`, 15000, `${title} selected`);
+}
+
 async function testLongHermesScrollbackIsReadable(page) {
   const appJs = await httpText('/app.js');
   assert(appJs.includes('const BIDI_READER_MAX_LINES = 2000'), 'readable terminal line cap is too small for long Hermes answers');
@@ -478,11 +564,11 @@ async function testLongHermesScrollbackIsReadable(page) {
   const topMarker = `__WARPISH_LONG_SCROLL_TOP_${Date.now().toString(36)}__`;
   const bottomMarker = `__WARPISH_LONG_SCROLL_BOTTOM_${Date.now().toString(36)}__`;
   const session = await createSession('Long Hermes Scroll Regression', path.join(runtimeRoot, 'long-scroll-cwd'));
+  respawnPane(session.id, longHermesScrollbackCommand({ topMarker, bottomMarker, lines: 650 }));
   await delay(500);
   await page.navigate(`${tokenUrl}&case=long-scrollback`);
   await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Long Hermes Scroll Regression')`, 15000, 'long-scroll session selected');
-  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'long-scroll shell prompt visible');
-  await page.eval(`window.sendRaw(${JSON.stringify(`${longHermesScrollbackCommand({ topMarker, bottomMarker, lines: 650 })}\r`)}, { directTmux: true })`);
+  await page.waitFor(`document.querySelector('#statusText')?.textContent.includes('connected')`, 15000, 'long-scroll terminal connected');
   await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(bottomMarker)})`, 20000, 'long-scroll bottom marker visible');
 
   const wheelPoint = await page.eval(`(() => {
@@ -835,6 +921,141 @@ async function testTerminal56ScrollAndTypingAreStable(page) {
   };
 }
 
+async function testSessionSwitchingSuppressesFocusReportsAndScrollBounce(page) {
+  const focusTitle = 'Switch Focus Reporter Regression';
+  const scrollTitle = 'Switch Scroll Bounce Regression';
+  const focusReady = `__WARPISH_FOCUS_REPORT_READY_${Date.now().toString(36)}__`;
+  const topMarker = `__WARPISH_SWITCH_SCROLL_TOP_${Date.now().toString(36)}__`;
+  const bottomMarker = `__WARPISH_SWITCH_SCROLL_BOTTOM_${Date.now().toString(36)}__`;
+  const readyMarker = `__WARPISH_SWITCH_SCROLL_READY_${Date.now().toString(36)}__`;
+
+  const focusSession = await createSession(focusTitle, path.join(runtimeRoot, 'switch-focus-cwd'));
+  const scrollSession = await createSession(scrollTitle, path.join(runtimeRoot, 'switch-scroll-cwd'));
+  respawnPane(focusSession.id, focusReportLeakDetectorCommand({ readyMarker: focusReady }));
+  respawnPane(scrollSession.id, terminal56ScrollableInputCommand({ topMarker, bottomMarker, readyMarker, lines: 460 }));
+  await delay(900);
+
+  await page.navigate(`${tokenUrl}&case=session-switch-scroll-bounce`);
+  await page.waitFor(`document.querySelector('#sessionList')?.innerText.includes(${JSON.stringify(focusTitle)}) && document.querySelector('#sessionList')?.innerText.includes(${JSON.stringify(scrollTitle)})`, 15000, 'switch regression sessions listed');
+  const focusFilter = await page.eval(`(() => {
+    window.__warpishSentInputMessages = [];
+    if (!WebSocket.prototype.__warpishLoggedSend) {
+      const originalSend = WebSocket.prototype.send;
+      WebSocket.prototype.send = function loggedSend(data) {
+        try {
+          const text = String(data);
+          if (text.includes('\\u001b') || text.includes(String.fromCharCode(27))) window.__warpishSentInputMessages.push(text);
+        } catch {}
+        return originalSend.call(this, data);
+      };
+      WebSocket.prototype.__warpishLoggedSend = true;
+    }
+    if (typeof setReaderMouseMode === 'function') setReaderMouseMode('reader');
+    if (typeof bidiReaderEnabled !== 'undefined' && !bidiReaderEnabled) {
+      bidiReaderEnabled = true;
+      localStorage.setItem('warpish_readable_terminal_v1', 'on');
+      applyBidiMode();
+    }
+    window.scrollTo(0, 0);
+    const focusIn = String.fromCharCode(27) + '[I';
+    const focusOut = String.fromCharCode(27) + '[O';
+    return {
+      focusIn: stripTerminalFocusReports(focusIn),
+      focusOut: stripTerminalFocusReports(focusOut),
+      mixed: stripTerminalFocusReports('before' + focusIn + 'middle' + focusOut + 'after'),
+      suppressesFocusIn: shouldSuppressTerminalInput(focusIn),
+      suppressesFocusOut: shouldSuppressTerminalInput(focusOut),
+    };
+  })()`);
+  assert(
+    focusFilter.focusIn === ''
+      && focusFilter.focusOut === ''
+      && focusFilter.mixed === 'beforemiddleafter'
+      && focusFilter.suppressesFocusIn
+      && focusFilter.suppressesFocusOut,
+    'readable-mode focus report filter did not suppress focus control input',
+    focusFilter,
+  );
+
+  await clickSessionCard(page, focusSession.id, focusTitle);
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(focusReady)})`, 15000, 'focus-report session ready');
+  for (let index = 0; index < 4; index += 1) {
+    await page.eval(`focusTerminalReliably()`);
+    await delay(120);
+    await clickSessionCard(page, scrollSession.id, scrollTitle);
+    await delay(140);
+    await clickSessionCard(page, focusSession.id, focusTitle);
+    await delay(140);
+  }
+  await page.eval(`focusTerminalReliably()`);
+  await delay(800);
+  const focusCapture = await api(`/api/sessions/${focusSession.id}/capture?lines=300&ansi=0`);
+  const sentFocusMessages = await page.eval(`window.__warpishSentInputMessages || []`);
+  const focusInputLeaks = sentFocusMessages.filter((wireMessage) => {
+    try {
+      const message = JSON.parse(wireMessage);
+      return /\x1b\[(?:I|O)/.test(String(message.data || ''));
+    } catch {
+      return /\x1b\[(?:I|O)/.test(wireMessage);
+    }
+  });
+  assert(!focusInputLeaks.length, 'browser sent terminal focus reports while switching sessions', focusInputLeaks);
+  assert(!focusCapture.text.includes('LEAK_BYTES:'), 'terminal focus reports leaked into the tmux pane while switching sessions', {
+    focusInputLeaks,
+    sentFocusMessages,
+    captureTail: focusCapture.text.split('\n').slice(-20),
+  });
+
+  await clickSessionCard(page, scrollSession.id, scrollTitle);
+  await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(readyMarker)})`, 20000, 'switch scroll reader ready');
+  const setup = await page.eval(uiStabilityStateExpression(`
+    if (lines) {
+      const maxScrollTop = Math.max(0, lines.scrollHeight - lines.clientHeight);
+      lines.scrollTop = Math.round(maxScrollTop * 0.72);
+      lines.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }
+    window.scrollTo(0, 0);
+  `));
+  assert(setup.maxScrollTop > 1000 && setup.scrollTop > 500, 'switch scroll setup is not meaningfully inside scrollback', setup);
+
+  const wheelPoint = await page.eval(`(() => {
+    const lines = document.getElementById('bidiReaderLines');
+    const rect = lines?.getBoundingClientRect();
+    return rect ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null;
+  })()`);
+  assert(wheelPoint, 'could not locate switch regression reader for wheel test');
+
+  const samples = [];
+  for (let index = 0; index < 8; index += 1) {
+    await page.wheelAt(wheelPoint.x, wheelPoint.y, -650);
+    await delay(55);
+    samples.push(await page.eval(uiStabilityStateExpression()));
+  }
+  await delay(850);
+  const settled = await page.eval(uiStabilityStateExpression());
+  const pageScrolled = samples.concat(settled).filter((sample) => sample.windowScrollY !== 0 || sample.windowScrollX !== 0);
+  assert(!pageScrolled.length, 'fast terminal wheel scrolled the page/project instead of the terminal reader', pageScrolled.map((sample) => ({ x: sample.windowScrollX, y: sample.windowScrollY, scrollTop: sample.scrollTop })));
+  assert(samples.some((sample) => sample.scrollTop < setup.scrollTop - 80), 'fast upward wheel did not move the terminal reader into history', { setup, samples: samples.map((sample) => ({ scrollTop: sample.scrollTop, maxScrollTop: sample.maxScrollTop })) });
+  const bounceDown = [];
+  for (let index = 1; index < samples.length; index += 1) {
+    const delta = samples[index].scrollTop - samples[index - 1].scrollTop;
+    if (delta > 260) bounceDown.push({ index, delta, before: samples[index - 1].scrollTop, after: samples[index].scrollTop });
+  }
+  assert(!bounceDown.length, 'fast upward wheel bounced the terminal reader back downward', { setup: { scrollTop: setup.scrollTop, maxScrollTop: setup.maxScrollTop }, bounceDown });
+  assert(!settled.nearBottom, 'fast wheel snapped the terminal reader back to bottom after settling', { setup: { scrollTop: setup.scrollTop, maxScrollTop: setup.maxScrollTop }, settled: { scrollTop: settled.scrollTop, maxScrollTop: settled.maxScrollTop, nearBottom: settled.nearBottom } });
+
+  return {
+    focusLeakClean: true,
+    focusFilter,
+    sentFocusMessageCount: sentFocusMessages.length,
+    focusCaptureTail: focusCapture.text.split('\n').slice(-8),
+    setup: { scrollTop: setup.scrollTop, maxScrollTop: setup.maxScrollTop, windowScrollY: setup.windowScrollY },
+    samples: samples.map((sample) => ({ scrollTop: sample.scrollTop, maxScrollTop: sample.maxScrollTop, windowScrollY: sample.windowScrollY, visibleTop: sample.visibleTop })),
+    settled: { scrollTop: settled.scrollTop, maxScrollTop: settled.maxScrollTop, windowScrollY: settled.windowScrollY, nearBottom: settled.nearBottom, visibleTop: settled.visibleTop },
+  };
+}
+
 async function testTypingDoesNotRevertToStaleCapture(page) {
   const appJs = await httpText('/app.js');
   assert(!appJs.includes('isSparseReadableEntries(entries) || lastCapturedReaderEntries.length > 0'), 'old captured-reader fast-path regression returned');
@@ -845,7 +1066,7 @@ async function testTypingDoesNotRevertToStaleCapture(page) {
   await delay(800);
   await page.navigate(`${tokenUrl}&case=typing-flicker`);
   await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Typing Flicker Regression')`, 15000, 'typing session selected');
-  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes('%')`, 15000, 'shell prompt visible in reader');
+  await page.waitFor(`document.querySelector('#statusText')?.textContent.includes('connected')`, 15000, 'typing terminal connected');
 
   const marker = `__WARPISH_NO_FLICKER_${Date.now().toString(36)}__`;
   const payload = await page.eval(`(async () => {
@@ -960,6 +1181,43 @@ async function testMouseModeAndMobileLayout(page) {
   return { mobile, raw };
 }
 
+function chromeVersionLabel() {
+  const infoPlist = path.resolve(path.dirname(chromePath), '..', 'Info.plist');
+  if (fs.existsSync(infoPlist) && fs.existsSync('/usr/libexec/PlistBuddy')) {
+    const plistResult = spawnSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', infoPlist], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 3000,
+    });
+    if (plistResult.status === 0 && plistResult.stdout.trim()) {
+      return `Google Chrome ${plistResult.stdout.trim()}`;
+    }
+  }
+
+  const result = spawnSync(chromePath, ['--version'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 5000,
+  });
+  const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+  if (result.status === 0 && output) return output;
+  const reason = result.error?.code || result.signal || `status ${result.status}`;
+  return `${path.basename(chromePath)} (version unavailable: ${reason})`;
+}
+
+async function terminateProcess(childProcess, timeoutMs = 3000) {
+  if (!childProcess || childProcess.exitCode !== null || childProcess.signalCode !== null) return;
+  const exited = new Promise((resolve) => childProcess.once('close', resolve));
+  childProcess.kill('SIGTERM');
+  const graceful = await Promise.race([
+    exited.then(() => true),
+    delay(timeoutMs).then(() => false),
+  ]);
+  if (graceful || childProcess.exitCode !== null || childProcess.signalCode !== null) return;
+  childProcess.kill('SIGKILL');
+  await Promise.race([exited, delay(1000)]);
+}
+
 async function main() {
   assert(fs.existsSync(chromePath), `Chrome binary not found at ${chromePath}`);
   await startServer();
@@ -974,6 +1232,7 @@ async function main() {
   const longHermesScrollback = await testLongHermesScrollbackIsReadable(page);
   const richHistoryTypingStability = await testRichHistoryTypingDoesNotCollapseOrJump(page);
   const terminal56ScrollTyping = await testTerminal56ScrollAndTypingAreStable(page);
+  const sessionSwitchingStability = await testSessionSwitchingSuppressesFocusReportsAndScrollBounce(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
   const sessionMetadataXssGuard = await testSessionMetadataXssGuard(page);
   const apiPlainTextErrorHandling = await testApiPlainTextErrorHandling(page);
@@ -983,7 +1242,7 @@ async function main() {
     ok: true,
     health,
     browser: {
-      chrome: execFileSync(chromePath, ['--version'], { encoding: 'utf8' }).trim(),
+      chrome: chromeVersionLabel(),
       cdpPort,
     },
     isolatedRuntime: {
@@ -1008,6 +1267,7 @@ async function main() {
         afterType: terminal56ScrollTyping.afterType,
         afterSecondWheel: terminal56ScrollTyping.afterSecondWheel,
       },
+      sessionSwitchingStability,
       typingNoFlicker: {
         marker: typingNoFlicker.marker,
         firstWithMarker: typingNoFlicker.firstWithMarker,
@@ -1042,7 +1302,7 @@ try {
         try { execFileSync('tmux', ['kill-session', '-t', name]); } catch {}
       });
   } catch {}
-  if (chrome && !chrome.killed) chrome.kill('SIGTERM');
-  if (server && !server.killed) server.kill('SIGTERM');
+  await terminateProcess(chrome);
+  await terminateProcess(server);
   try { fs.rmSync(runtimeRoot, { recursive: true, force: true }); } catch {}
 }

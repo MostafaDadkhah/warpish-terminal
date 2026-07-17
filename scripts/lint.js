@@ -16,6 +16,9 @@ const appJs = read('public/app.js');
 const serverJs = read('server.js');
 const stylesCss = read('public/styles.css');
 const smokeJs = read('scripts/smoke.js');
+const browserRegressionJs = read('scripts/browser-regressions.js');
+const uiAgentJs = read('scripts/ui-stability-agent.js');
+const packageJson = JSON.parse(read('package.json'));
 
 if (/\.innerHTML\b|insertAdjacentHTML\s*\(/.test(appJs)) {
   fail('public/app.js must not render runtime data with innerHTML/insertAdjacentHTML. Use DOM nodes + textContent.');
@@ -43,6 +46,30 @@ if (!stylesCss.includes('body.reader-mouse-raw .bidi-reader')) {
 
 if (!smokeJs.includes('freePort()')) {
   fail('scripts/smoke.js must use a dynamic free port by default to avoid CI/local port collisions.');
+}
+
+if (!smokeJs.includes('cleanupTmuxSessions(smokePrefix)')) {
+  fail('scripts/smoke.js must have a tmux-prefix cleanup fallback when API cleanup is unavailable.');
+}
+
+if (!smokeJs.includes('verifyHttpAndWebSocketSecurity') || !smokeJs.includes('verifyNonLoopbackBindRefusal')) {
+  fail('scripts/smoke.js must preserve behavioral auth/origin/cookie and local-bind coverage.');
+}
+
+if (!browserRegressionJs.includes("chrome.stdout.on('data'") || !browserRegressionJs.includes("chrome.stderr.on('data'")) {
+  fail('scripts/browser-regressions.js must drain Chrome stdout/stderr so CDP startup cannot block on full pipes.');
+}
+
+if (/execFileSync\(chromePath,\s*\[['"]--version['"]\]/.test(browserRegressionJs)) {
+  fail('scripts/browser-regressions.js must not run Chrome --version synchronously without a timeout.');
+}
+
+if (/\bspawnSync\b/.test(uiAgentJs)) {
+  fail('scripts/ui-stability-agent.js must use an async child process so timeout cleanup can kill the full process group.');
+}
+
+if (packageJson.scripts?.regression !== 'node scripts/ui-stability-agent.js') {
+  fail('package.json regression must run the browser suite once through the UI stability validator.');
 }
 
 if (failures.length) {

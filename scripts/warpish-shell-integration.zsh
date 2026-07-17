@@ -31,6 +31,15 @@ __warpish_file_event() {
   if [[ -n "${WARPISH_EVENT_FILE:-}" ]]; then
     command mkdir -p "${WARPISH_EVENT_FILE:h}" 2>/dev/null || true
     command printf '%s\n' "$1" >> "$WARPISH_EVENT_FILE" 2>/dev/null || true
+    local event_size
+    event_size="$(command wc -c < "$WARPISH_EVENT_FILE" 2>/dev/null)" || return 0
+    if (( ${event_size:-0} > 1048576 )); then
+      local compact_file="${WARPISH_EVENT_FILE}.compact.$$.$RANDOM"
+      if command tail -c 524288 "$WARPISH_EVENT_FILE" > "$compact_file" 2>/dev/null; then
+        command mv -f "$compact_file" "$WARPISH_EVENT_FILE" 2>/dev/null || true
+      fi
+      command rm -f "$compact_file" 2>/dev/null || true
+    fi
   fi
 }
 
@@ -51,8 +60,8 @@ __warpish_preexec() {
 }
 
 __warpish_precmd() {
-  emulate -L zsh
   local exit_code=$?
+  emulate -L zsh
   if [[ -n "${__WARPISH_BLOCK_ID:-}" ]]; then
     local ended="$(__warpish_now)"
     __warpish_marker "End;id=${__WARPISH_BLOCK_ID};ended=${ended};status=${exit_code}"

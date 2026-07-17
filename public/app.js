@@ -27,9 +27,10 @@ const refreshBlocksButton = document.getElementById('refreshBlocks');
 const TerminalCtor = window.Terminal;
 const FitAddonCtor = window.FitAddon?.FitAddon;
 const WebLinksAddonCtor = window.WebLinksAddon?.WebLinksAddon;
+const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
 const term = new TerminalCtor({
-  cursorBlink: true,
+  cursorBlink: !prefersReducedMotion,
   cursorStyle: 'bar',
   macOptionIsMeta: true,
   convertEol: false,
@@ -55,13 +56,27 @@ const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
 if (fitAddon) term.loadAddon(fitAddon);
 if (WebLinksAddonCtor) term.loadAddon(new WebLinksAddonCtor());
 term.open(terminalEl);
+const terminalHelperTextarea = () => terminalEl?.querySelector?.('.xterm-helper-textarea') || null;
+const helperTextarea = terminalHelperTextarea();
+if (helperTextarea) {
+  helperTextarea.setAttribute('aria-label', 'Terminal input');
+  helperTextarea.setAttribute('inputmode', 'text');
+  helperTextarea.setAttribute('enterkeyhint', 'enter');
+  helperTextarea.setAttribute('autocapitalize', 'off');
+  helperTextarea.setAttribute('autocomplete', 'off');
+  helperTextarea.setAttribute('autocorrect', 'off');
+  helperTextarea.spellcheck = false;
+}
 
 let sessions = [];
 let blocks = [];
 let currentSessionId = null;
 let ws = null;
 let connectionSerial = 0;
-let intentionalDetach = false;
+let sessionGeneration = 0;
+let blocksRequestSerial = 0;
+let pendingTerminalInputs = [];
+const intentionallyClosedSockets = new WeakSet();
 let refreshTimer = null;
 let blockFilter = '';
 let blocksOpen = localStorage.getItem('warpish_blocks_open') === 'on';
@@ -80,6 +95,7 @@ const BIDI_READER_RENDER_INTERVAL_MS = 70;
 const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 600;
 const BIDI_CAPTURE_SETTLE_DELAY_MS = 450;
 const BIDI_READER_BOTTOM_EPSILON = 10;
+const TERMINAL_FOCUS_REPORT_SUPPRESS_MS = 1200;
 const XTERM_COLOR_MODE_PALETTE = 0x1000000;
 const XTERM_COLOR_MODE_P256 = 0x2000000;
 const XTERM_COLOR_MODE_RGB = 0x3000000;
@@ -90,6 +106,7 @@ const ANSI_PALETTE = [
 const BLOCK_RENDER_LIMIT = 60;
 const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
 const SESSION_PREVIEW_CHARS = 900;
+const MAX_PENDING_TERMINAL_INPUT_CHARS = 100000;
 let blockRenderPending = false;
 let bidiReaderUpdateTimer = null;
 let lastBidiReaderRenderAt = 0;
@@ -105,8 +122,12 @@ let lastCapturedReaderEntries = [];
 let bidiReaderHistoryModeUntil = 0;
 let stalePromptRecoverySent = false;
 let terminalFocusTimer = null;
+let terminalFocusSerial = 0;
+let terminalInputEventSerial = 0;
+let terminalFocusFollowupTimers = [];
 let terminalFitRaf = null;
 let lastSentTerminalSize = '';
+let suppressTerminalFocusReportsUntil = 0;
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
   const value = String(text || '');
@@ -269,8 +290,22 @@ function applyBidiText(element, text, { className = 'bidi-plain' } = {}) {
 
 function normalizeReadableEntries(input = []) {
   return input
-    .map((entry) => (typeof entry === 'string' ? { text: entry } : { ...entry, text: String(entry?.text || '') }))
+    .map((entry) => {
+      const value = typeof entry === 'string' ? { text: entry } : { ...entry, text: String(entry?.text || '') };
+      value.text = stripTerminalFocusArtifacts(value.text);
+      return value;
+    })
     .filter((entry) => entry.text.length || entry.ghostStart != null);
+}
+
+function stripTerminalFocusArtifacts(text = '') {
+  return String(text || '')
+    .replace(/\x1b\[(?:I|O)/g, '')
+    .replace(/\^\[\[(?:I|O)/g, '');
+}
+
+function hasTerminalFocusArtifacts(text = '') {
+  return /(?:\x1b\[|\^\[\[)(?:I|O)/.test(String(text || ''));
 }
 
 function rgbToHex(value) {
@@ -696,14 +731,14 @@ function restoreBidiReaderAnchor(anchor) {
   return true;
 }
 
-function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false, source = 'xterm' } = {}) {
+function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false, source = 'xterm', preserveAwayFromBottom = false } = {}) {
   if (!bidiReaderLines) return;
   const entries = normalizeReadableEntries(input);
   const hasContent = entries.length > 0;
   const key = `${hasContent ? 'content' : 'empty'}\n${readableEntriesKey(entries)}`;
   if (!force && key === lastBidiReaderRenderKey) return;
   const previousNearBottom = isBidiReaderNearBottom();
-  const wasPinned = previousNearBottom || (!keepScroll && bidiReaderPinnedToBottom);
+  const wasPinned = !preserveAwayFromBottom && (previousNearBottom || (!keepScroll && bidiReaderPinnedToBottom));
   const previousScrollTop = bidiReaderLines.scrollTop;
   const anchor = keepScroll && !wasPinned ? captureBidiReaderAnchor() : null;
   lastBidiReaderRenderKey = key;
@@ -795,24 +830,29 @@ function handleTerminalWriteComplete() {
   scheduleBidiReaderCaptureAfterOutput();
 }
 
-async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture = false } = {}) {
+async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture = false, preserveAwayFromBottom = false } = {}) {
   if (bidiReaderCaptureRefreshPending) {
-    if (preferCapture || keepScroll) {
+    if (preferCapture || keepScroll || preserveAwayFromBottom) {
       bidiReaderCaptureRefreshQueued = {
         keepScroll: keepScroll || Boolean(bidiReaderCaptureRefreshQueued?.keepScroll),
         preferCapture: preferCapture || Boolean(bidiReaderCaptureRefreshQueued?.preferCapture),
+        preserveAwayFromBottom: preserveAwayFromBottom || Boolean(bidiReaderCaptureRefreshQueued?.preserveAwayFromBottom),
       };
     }
     return;
   }
   if (!bidiReaderEnabled || !currentSessionId) {
-    renderBidiReader(getReadableTerminalEntries(), { keepScroll });
+    renderBidiReader(getReadableTerminalEntries(), { keepScroll, preserveAwayFromBottom });
     return;
   }
+  const requestSessionId = currentSessionId;
+  const requestGeneration = sessionGeneration;
+  const requestIsCurrent = () => requestSessionId === currentSessionId && requestGeneration === sessionGeneration;
   bidiReaderCaptureRefreshPending = true;
   lastBidiReaderCaptureAt = performance.now();
   try {
-    const payload = await api(`/api/sessions/${currentSessionId}/capture?lines=5000&ansi=1`);
+    const payload = await api(`/api/sessions/${encodeURIComponent(requestSessionId)}/capture?lines=5000&ansi=1`);
+    if (!requestIsCurrent()) return;
     const captureEntries = parseAnsiCaptureEntries(payload.text || '')
       .slice(-BIDI_READER_MAX_LINES);
     if (captureEntries.length) lastCapturedReaderEntries = captureEntries;
@@ -833,14 +873,15 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
       ? mergeCapturedReaderEntriesWithLiveTail(captureEntries, xtermEntries)
       : (shouldUseCapture ? captureEntries : (xtermHasText ? xtermEntries : captureEntries));
     const renderSource = (captureIsRicherHistory || shouldUseCapture || !xtermHasText) ? 'capture' : 'xterm';
-    renderBidiReader(renderEntries, { force: true, keepScroll, source: renderSource });
+    renderBidiReader(renderEntries, { force: true, keepScroll, source: renderSource, preserveAwayFromBottom });
   } catch {
+    if (!requestIsCurrent()) return;
     const xtermEntries = getReadableTerminalEntries();
     const useCaptureFallback = lastCapturedReaderEntries.length && (preferCapture || isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries));
     const fallbackEntries = useCaptureFallback
       ? lastCapturedReaderEntries
       : xtermEntries;
-    renderBidiReader(fallbackEntries, { force: true, keepScroll, source: useCaptureFallback ? 'capture' : 'xterm' });
+    renderBidiReader(fallbackEntries, { force: true, keepScroll, source: useCaptureFallback ? 'capture' : 'xterm', preserveAwayFromBottom });
   } finally {
     bidiReaderCaptureRefreshPending = false;
     if (bidiReaderCaptureRefreshQueued) {
@@ -874,7 +915,10 @@ function refitTerminal() {
 function applyPanelMode() {
   document.body.classList.add('terminal-native-mode');
   document.body.classList.toggle('blocks-open', blocksOpen);
-  if (blocksToggleButton) blocksToggleButton.textContent = blocksOpen ? 'Hide blocks' : 'Blocks';
+  if (blocksToggleButton) {
+    blocksToggleButton.textContent = blocksOpen ? 'Hide blocks' : 'Blocks';
+    blocksToggleButton.setAttribute('aria-expanded', String(blocksOpen));
+  }
   refitTerminal();
 }
 
@@ -887,7 +931,10 @@ function setBlocksOpen(open) {
 
 function applyBidiMode() {
   document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
-  if (bidiToggleButton) bidiToggleButton.textContent = `Readable: ${bidiReaderEnabled ? 'on' : 'off'}`;
+  if (bidiToggleButton) {
+    bidiToggleButton.textContent = `Readable: ${bidiReaderEnabled ? 'on' : 'off'}`;
+    bidiToggleButton.setAttribute('aria-pressed', String(bidiReaderEnabled));
+  }
   if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
   if (!bidiReaderEnabled) setBidiReaderHasContent(false);
   if (bidiReaderUpdateTimer) window.clearTimeout(bidiReaderUpdateTimer);
@@ -909,6 +956,8 @@ function applyReaderMouseMode() {
   document.body.classList.toggle('reader-mouse-reader', !raw);
   if (mouseModeToggleButton) {
     mouseModeToggleButton.textContent = `Mouse: ${raw ? 'raw' : 'reader'}`;
+    mouseModeToggleButton.setAttribute('aria-pressed', String(raw));
+    mouseModeToggleButton.setAttribute('aria-label', raw ? 'Use raw terminal mouse mode' : 'Use readable terminal mouse mode');
     mouseModeToggleButton.title = raw
       ? 'Mouse goes through the readable overlay to raw xterm/TUI apps; switch to reader for selection and links.'
       : 'Mouse selects/scrolls readable text and opens links; switch to raw for mouse-enabled TUI apps.';
@@ -938,9 +987,36 @@ function preserveViewportAndReaderScroll(callback) {
   }
 }
 
+function suppressTerminalFocusReports(durationMs = TERMINAL_FOCUS_REPORT_SUPPRESS_MS) {
+  suppressTerminalFocusReportsUntil = Math.max(suppressTerminalFocusReportsUntil, performance.now() + durationMs);
+}
+
+function isTerminalFocusReport(data) {
+  return data === '\x1b[I' || data === '\x1b[O';
+}
+
+function shouldStripTerminalFocusReports() {
+  if (readerMouseMode !== 'raw') return true;
+  return performance.now() <= suppressTerminalFocusReportsUntil;
+}
+
+function stripTerminalFocusReports(data) {
+  if (!shouldStripTerminalFocusReports()) return data;
+  return String(data || '').replace(/\x1b\[(?:I|O)/g, '');
+}
+
+function shouldSuppressTerminalInput(data) {
+  return isTerminalFocusReport(data) && shouldStripTerminalFocusReports();
+}
+
+function clearTerminalFocusFollowups() {
+  for (const timer of terminalFocusFollowupTimers) window.clearTimeout(timer);
+  terminalFocusFollowupTimers = [];
+}
+
 function focusTerminalOnceWithoutScroll() {
   preserveViewportAndReaderScroll(() => {
-    const helper = terminalEl?.querySelector?.('.xterm-helper-textarea');
+    const helper = terminalHelperTextarea();
     if (helper?.focus) {
       try {
         helper.focus({ preventScroll: true });
@@ -952,6 +1028,7 @@ function focusTerminalOnceWithoutScroll() {
 }
 
 function focusTerminalSoon() {
+  suppressTerminalFocusReports();
   if (terminalFocusTimer) return;
   terminalFocusTimer = setTimeout(() => {
     terminalFocusTimer = null;
@@ -960,10 +1037,22 @@ function focusTerminalSoon() {
 }
 
 function focusTerminalReliably() {
+  suppressTerminalFocusReports();
+  const serial = ++terminalFocusSerial;
+  clearTerminalFocusFollowups();
   focusTerminalOnceWithoutScroll();
-  requestAnimationFrame(() => focusTerminalOnceWithoutScroll());
-  setTimeout(() => focusTerminalOnceWithoutScroll(), 80);
-  setTimeout(() => focusTerminalOnceWithoutScroll(), 240);
+  requestAnimationFrame(() => {
+    if (serial === terminalFocusSerial) focusTerminalOnceWithoutScroll();
+  });
+  for (const delayMs of [80, 240]) {
+    const timer = setTimeout(() => {
+      terminalFocusFollowupTimers = terminalFocusFollowupTimers.filter((item) => item !== timer);
+      if (serial !== terminalFocusSerial) return;
+      suppressTerminalFocusReports();
+      focusTerminalOnceWithoutScroll();
+    }, delayMs);
+    terminalFocusFollowupTimers.push(timer);
+  }
 }
 
 function shouldPreserveControlFocus(event) {
@@ -980,7 +1069,16 @@ function clearAutoRawInput() {
 }
 
 function handleTerminalInput(data) {
-  sendRaw(data);
+  terminalInputEventSerial += 1;
+  if (shouldSuppressTerminalInput(data)) return;
+  const filtered = stripTerminalFocusReports(data);
+  if (!filtered) return;
+  const sessionId = currentSessionId;
+  if (maybeRecoverStalePromptBeforeInput(filtered)) {
+    setTimeout(() => sendRaw(filtered, { sessionId }), 80);
+  } else {
+    sendRaw(filtered, { sessionId });
+  }
 }
 
 const initialParams = new URLSearchParams(window.location.search);
@@ -1087,7 +1185,28 @@ function updateSessionHistoryActions() {
     : 'No stopped sessions to clear';
 }
 
+function captureSessionListUiState() {
+  const active = document.activeElement;
+  const focusedCard = active && sessionList.contains(active) ? active.closest?.('.session-card') : null;
+  return {
+    scrollTop: sessionList.scrollTop,
+    focusedSessionId: focusedCard?.dataset?.sessionId || '',
+  };
+}
+
+function restoreSessionListUiState(state) {
+  if (!state) return;
+  sessionList.scrollTop = state.scrollTop;
+  if (!state.focusedSessionId) return;
+  const card = [...sessionList.querySelectorAll('.session-card')]
+    .find((candidate) => candidate.dataset.sessionId === state.focusedSessionId && !candidate.disabled);
+  if (!card) return;
+  try { card.focus({ preventScroll: true }); } catch { card.focus(); }
+  sessionList.scrollTop = state.scrollTop;
+}
+
 function renderSessions() {
+  const uiState = captureSessionListUiState();
   sessionList.replaceChildren();
   updateSessionHistoryActions();
   if (!sessions.length) {
@@ -1096,6 +1215,7 @@ function renderSessions() {
     empty.textContent = 'No terminal history yet. Create a new terminal to start a resumable session.';
     sessionList.appendChild(empty);
     updateHeader();
+    restoreSessionListUiState(uiState);
     return;
   }
 
@@ -1104,6 +1224,7 @@ function renderSessions() {
     button.className = `session-card ${session.id === currentSessionId ? 'active' : ''} ${session.alive ? '' : 'dead'}`;
     button.disabled = !session.alive;
     button.dataset.sessionId = session.id;
+    if (session.id === currentSessionId) button.setAttribute('aria-current', 'true');
 
     const title = document.createElement('div');
     title.className = 'session-card-title';
@@ -1132,6 +1253,30 @@ function renderSessions() {
     sessionList.appendChild(button);
   }
   updateHeader();
+  restoreSessionListUiState(uiState);
+}
+
+function captureBlockListUiState() {
+  const active = document.activeElement;
+  const focusedAction = active && blockList.contains(active) ? active.closest?.('[data-block-action]') : null;
+  const focusedCard = focusedAction?.closest?.('.block-card');
+  return {
+    scrollTop: blockList.scrollTop,
+    focusedBlockId: focusedCard?.dataset?.blockId || '',
+    focusedAction: focusedAction?.dataset?.blockAction || '',
+  };
+}
+
+function restoreBlockListUiState(state) {
+  if (!state) return;
+  blockList.scrollTop = state.scrollTop;
+  if (!state.focusedBlockId || !state.focusedAction) return;
+  const card = [...blockList.querySelectorAll('.block-card')]
+    .find((candidate) => candidate.dataset.blockId === state.focusedBlockId);
+  const action = card?.querySelector?.(`[data-block-action="${state.focusedAction}"]`);
+  if (!action || action.disabled) return;
+  try { action.focus({ preventScroll: true }); } catch { action.focus(); }
+  blockList.scrollTop = state.scrollTop;
 }
 
 function blockMatchesFilter(block) {
@@ -1158,11 +1303,25 @@ function upsertBlock(block) {
   scheduleRenderBlocks();
 }
 
+async function copyTextFromButton(button, text, successDetail) {
+  button.disabled = true;
+  try {
+    await navigator.clipboard.writeText(String(text || ''));
+    setStatus('ok', 'copied', successDetail);
+  } catch (error) {
+    setStatus('bad', 'copy failed', error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderBlocks() {
+  const uiState = captureBlockListUiState();
   const filtered = blocks.filter(blockMatchesFilter);
   blocksCount.textContent = `${filtered.length}${filtered.length === blocks.length ? '' : ` / ${blocks.length}`} block${blocks.length === 1 ? '' : 's'}`;
   if (!blocksOpen) {
     blockList.replaceChildren();
+    restoreBlockListUiState(uiState);
     return;
   }
 
@@ -1173,6 +1332,7 @@ function renderBlocks() {
     empty.className = 'empty-state';
     empty.textContent = 'Select a session to see command blocks.';
     blockList.appendChild(empty);
+    restoreBlockListUiState(uiState);
     return;
   }
 
@@ -1183,6 +1343,7 @@ function renderBlocks() {
       ? 'No blocks match this search.'
       : 'No command blocks yet. New sessions record commands with shell integration; run a command to create the first block.';
     blockList.appendChild(empty);
+    restoreBlockListUiState(uiState);
     return;
   }
 
@@ -1190,6 +1351,7 @@ function renderBlocks() {
   for (const block of visibleBlocks) {
     const card = document.createElement('article');
     card.className = `block-card ${block.status || 'unknown'}`;
+    card.dataset.blockId = String(block.id || '');
 
     const command = document.createElement('div');
     command.className = 'block-command';
@@ -1218,6 +1380,7 @@ function renderBlocks() {
     actions.className = 'block-actions';
     const rerun = document.createElement('button');
     rerun.textContent = 'Rerun';
+    rerun.dataset.blockAction = 'rerun';
     rerun.disabled = !block.command || !activeSession()?.alive;
     rerun.addEventListener('click', () => {
       sendRaw(`${block.command}\r`);
@@ -1225,10 +1388,12 @@ function renderBlocks() {
     });
     const copyCommand = document.createElement('button');
     copyCommand.textContent = 'Copy cmd';
-    copyCommand.addEventListener('click', () => navigator.clipboard.writeText(block.command || ''));
+    copyCommand.dataset.blockAction = 'copy-command';
+    copyCommand.addEventListener('click', () => copyTextFromButton(copyCommand, block.command || '', 'command copied'));
     const copyOutput = document.createElement('button');
     copyOutput.textContent = 'Copy output';
-    copyOutput.addEventListener('click', () => navigator.clipboard.writeText(block.output || ''));
+    copyOutput.dataset.blockAction = 'copy-output';
+    copyOutput.addEventListener('click', () => copyTextFromButton(copyOutput, block.output || '', 'output copied'));
     actions.append(rerun, copyCommand, copyOutput);
 
     card.append(command, meta, output, actions);
@@ -1241,9 +1406,12 @@ function renderBlocks() {
     more.textContent = `Showing latest ${visibleBlocks.length} of ${filtered.length} matching blocks. Narrow search to inspect older blocks.`;
     blockList.appendChild(more);
   }
+  restoreBlockListUiState(uiState);
 }
 
 async function loadBlocks(sessionId = currentSessionId, { force = false } = {}) {
+  const requestSerial = ++blocksRequestSerial;
+  const requestGeneration = sessionGeneration;
   if (!sessionId) {
     blocks = [];
     renderBlocks();
@@ -1253,7 +1421,8 @@ async function loadBlocks(sessionId = currentSessionId, { force = false } = {}) 
     renderBlocks();
     return;
   }
-  const payload = await api(`/api/sessions/${sessionId}/blocks`);
+  const payload = await api(`/api/sessions/${encodeURIComponent(sessionId)}/blocks`);
+  if (requestSerial !== blocksRequestSerial || requestGeneration !== sessionGeneration || sessionId !== currentSessionId) return;
   blocks = payload.blocks || [];
   renderBlocks();
 }
@@ -1288,7 +1457,11 @@ async function clearStoppedSessions() {
   try {
     const payload = await api('/api/sessions?stopped=1', { method: 'DELETE' });
     sessions = payload.sessions || [];
-    if (currentSessionId && !sessions.some((session) => session.id === currentSessionId && session.alive)) currentSessionId = null;
+    if (currentSessionId && !sessions.some((session) => session.id === currentSessionId && session.alive)) {
+      currentSessionId = null;
+      sessionGeneration += 1;
+      blocksRequestSerial += 1;
+    }
     renderSessions();
     setStatus('ok', 'history cleaned', `${payload.purged?.length || stoppedCount} stopped removed`);
     const target = currentSessionId || sessions.find((session) => session.alive)?.id;
@@ -1311,12 +1484,68 @@ function socketUrl(sessionId) {
 }
 
 function disconnectCurrent({ quiet = false } = {}) {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    intentionalDetach = quiet;
-    try { ws.send(JSON.stringify({ type: 'detach' })); } catch {}
-    ws.close();
+  const socket = ws;
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    if (quiet) intentionallyClosedSockets.add(socket);
+    if (socket.readyState === WebSocket.OPEN) {
+      try { socket.send(JSON.stringify({ type: 'detach' })); } catch {}
+    }
+    try { socket.close(); } catch {}
   }
-  ws = null;
+  if (ws === socket) ws = null;
+}
+
+function pendingInputChars(sessionId) {
+  return pendingTerminalInputs
+    .filter((item) => item.sessionId === sessionId)
+    .reduce((total, item) => total + item.data.length, 0);
+}
+
+function discardPendingTerminalInputs(sessionId) {
+  const discarded = pendingInputChars(sessionId);
+  pendingTerminalInputs = pendingTerminalInputs.filter((item) => item.sessionId !== sessionId);
+  return discarded;
+}
+
+function queueTerminalInput({ data, directTmux, sessionId }) {
+  const value = String(data || '');
+  if (!value) return true;
+  if (pendingInputChars(sessionId) + value.length > MAX_PENDING_TERMINAL_INPUT_CHARS) {
+    setStatus('bad', 'input queue full', 'wait for the terminal to connect before sending more input');
+    return false;
+  }
+  const last = pendingTerminalInputs.at(-1);
+  if (last && last.sessionId === sessionId && last.directTmux === directTmux) {
+    last.data += value;
+  } else {
+    pendingTerminalInputs.push({ data: value, directTmux: Boolean(directTmux), sessionId });
+  }
+  return true;
+}
+
+function sendTerminalInputOverSocket(socket, item) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  const allowFocusReports = readerMouseMode === 'raw' && performance.now() > suppressTerminalFocusReportsUntil;
+  try {
+    socket.send(JSON.stringify({ type: 'input', data: item.data, directTmux: item.directTmux, allowFocusReports }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function flushPendingTerminalInputs(socket, sessionId) {
+  const remaining = [];
+  for (const item of pendingTerminalInputs) {
+    if (item.sessionId !== sessionId) {
+      remaining.push(item);
+      continue;
+    }
+    if (sessionId !== currentSessionId || ws !== socket || !sendTerminalInputOverSocket(socket, item)) {
+      remaining.push(item);
+    }
+  }
+  pendingTerminalInputs = remaining;
 }
 
 function refreshReadableFromTmuxSoon(delay = 250, preferCapture = false) {
@@ -1333,6 +1562,12 @@ function connectToSession(sessionId) {
 
   connectionSerial += 1;
   const serial = connectionSerial;
+  sessionGeneration += 1;
+  blocksRequestSerial += 1;
+  pendingTerminalInputs = pendingTerminalInputs.filter((item) => item.sessionId === sessionId);
+  suppressTerminalFocusReports();
+  terminalFocusSerial += 1;
+  clearTerminalFocusFollowups();
   disconnectCurrent({ quiet: true });
   currentSessionId = sessionId;
   stalePromptRecoverySent = false;
@@ -1352,20 +1587,22 @@ function connectToSession(sessionId) {
   focusTerminalSoon();
   setStatus('warn', 'attaching…', session.title);
 
-  ws = new WebSocket(socketUrl(sessionId));
-  ws.binaryType = 'arraybuffer';
+  const socket = new WebSocket(socketUrl(sessionId));
+  socket.binaryType = 'arraybuffer';
+  ws = socket;
 
-  ws.addEventListener('open', () => {
-    if (serial !== connectionSerial) return;
+  socket.addEventListener('open', () => {
+    if (serial !== connectionSerial || ws !== socket) return;
     setStatus('ok', 'connected', `${session.title} • tmux resumable`);
     const { cols, rows } = currentDims();
-    ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+    socket.send(JSON.stringify({ type: 'resize', cols, rows }));
+    flushPendingTerminalInputs(socket, sessionId);
     refreshReadableFromTmuxSoon(200, true);
     focusPreferredInput();
   });
 
-  ws.addEventListener('message', (event) => {
-    if (serial !== connectionSerial) return;
+  socket.addEventListener('message', (event) => {
+    if (serial !== connectionSerial || ws !== socket) return;
     if (event.data instanceof ArrayBuffer) {
       scheduleBidiReaderCaptureAfterOutput();
       term.write(new Uint8Array(event.data), handleTerminalWriteComplete);
@@ -1390,20 +1627,23 @@ function connectToSession(sessionId) {
       term.writeln(`\r\n\x1b[31m${msg.message || 'server error'}\x1b[0m`);
       scheduleBidiReaderUpdate();
     } else if (msg.type === 'detached') {
-      if (!intentionalDetach) setStatus('bad', 'detached', 'session still exists in sidebar');
+      if (!intentionallyClosedSockets.has(socket)) setStatus('bad', 'detached', 'session still exists in sidebar');
     } else if (['block-start', 'block-update', 'block-end'].includes(msg.type)) {
       upsertBlock(msg.block);
       if (msg.type === 'block-end') clearAutoRawInput('block-end');
     }
   });
 
-  ws.addEventListener('close', () => {
+  socket.addEventListener('close', () => {
+    const intentionalClose = intentionallyClosedSockets.has(socket);
+    intentionallyClosedSockets.delete(socket);
     if (serial !== connectionSerial) return;
-    if (intentionalDetach) {
+    if (ws === socket) ws = null;
+    if (intentionalClose) {
       setStatus('warn', 'detached', 'tmux session kept alive');
-      intentionalDetach = false;
     } else {
-      setStatus('bad', 'disconnected', 'click session to attach again');
+      const droppedChars = discardPendingTerminalInputs(sessionId);
+      setStatus('bad', 'disconnected', droppedChars ? `${droppedChars} queued chars were not sent` : 'click session to attach again');
     }
     setTimeout(() => {
       refreshSessions().catch(() => {});
@@ -1411,28 +1651,27 @@ function connectToSession(sessionId) {
     }, 300);
   });
 
-  ws.addEventListener('error', () => {
-    if (serial !== connectionSerial) return;
+  socket.addEventListener('error', () => {
+    if (serial !== connectionSerial || ws !== socket) return;
     setStatus('bad', 'connection error', 'server/token/session problem');
   });
 }
 
-function sendRaw(data, { directTmux = false, retry = 0 } = {}) {
-  if (!currentSessionId) {
+function sendRaw(data, { directTmux = false, sessionId = currentSessionId } = {}) {
+  if (!sessionId) {
     term.writeln('\r\n\x1b[31mNo session selected. Create or select a terminal first.\x1b[0m');
     scheduleBidiReaderUpdate();
     return;
   }
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    if (retry >= 3) {
-      setStatus('bad', 'send failed', 'terminal is not connected after retrying');
-      return;
-    }
-    connectToSession(currentSessionId);
-    setTimeout(() => sendRaw(data, { directTmux, retry: retry + 1 }), 500);
+  if (sessionId !== currentSessionId) return;
+  const item = { data: String(data || ''), directTmux: Boolean(directTmux), sessionId };
+  if (ws?.readyState === WebSocket.OPEN && sendTerminalInputOverSocket(ws, item)) return;
+  if (!queueTerminalInput(item)) return;
+  if (ws?.readyState === WebSocket.CONNECTING) {
+    setStatus('warn', 'attaching…', `${pendingInputChars(sessionId)} input chars queued`);
     return;
   }
-  ws.send(JSON.stringify({ type: 'input', data, directTmux }));
+  connectToSession(sessionId);
 }
 
 function selectedReadableText() {
@@ -1505,6 +1744,32 @@ function terminalKeyData(event) {
   return null;
 }
 
+function forwardReaderKeyToXterm(event) {
+  const helper = terminalHelperTextarea();
+  if (!helper) return false;
+  const inputSerialBefore = terminalInputEventSerial;
+  try { helper.focus({ preventScroll: true }); } catch { helper.focus(); }
+  const forwarded = new KeyboardEvent('keydown', {
+    key: event.key,
+    code: event.code,
+    location: event.location,
+    ctrlKey: event.ctrlKey,
+    shiftKey: event.shiftKey,
+    altKey: event.altKey,
+    metaKey: event.metaKey,
+    repeat: event.repeat,
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+  });
+  try {
+    Object.defineProperty(forwarded, 'keyCode', { get: () => event.keyCode });
+    Object.defineProperty(forwarded, 'which', { get: () => event.which });
+  } catch {}
+  helper.dispatchEvent(forwarded);
+  return terminalInputEventSerial !== inputSerialBefore;
+}
+
 function currentCursorLineText() {
   const buffer = term.buffer?.active;
   if (!buffer) return '';
@@ -1538,26 +1803,24 @@ function maybeRecoverStalePromptBeforeInput(data) {
 
 function handleReadableTerminalKeydown(event) {
   if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
-  const data = terminalKeyData(event);
-  if (!data) return;
+  if (isXtermHelperTarget(event.target) || event.isComposing || event.metaKey) return;
   event.preventDefault();
   event.stopPropagation();
-  focusTerminalSoon();
-  if (maybeRecoverStalePromptBeforeInput(data)) {
-    setTimeout(() => sendRaw(data, { directTmux: true }), 80);
-  } else {
-    sendRaw(data, { directTmux: true });
-  }
+  suppressTerminalFocusReports();
+  if (forwardReaderKeyToXterm(event)) return;
+  const data = terminalKeyData(event);
+  if (data) term.input(data, true);
 }
 
 function handleReadableTerminalPaste(event) {
   if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
+  if (isXtermHelperTarget(event.target)) return;
   const text = event.clipboardData?.getData('text/plain');
   if (!text) return;
   event.preventDefault();
   event.stopPropagation();
-  focusTerminalSoon();
-  sendRaw(text, { directTmux: true });
+  focusTerminalOnceWithoutScroll();
+  term.paste(text);
 }
 
 term.onData((data) => handleTerminalInput(data));
@@ -1589,7 +1852,7 @@ async function refreshBidiReaderForScroll(deltaY) {
   const wasNearBottom = isBidiReaderNearBottom();
   const scrollTopAtStart = bidiReaderLines.scrollTop;
   try {
-    await refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true });
+    await refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true, preserveAwayFromBottom: deltaY < 0 });
     preferBidiReaderHistoryForScroll();
     const userMovedDuringCapture = Math.abs(bidiReaderLines.scrollTop - scrollTopAtStart) > 2;
     if (!userMovedDuringCapture && wasNearBottom && deltaY < 0) {
@@ -1626,6 +1889,7 @@ bidiReader?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, pa
 bidiReaderLines?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 terminalEl.addEventListener('wheel', (event) => {
   if (event.ctrlKey) return;
+  event.stopPropagation();
   const lineHeight = 18;
   const lines = Math.max(1, Math.min(12, Math.round(Math.abs(event.deltaY) / lineHeight)));
   const before = term.buffer?.active?.viewportY ?? 0;
@@ -1667,15 +1931,30 @@ blockSearch.addEventListener('input', () => {
 renameSessionButton.addEventListener('click', async () => {
   const session = activeSession();
   if (!session) return;
-  const title = window.prompt('Rename terminal session:', session.title);
-  if (!title || title.trim() === session.title) return;
-  const payload = await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ title }) });
-  sessions = payload.sessions || sessions;
-  renderSessions();
+  const title = window.prompt('Rename terminal session:', session.title)?.trim();
+  if (!title || title === session.title) return;
+  renameSessionButton.disabled = true;
+  try {
+    const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'PATCH', body: JSON.stringify({ title }) });
+    sessions = payload.sessions || sessions;
+    renderSessions();
+    setStatus('ok', 'renamed', title);
+  } catch (error) {
+    setStatus('bad', 'rename failed', error.message);
+  } finally {
+    renameSessionButton.disabled = false;
+  }
 });
 
-copySelection.addEventListener('click', () => {
-  copyTerminalSelection().catch((error) => setStatus('bad', 'copy failed', error.message));
+copySelection.addEventListener('click', async () => {
+  copySelection.disabled = true;
+  try {
+    await copyTerminalSelection();
+  } catch (error) {
+    setStatus('bad', 'copy failed', error.message);
+  } finally {
+    copySelection.disabled = false;
+  }
 });
 
 blocksToggleButton?.addEventListener('click', () => setBlocksOpen(!blocksOpen));
@@ -1688,6 +1967,7 @@ bidiToggleButton.addEventListener('click', () => {
 });
 
 detachSessionButton.addEventListener('click', () => {
+  discardPendingTerminalInputs(currentSessionId);
   disconnectCurrent({ quiet: true });
   setStatus('warn', 'detached', 'click sidebar session to continue');
 });
@@ -1696,15 +1976,37 @@ killSessionButton.addEventListener('click', async () => {
   const session = activeSession();
   if (!session) return;
   if (!window.confirm(`Kill tmux session "${session.title}"? This stops the terminal process, not just the browser attach.`)) return;
+  killSessionButton.disabled = true;
+  detachSessionButton.disabled = true;
+  connectionSerial += 1;
+  sessionGeneration += 1;
+  blocksRequestSerial += 1;
+  discardPendingTerminalInputs(session.id);
   disconnectCurrent({ quiet: true });
-  await api(`/api/sessions/${session.id}`, { method: 'DELETE' });
-  currentSessionId = null;
-  blocks = [];
-  renderBlocks();
-  term.reset();
-  scheduleBidiReaderUpdate();
-  setStatus('warn', 'session killed', 'create or choose another session');
-  await refreshSessions({ createIfEmpty: true });
+  try {
+    await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE' });
+    currentSessionId = null;
+    blocks = [];
+    lastCapturedReaderEntries = [];
+    renderBlocks();
+    term.reset();
+    scheduleBidiReaderUpdate();
+    setStatus('warn', 'session killed', 'create or choose another session');
+    try {
+      await refreshSessions({ createIfEmpty: true });
+    } catch (error) {
+      setStatus('bad', 'refresh failed', `session was killed; ${error.message}`);
+    }
+  } catch (error) {
+    setStatus('bad', 'kill failed', error.message);
+    try {
+      await refreshSessions();
+      if (sessions.some((candidate) => candidate.id === session.id && candidate.alive)) connectToSession(session.id);
+    } catch {}
+  } finally {
+    killSessionButton.disabled = false;
+    detachSessionButton.disabled = false;
+  }
 });
 
 window.addEventListener('keydown', (event) => {

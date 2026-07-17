@@ -4,6 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Warpish Terminal</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#070711" />
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -28,7 +30,7 @@
           </div>
         </div>
 
-        <div id="sessionList" class="session-list" aria-label="Terminal sessions"></div>
+        <div id="sessionList" class="session-list" aria-label="Terminal sessions" role="group"></div>
 
         <div class="sidebar-footer">
           <span>Resumable via tmux</span>
@@ -43,8 +45,8 @@
             <h2 id="sessionTitle">Terminal</h2>
             <p id="sessionMeta" class="subtitle">Choose or create a terminal session.</p>
           </div>
-          <div class="status-card" id="statusCard">
-            <span class="dot" id="statusDot"></span>
+          <div class="status-card" id="statusCard" role="status" aria-live="polite" aria-atomic="true">
+            <span class="dot" id="statusDot" aria-hidden="true"></span>
             <div>
               <strong id="statusText">loading…</strong>
               <small id="sessionText">tmux session manager</small>
@@ -58,17 +60,17 @@
               <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
               <div class="terminal-title" id="terminalTitle">No session attached</div>
               <div class="toolbar-actions">
-                <button id="blocksToggle" title="Show or hide command blocks">Blocks</button>
+                <button id="blocksToggle" title="Show or hide command blocks" aria-expanded="false" aria-controls="blocksPanel">Blocks</button>
                 <button id="renameSession" title="Rename selected session">Rename</button>
                 <button id="copySelection" title="Copy selected terminal text">Copy</button>
-                <button id="bidiToggle" class="bidi-toggle" title="Toggle the default readable terminal mask">Readable: on</button>
-                <button id="mouseModeToggle" class="mouse-toggle" title="Switch readable overlay mouse handling between reader selection/links and raw xterm/TUI passthrough">Mouse: reader</button>
+                <button id="bidiToggle" class="bidi-toggle" title="Toggle the default readable terminal mask" aria-pressed="true" aria-controls="bidiReader">Readable: on</button>
+                <button id="mouseModeToggle" class="mouse-toggle" title="Switch readable overlay mouse handling between reader selection/links and raw xterm/TUI passthrough" aria-pressed="false">Mouse: reader</button>
                 <button id="detachSession" title="Detach from this session; tmux keeps it alive">Detach</button>
                 <button id="killSession" class="danger" title="Kill selected tmux session">Kill session</button>
               </div>
             </div>
-            <div id="terminal"></div>
-            <div id="bidiReader" class="bidi-reader" aria-live="polite">
+            <div id="terminal" aria-label="Terminal display"></div>
+            <div id="bidiReader" class="bidi-reader" role="region" aria-label="Readable terminal output" aria-live="off">
               <div class="bidi-reader-head">
                 <span>Readable terminal</span>
                 <small>Default masked terminal output for mixed RTL/LTR lines</small>
@@ -77,7 +79,7 @@
             </div>
           </section>
 
-          <aside class="blocks-card">
+          <aside id="blocksPanel" class="blocks-card">
             <div class="blocks-head">
               <div>
                 <span>Command blocks</span>
@@ -85,8 +87,8 @@
               </div>
               <button id="refreshBlocks" title="Refresh command blocks" aria-label="Refresh command blocks">↻</button>
             </div>
-            <input id="blockSearch" autocomplete="off" spellcheck="false" dir="auto" placeholder="Search blocks…" />
-            <div id="blockList" class="block-list" aria-label="Command blocks"></div>
+            <input id="blockSearch" autocomplete="off" spellcheck="false" dir="auto" placeholder="Search blocks…" aria-label="Search command blocks" />
+            <div id="blockList" class="block-list" aria-label="Command blocks" role="group"></div>
           </aside>
         </section>
 

@@ -58,7 +58,7 @@ def main():
     args = parser.parse_args()
 
     env = dict(os.environ)
-    env["TERM"] = "xterm-256color"
+    env["TERM"] = os.environ.get("TERM", "xterm-256color")
     env["COLORTERM"] = "truecolor"
     env["WARPISH_TERMINAL"] = "1"
     # The web PTY is not itself inside the user's terminal, so never inherit
@@ -83,6 +83,7 @@ def main():
     emit({"type": "ready", "pid": pid})
 
     stdin_fd = sys.stdin.fileno()
+    pending_input = bytearray()
 
     while True:
         exit_msg = child_exit_status(pid)
@@ -91,9 +92,24 @@ def main():
             return
 
         try:
-            readable, _, _ = select.select([master_fd, stdin_fd], [], [], 0.1)
+            readable, writable, _ = select.select(
+                [master_fd, stdin_fd],
+                [master_fd] if pending_input else [],
+                [],
+                0.1,
+            )
         except InterruptedError:
             continue
+
+        if master_fd in writable and pending_input:
+            try:
+                written = os.write(master_fd, pending_input)
+                if written > 0:
+                    del pending_input[:written]
+            except (BlockingIOError, InterruptedError):
+                pass
+            except OSError:
+                pending_input.clear()
 
         if master_fd in readable:
             try:
@@ -122,9 +138,12 @@ def main():
 
             msg_type = message.get("type")
             if msg_type == "input":
-                payload = base64.b64decode(message.get("data", ""))
+                try:
+                    payload = base64.b64decode(message.get("data", ""), validate=True)
+                except (TypeError, ValueError):
+                    continue
                 if payload:
-                    os.write(master_fd, payload)
+                    pending_input.extend(payload)
             elif msg_type == "resize":
                 set_winsize(master_fd, message.get("cols", args.cols), message.get("rows", args.rows))
                 try:
