@@ -117,13 +117,22 @@ bash -n start.sh stop.sh
   - Default readable terminal input/output.
   - Command-block search/copy/rerun UI.
 
+- `public/terminal-key-data.js`
+  - Pure state-aware terminal key mapping for application cursor mode, modifiers, function/navigation keys, Alt, Ctrl, and IME/Meta guards.
+
+- `public/terminal-input.js`
+  - Pure 64 KiB byte-aware UTF-8/binary chunking used by the ordered, bounded browser reconnect/backpressure queue.
+
+- `public/terminal-preferences.js`
+  - Browser-local normalized theme/font/scrollback/accessibility/default-session preferences.
+
 - `public/index.html` and `public/styles.css`
   - Layout and visual design.
 
 - `scripts/smoke.js`
   - End-to-end backend/tmux regression test.
   - Runs against a temporary `WARPISH_DATA_DIR`, token file, and session prefix so smoke sessions do not pollute the real sidebar.
-  - Must keep proving session resume, command-block capture, bidi output, and stopped-history cleanup.
+  - Must keep proving reconnect and real Node-server restart resume, command-block byte-for-byte persistence, bidi output, sidebar preview evidence, and stopped-history cleanup.
 
 - `scripts/browser-regressions.js`
   - Headless Chrome/CDP regression test.
@@ -141,6 +150,7 @@ bash -n start.sh stop.sh
 - Cmd/Ctrl+K should focus the terminal, not open a separate command mask.
 - Readable overlay/focus/scroll/mouse regression guard: the overlay must not steal typing. Keep explicit focus handlers on the terminal surface/card so that after toolbar blur or old-session reattach, clicking the terminal/readable area focuses xterm. When readable mode is on, bridge keydown/paste from the readable surface directly to the backing tmux pane (`directTmux`) so old attach-session clients cannot swallow input; for stale prompt-only shell rows, a conservative `C-g C-u` recovery before the first printable key is allowed. Wheel over the readable surface should scroll the readable/tmux-captured history and stop propagation in reader mouse mode; raw mouse mode must pass pointer events through to xterm for mouse-enabled TUIs.
 - Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
+- Generic TUI auto mode may activate only when capture metadata agrees on `alternateActive`, `usingAlternate`, and `captureReason === 'alternate-active'`; private sessions may expose those non-content booleans but never captured text.
 - Keep the readable terminal mask available as the default surface/toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML, splits LTR prompts from RTL suffix segments, isolates English/code/path runs as LTR, preserves live xterm and ANSI-preserving tmux-captured foreground/background/bold styling, dims inline suggestion text after the cursor, and throttles/cache-skips fast redraws so Hermes streaming output does not flicker. If a full-screen/alternate-screen terminal app leaves xterm scrollback at `baseY=0` or exposes only sparse/control-key artifacts, prefer tmux-captured reader content and do not hide raw xterm unless the reader has real content (`bidi-reader-has-content`); wheel should refresh/update this tmux-backed readable layer rather than trying to split the terminal layout or sending history/navigation input to the shell.
 - Preserve bidi styling on sidebar previews, block commands, and block outputs.
 - Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
@@ -153,6 +163,20 @@ bash -n start.sh stop.sh
 - The UI `Kill session` action is the intentional destructive path for live shells.
 - The UI `Clear stopped` action may purge stopped-session rows and their related block/event rows, but it must not kill active `tmux` sessions.
 - Sidebar previews should come from actual tmux pane content, not fabricated state.
+- Stopped session cards must remain selectable as read-only retained history; they must never attempt a WebSocket attach.
+- New-session CWD must resolve to an existing accessible directory, and profile/private metadata must survive SQLite round trips.
+- Private sessions must not persist command markers, blocks, output, previews, capture/export text, or tmux scrollback. Live screen rendering and non-content TUI metadata are allowed.
+- Set tmux `history-limit` before creating the real shell pane; changing it on an existing pane does not alter that pane's limit. Recovered unknown tmux sessions must never default to non-private, and a private pane whose effective limit is nonzero must stay quarantined from attach/input/capture.
+- Pane split/next operations require a live validated session and must return explicit 4xx/5xx errors instead of silently succeeding.
+
+### Terminal protocol and lifecycle
+
+- Preserve `term.onBinary` and ordered text/binary reconnect queues; do not coerce binary terminal replies through UTF-8 text.
+- Keep browser chunks within the server's 64 KiB byte limit without splitting Unicode code points, and measure pending capacity in bytes rather than JavaScript characters.
+- Keyboard fallback must use terminal mode state and the pure mapper rather than a fixed arrow-key table.
+- Keep WebSocket payload/buffer limits, ping/pong heartbeat, bounded Node/Python input queues, tmux timeouts, and idle attach-runtime teardown. Backpressure errors must be visible to the client, while tmux remains alive.
+- CWD comes from a bounded base64 shell marker, is validated as an absolute existing directory, and is broadcast as `session-meta`.
+- Multiline paste requires an explicit safe single-line/preserve/cancel choice outside bracketed-paste mode; trailing line breaks must never become an implicit submit.
 
 ### Command blocks
 
@@ -208,6 +232,7 @@ Then open the app in Chrome and verify at least:
 - clearing stopped session history removes stopped sidebar entries and keeps live sessions alive,
 - a disposable full-screen/resume-style terminal fixture leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured text rather than freezing or splitting the layout,
 - browser console has no JavaScript errors.
+- new-session CWD/profile/private fields, settings persistence, find, export, pane actions, stopped-history selection, and toolbar hit targets work in a real browser.
 
 For docs-only changes, at minimum verify:
 
@@ -243,6 +268,8 @@ These are hard rules for future development:
 8. Start/stop scripts must validate process identity; do not kill arbitrary listeners just because they occupy the configured port.
 9. Durable docs must not contain private resume IDs, tokens, transient ports, or stale runtime claims. Use reproducible fixtures or placeholders.
 10. Before handoff, run `npm test` plus the syntax/check commands, then verify final `git status --short`.
+11. Toolbar overflow must start-align inside its scroll container. `flex-end` can place early controls at negative x coordinates, making Blocks/Find visually present but unclickable.
+12. HTML number defaults must satisfy their own `min`/`step` constraints; native validation can otherwise prevent Settings from submitting without a JavaScript error.
 
 
 ## Known pitfalls

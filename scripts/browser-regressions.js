@@ -4,9 +4,10 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 
-const projectRoot = new URL('..', import.meta.url).pathname;
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 const chromePath = process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const runtimeRoot = process.env.WARPISH_BROWSER_RUNTIME_ROOT
   ? path.resolve(process.env.WARPISH_BROWSER_RUNTIME_ROOT)
@@ -1955,6 +1956,23 @@ async function testReadableClipboardShortcutsDoNotSendControlBytes(page) {
   await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Readable Clipboard Shortcut Regression')`, 15000, 'clipboard shortcut session selected');
   await page.waitFor(`document.querySelector('.terminal-card')?.dataset.controlRole === 'controller'`, 15000, 'clipboard shortcut tab controller role');
   await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(readyMarker)})`, 15000, 'clipboard shortcut reader ready');
+  const lightThemeState = await page.eval(`(() => {
+    applyTerminalPreferences({ ...terminalPreferences, theme: 'light' });
+    const reader = getComputedStyle(document.querySelector('#bidiReader'));
+    const line = getComputedStyle(document.querySelector('#bidiReaderLines .bidi-line'));
+    const result = { background: reader.backgroundColor, foreground: line.color };
+    applyTerminalPreferences({ ...terminalPreferences, theme: 'midnight' });
+    return result;
+  })()`);
+  assert(lightThemeState.background === 'rgb(251, 251, 253)' && lightThemeState.foreground === 'rgb(32, 33, 36)', 'light theme did not reach the readable terminal surface', lightThemeState);
+  const busyControlState = await page.eval(`(() => {
+    setControlBusy(exportSessionButton, true);
+    renderSessions();
+    const stayedDisabled = exportSessionButton.disabled;
+    setControlBusy(exportSessionButton, false);
+    return { stayedDisabled, released: !exportSessionButton.disabled };
+  })()`);
+  assert(busyControlState.stayedDisabled && busyControlState.released, 'header refresh discarded an in-flight action busy state', busyControlState);
   const naturalReconnectMode = await page.eval(`Boolean(term.modes?.bracketedPasteMode)`);
   await page.eval(`new Promise((resolve) => term.write('\\x1b[?2004l', resolve))`);
   const reconnectMode = await page.eval(`Boolean(term.modes?.bracketedPasteMode)`);
@@ -1963,6 +1981,17 @@ async function testReadableClipboardShortcutsDoNotSendControlBytes(page) {
     reconnectMode,
   });
   fs.writeFileSync(inputLog, Buffer.alloc(0));
+
+  await dispatchTrustedReadableKey(page, 'f', { ctrlKey: true, focusReader: true });
+  await page.waitFor(`document.querySelector('#terminalSearchPanel')?.hidden === false`, 5000, 'terminal find shortcut opened search');
+  await delay(250);
+  const findShortcutBytes = fs.readFileSync(inputLog);
+  assert(findShortcutBytes.length === 0, 'Ctrl+F opened Find but leaked terminal input first', {
+    receivedHex: findShortcutBytes.toString('hex'),
+  });
+  await page.eval(`setTerminalSearchOpen(false)`);
+  const closedSearchState = await page.eval(`({ query: terminalSearchQuery, native: document.body.classList.contains('terminal-search-native') })`);
+  assert(closedSearchState.query === '' && closedSearchState.native === false, 'closing Find left hidden search/highlight state active', closedSearchState);
 
   async function waitForSemanticState(predicate, label) {
     const text = await waitForFileState(stateFile, (value) => {
@@ -2030,6 +2059,17 @@ async function testReadableClipboardShortcutsDoNotSendControlBytes(page) {
     assert(dispatch.dispatched && dispatch.defaultPrevented, 'safe terminal paste handler did not intercept the clipboard event', {
       selector,
       dispatch,
+    });
+    const choice = await page.eval(`(() => {
+      const dialog = document.querySelector('#pasteDialog');
+      const button = dialog?.querySelector('button[value="single-line"]');
+      const open = Boolean(dialog?.open);
+      if (open) button?.click();
+      return { open, buttonFound: Boolean(button) };
+    })()`);
+    assert(choice.open && choice.buttonFound, 'multiline paste did not require an explicit safe-mode choice', {
+      selector,
+      choice,
     });
     const expected = Buffer.from(safeSingleLinePaste, 'utf8');
     const actual = await waitForFileState(inputLog, (value) => value.length >= expected.length, 5000, `safe paste input for ${selector}`, { binary: true });
@@ -2159,10 +2199,85 @@ async function testReadableClipboardShortcutsDoNotSendControlBytes(page) {
   await resetSemanticDraft(1);
   await page.eval(`new Promise((resolve) => term.write('\\x1b[?2004l', resolve))`);
 
+  const affinitySession = await createSession('Paste Affinity And History Regression', path.join(runtimeRoot, 'paste-affinity-cwd'));
+  const affinityInputLog = path.join(runtimeRoot, `paste-affinity-${suffix}.bin`);
+  const affinityReadyMarker = `__WARPISH_PASTE_AFFINITY_READY_${suffix}__`;
+  respawnPane(affinitySession.id, controllerLeaseProbeCommand({ readyMarker: affinityReadyMarker, inputLog: affinityInputLog }));
+  await waitForFileState(affinityInputLog, () => true, 5000, 'paste-affinity input log', { binary: true });
+  const affinityDispatch = await page.eval(`(() => {
+    const target = document.querySelector('#bidiReaderLines');
+    const transfer = new DataTransfer();
+    transfer.setData('text/plain', 'first session line\\nsecond session line\\n');
+    const event = new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true, composed: true });
+    target?.dispatchEvent(event);
+    return { targetFound: Boolean(target), prevented: event.defaultPrevented, dialogOpen: Boolean(document.querySelector('#pasteDialog')?.open) };
+  })()`);
+  assert(affinityDispatch.targetFound && affinityDispatch.prevented && affinityDispatch.dialogOpen, 'paste-affinity dialog did not open', affinityDispatch);
+  await page.eval(`refreshSessions({ selectId: ${JSON.stringify(affinitySession.id)} })`);
+  await page.waitFor(`currentSessionId === ${JSON.stringify(affinitySession.id)} && terminalControlRole === 'controller'`, 15000, 'paste-affinity second session connected');
+  await page.eval(`document.querySelector('#pasteDialog button[value="preserve"]')?.click()`);
+  await delay(200);
+  const affinityState = await page.eval(`({
+    currentSessionId,
+    pendingForCurrent: pendingInputBytes(currentSessionId),
+    pendingTotal: pendingTerminalInputs.length,
+    status: document.querySelector('#statusText')?.textContent || '',
+  })`);
+  assert(affinityState.pendingForCurrent === 0 && affinityState.pendingTotal === 0 && affinityState.status.includes('paste cancelled'), 'paste crossed into the session selected while its dialog was open', affinityState);
+  assert(fs.readFileSync(affinityInputLog).length === 0, 'cancelled cross-session paste reached the new PTY');
+
+  const largeUtf8Input = 'سلام🙂-terminal-input-'.repeat(5000);
+  const largeUtf8Expected = Buffer.from(largeUtf8Input, 'utf8');
+  fs.writeFileSync(affinityInputLog, Buffer.alloc(0));
+  await page.eval(`sendRaw(${JSON.stringify(largeUtf8Input)})`);
+  const largeUtf8Actual = await waitForFileState(
+    affinityInputLog,
+    (value) => value.length >= largeUtf8Expected.length,
+    15000,
+    'large UTF-8 chunked terminal input',
+    { binary: true },
+  );
+  assert(largeUtf8Actual.equals(largeUtf8Expected), 'large UTF-8 terminal input was rejected, reordered, or split inside a code point', {
+    expectedBytes: largeUtf8Expected.length,
+    actualBytes: largeUtf8Actual.length,
+  });
+
+  await page.eval(`api('/api/sessions/${affinitySession.id}', { method: 'DELETE' }).then(() => refreshSessions({ selectId: ${JSON.stringify(affinitySession.id)} }))`);
+  await page.waitFor(`currentSessionId === ${JSON.stringify(affinitySession.id)} && terminalControlRole === 'history' && ws === null`, 15000, 'stopped session entered read-only history mode');
+  await page.eval(`(() => {
+    term.input('history-must-not-queue', true);
+    document.querySelector('.mobile-terminal-keys button[data-terminal-key="ArrowUp"]')?.click();
+    const target = document.querySelector('#bidiReaderLines');
+    const transfer = new DataTransfer();
+    transfer.setData('text/plain', 'history paste\\nsecond line\\n');
+    target?.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true, composed: true }));
+  })()`);
+  await delay(200);
+  const stoppedInputState = await page.eval(`({
+    role: terminalControlRole,
+    pendingBytes: pendingInputBytes(currentSessionId),
+    pendingTotal: pendingTerminalInputs.length,
+    socket: ws?.readyState ?? null,
+    pasteDialogOpen: Boolean(document.querySelector('#pasteDialog')?.open),
+    status: document.querySelector('#statusText')?.textContent || '',
+  })`);
+  assert(stoppedInputState.role === 'history'
+    && stoppedInputState.pendingBytes === 0
+    && stoppedInputState.pendingTotal === 0
+    && stoppedInputState.socket === null
+    && stoppedInputState.pasteDialogOpen === false
+    && stoppedInputState.status === 'read only', 'stopped history accepted, queued, or falsely reported a successful paste', stoppedInputState);
+
   return {
     selectionText: selection.text,
     receivedHex: received.toString('hex'),
+    findShortcutHex: findShortcutBytes.toString('hex'),
     controller: true,
+    lightThemeState,
+    busyControlState,
+    pasteSessionAffinityVerified: affinityState,
+    stoppedHistoryInputBlocked: stoppedInputState,
+    largeUtf8InputBytes: largeUtf8Actual.length,
     safePaste: {
       surfaces: 3,
       submittedBeforeEnter: [readerSemanticState, helperSemanticState, rawSemanticState]

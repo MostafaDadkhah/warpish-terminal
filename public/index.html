@@ -60,14 +60,29 @@
               <div class="traffic-lights" aria-hidden="true"><span></span><span></span><span></span></div>
               <div class="terminal-title" id="terminalTitle">No session attached</div>
               <div class="toolbar-actions">
+                <span id="tuiModeStatus" class="tui-mode-status" role="status" aria-live="polite" aria-atomic="true" hidden></span>
                 <button id="blocksToggle" title="Show or hide command blocks" aria-expanded="false" aria-controls="blocksPanel">Blocks</button>
+                <button id="terminalSearchToggle" title="Find in terminal scrollback (Cmd/Ctrl+F)" aria-expanded="false" aria-controls="terminalSearchPanel">Find</button>
                 <button id="renameSession" title="Rename selected session">Rename</button>
                 <button id="copySelection" title="Copy selected terminal text">Copy</button>
+                <button id="exportSession" title="Export terminal history and command blocks">Export</button>
                 <button id="bidiToggle" class="bidi-toggle" title="Toggle the default readable terminal mask" aria-pressed="true" aria-controls="bidiReader">Readable: on</button>
                 <button id="mouseModeToggle" class="mouse-toggle" title="Switch readable overlay mouse handling between reader selection/links and raw xterm/TUI passthrough" aria-pressed="false">Mouse: reader</button>
+                <button id="tuiModeToggle" class="tui-mode-toggle" title="Automatically use the native terminal display and raw mouse passthrough for detected full-screen TUI apps" aria-pressed="true" aria-controls="terminal bidiReader">TUI: auto</button>
+                <button id="splitVertical" title="Split the active tmux pane left/right">Split ↔</button>
+                <button id="splitHorizontal" title="Split the active tmux pane top/bottom">Split ↕</button>
+                <button id="nextPane" title="Focus the next tmux pane">Next pane</button>
+                <button id="settingsToggle" title="Terminal settings">Settings</button>
                 <button id="detachSession" title="Detach from this session; tmux keeps it alive">Detach</button>
                 <button id="killSession" class="danger" title="Kill selected tmux session">Kill session</button>
               </div>
+            </div>
+            <div id="terminalSearchPanel" class="terminal-search-panel" hidden>
+              <input id="terminalSearchInput" type="search" autocomplete="off" spellcheck="false" placeholder="Find in terminal…" aria-label="Find in terminal scrollback" />
+              <span id="terminalSearchCount" aria-live="polite">0 matches</span>
+              <button id="terminalSearchPrevious" title="Previous match" aria-label="Previous match">↑</button>
+              <button id="terminalSearchNext" title="Next match" aria-label="Next match">↓</button>
+              <button id="terminalSearchClose" title="Close find" aria-label="Close find">×</button>
             </div>
             <div id="terminal" aria-label="Terminal display"></div>
             <div id="bidiReader" class="bidi-reader" role="region" aria-label="Readable terminal output" aria-live="off">
@@ -76,6 +91,16 @@
                 <small>Default masked terminal output for mixed RTL/LTR lines</small>
               </div>
               <div id="bidiReaderLines" class="bidi-reader-lines" aria-label="Bidi-readable terminal mirror" tabindex="0"></div>
+            </div>
+            <div class="mobile-terminal-keys" aria-label="Terminal modifier keys">
+              <button data-terminal-key="Escape">Esc</button>
+              <button data-terminal-key="Tab">Tab</button>
+              <button data-terminal-data="ctrl-c">Ctrl+C</button>
+              <button data-terminal-data="ctrl-d">Ctrl+D</button>
+              <button data-terminal-key="ArrowLeft" aria-label="Left arrow">←</button>
+              <button data-terminal-key="ArrowDown" aria-label="Down arrow">↓</button>
+              <button data-terminal-key="ArrowUp" aria-label="Up arrow">↑</button>
+              <button data-terminal-key="ArrowRight" aria-label="Right arrow">→</button>
             </div>
           </section>
 
@@ -99,10 +124,53 @@
       </main>
     </div>
 
+    <dialog id="newSessionDialog" class="warpish-dialog" aria-labelledby="newSessionDialogTitle">
+      <form id="newSessionForm" method="dialog">
+        <header><h3 id="newSessionDialogTitle">New terminal</h3><p>Choose where and how this resumable session starts.</p></header>
+        <label>Title <input id="newSessionTitle" autocomplete="off" maxlength="80" placeholder="Automatic" /></label>
+        <label>Working directory <input id="newSessionCwd" autocomplete="off" spellcheck="false" placeholder="Home directory" /></label>
+        <label>Profile <input id="newSessionProfile" autocomplete="off" maxlength="40" pattern="[a-z0-9][a-z0-9._-]{0,39}" title="Start with a lowercase letter or number; then use letters, numbers, dot, underscore, or dash" value="default" required /></label>
+        <label class="checkbox-row"><input id="newSessionPrivate" type="checkbox" /> Private session — do not retain blocks or output history</label>
+        <p id="newSessionError" class="dialog-error" role="alert" hidden></p>
+        <div class="dialog-actions"><button type="button" data-dialog-cancel>Cancel</button><button id="createSessionConfirm" class="primary" type="submit">Create</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="settingsDialog" class="warpish-dialog" aria-labelledby="settingsDialogTitle">
+      <form id="settingsForm" method="dialog">
+        <header><h3 id="settingsDialogTitle">Terminal settings</h3><p>Saved only in this browser profile.</p></header>
+        <div class="settings-grid">
+          <label>Font size <input id="settingFontSize" type="number" min="10" max="24" step="0.5" /></label>
+          <label>Line height <input id="settingLineHeight" type="number" min="1" max="2" step="0.01" /></label>
+          <label>Scrollback lines <input id="settingScrollback" type="number" min="1000" max="200000" step="1000" /></label>
+          <label>Theme <select id="settingTheme"><option value="midnight">Midnight</option><option value="graphite">Graphite</option><option value="light">Light</option></select></label>
+          <label>Default working directory <input id="settingDefaultCwd" autocomplete="off" spellcheck="false" placeholder="Home directory" /></label>
+          <label>Default profile <input id="settingDefaultProfile" autocomplete="off" maxlength="40" pattern="[a-z0-9][a-z0-9._-]{0,39}" title="Start with a lowercase letter or number; then use letters, numbers, dot, underscore, or dash" required /></label>
+        </div>
+        <label class="checkbox-row"><input id="settingCursorBlink" type="checkbox" /> Blinking cursor</label>
+        <label class="checkbox-row"><input id="settingScreenReader" type="checkbox" /> Screen-reader mode</label>
+        <label class="checkbox-row"><input id="settingNotifications" type="checkbox" /> Notify on terminal bell while hidden</label>
+        <label class="checkbox-row"><input id="settingPrivateDefault" type="checkbox" /> New sessions are private by default</label>
+        <div class="dialog-actions"><button id="settingsReset" type="button">Reset</button><button type="button" data-dialog-cancel>Cancel</button><button id="settingsApply" class="primary" type="submit">Apply</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="pasteDialog" class="warpish-dialog paste-dialog" aria-labelledby="pasteDialogTitle">
+      <form method="dialog">
+        <header><h3 id="pasteDialogTitle">Multiline paste</h3><p>Choose whether line breaks should execute separate shell lines.</p></header>
+        <pre id="pastePreview" aria-label="Paste preview"></pre>
+        <div class="dialog-actions"><button value="cancel">Cancel</button><button value="single-line">Paste as one line</button><button class="danger" value="preserve">Preserve lines</button></div>
+      </form>
+    </dialog>
+
     <script src="/vendor/xterm.js"></script>
     <script src="/vendor/fit.js"></script>
     <script src="/vendor/web-links.js"></script>
+    <script src="/vendor/search.js"></script>
     <script src="/paste-safety.js"></script>
+    <script src="/terminal-key-data.js"></script>
+    <script src="/terminal-input.js"></script>
+    <script src="/terminal-preferences.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

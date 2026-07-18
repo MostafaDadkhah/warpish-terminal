@@ -9,6 +9,7 @@ Warp-like resumable sessions.
 
 import argparse
 import base64
+import binascii
 import fcntl
 import json
 import os
@@ -19,6 +20,9 @@ import struct
 import sys
 import termios
 import time
+
+
+DEFAULT_MAX_PENDING_INPUT_BYTES = 1024 * 1024
 
 
 def emit(message):
@@ -55,7 +59,9 @@ def main():
     parser.add_argument("--rows", type=int, default=36)
     parser.add_argument("--tmux-bin", default="tmux")
     parser.add_argument("--tmux-session")
+    parser.add_argument("--max-pending-input-bytes", type=int, default=DEFAULT_MAX_PENDING_INPUT_BYTES)
     args = parser.parse_args()
+    max_pending_input_bytes = max(1, min(args.max_pending_input_bytes, 64 * 1024 * 1024))
 
     env = dict(os.environ)
     env["TERM"] = os.environ.get("TERM", "xterm-256color")
@@ -83,7 +89,57 @@ def main():
     emit({"type": "ready", "pid": pid})
 
     stdin_fd = sys.stdin.fileno()
+    fcntl.fcntl(stdin_fd, fcntl.F_SETFL, fcntl.fcntl(stdin_fd, fcntl.F_GETFL) | os.O_NONBLOCK)
     pending_input = bytearray()
+    control_input = bytearray()
+    max_control_input_bytes = max(256 * 1024, min(max_pending_input_bytes * 2, 64 * 1024 * 1024))
+
+    def handle_control_line(line):
+        try:
+            message = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            emit({
+                "type": "error",
+                "code": "invalid-control-message",
+                "message": "PTY worker received an invalid control message.",
+            })
+            return
+        if not isinstance(message, dict):
+            return
+
+        msg_type = message.get("type")
+        if msg_type == "input":
+            try:
+                payload = base64.b64decode(message.get("data", ""), validate=True)
+            except (TypeError, ValueError, binascii.Error):
+                emit({
+                    "type": "error",
+                    "code": "invalid-input-base64",
+                    "message": "PTY worker input was not valid base64.",
+                })
+                return
+            if payload:
+                if len(payload) > max_pending_input_bytes - len(pending_input):
+                    emit({
+                        "type": "error",
+                        "code": "input-backpressure",
+                        "message": "PTY input queue is full; wait for the terminal to catch up and try again.",
+                        "pendingBytes": len(pending_input),
+                        "limitBytes": max_pending_input_bytes,
+                    })
+                    return
+                pending_input.extend(payload)
+        elif msg_type == "resize":
+            set_winsize(master_fd, message.get("cols", args.cols), message.get("rows", args.rows))
+            try:
+                os.kill(pid, signal.SIGWINCH)
+            except ProcessLookupError:
+                pass
+        elif msg_type == "kill":
+            try:
+                os.kill(pid, signal.SIGHUP)
+            except ProcessLookupError:
+                pass
 
     while True:
         exit_msg = child_exit_status(pid)
@@ -108,8 +164,13 @@ def main():
                     del pending_input[:written]
             except (BlockingIOError, InterruptedError):
                 pass
-            except OSError:
+            except OSError as error:
                 pending_input.clear()
+                emit({
+                    "type": "error",
+                    "code": "input-write-failed",
+                    "message": "PTY rejected queued input: {}".format(error),
+                })
 
         if master_fd in readable:
             try:
@@ -124,37 +185,40 @@ def main():
                 time.sleep(0.03)
 
         if stdin_fd in readable:
-            line = sys.stdin.buffer.readline()
-            if not line:
+            stdin_closed = False
+            while True:
+                try:
+                    chunk = os.read(stdin_fd, 65536)
+                except (BlockingIOError, InterruptedError):
+                    break
+                if not chunk:
+                    stdin_closed = True
+                    break
+                if len(control_input) + len(chunk) > max_control_input_bytes:
+                    control_input.clear()
+                    emit({
+                        "type": "error",
+                        "code": "control-input-backpressure",
+                        "message": "PTY worker control input exceeded its bounded buffer.",
+                    })
+                    continue
+                control_input.extend(chunk)
+
+            while True:
+                newline = control_input.find(b"\n")
+                if newline < 0:
+                    break
+                line = bytes(control_input[:newline]).rstrip(b"\r")
+                del control_input[:newline + 1]
+                if line:
+                    handle_control_line(line)
+
+            if stdin_closed:
                 try:
                     os.kill(pid, signal.SIGHUP)
                 except ProcessLookupError:
                     pass
                 return
-            try:
-                message = json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError:
-                continue
-
-            msg_type = message.get("type")
-            if msg_type == "input":
-                try:
-                    payload = base64.b64decode(message.get("data", ""), validate=True)
-                except (TypeError, ValueError):
-                    continue
-                if payload:
-                    pending_input.extend(payload)
-            elif msg_type == "resize":
-                set_winsize(master_fd, message.get("cols", args.cols), message.get("rows", args.rows))
-                try:
-                    os.kill(pid, signal.SIGWINCH)
-                except ProcessLookupError:
-                    pass
-            elif msg_type == "kill":
-                try:
-                    os.kill(pid, signal.SIGHUP)
-                except ProcessLookupError:
-                    pass
 
 
 if __name__ == "__main__":

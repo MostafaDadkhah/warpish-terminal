@@ -39,6 +39,16 @@ __warpish_database_event() {
 }
 
 __warpish_marker() {
+  if [[ "${WARPISH_PRIVATE_SESSION:-0}" == 1 ]]; then
+    case "$1" in
+      Start\;*|End\;*)
+        # Private sessions keep their live terminal behavior but never journal
+        # or emit command text/output markers. Cwd markers remain available so
+        # the UI can show the current directory without retaining scrollback.
+        return 0
+        ;;
+    esac
+  fi
   # The database journal preserves markers across server restarts. OSC keeps
   # the active browser responsive; the server de-duplicates replayed markers.
   __warpish_database_event "$1"
@@ -63,6 +73,10 @@ __warpish_precmd() {
     local ended="$(__warpish_now)"
     __warpish_marker "End;id=${__WARPISH_BLOCK_ID};ended=${ended};status=${exit_code}"
     unset __WARPISH_BLOCK_ID __WARPISH_BLOCK_STARTED
+  fi
+  if [[ "${__WARPISH_LAST_CWD:-}" != "$PWD" ]]; then
+    __WARPISH_LAST_CWD="$PWD"
+    __warpish_marker "Cwd;path=$(__warpish_b64 "$PWD")"
   fi
   return $exit_code
 }

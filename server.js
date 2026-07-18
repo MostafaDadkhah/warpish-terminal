@@ -34,6 +34,20 @@ const MAX_BLOCK_OUTPUT_CHARS = 24000;
 const MAX_CAPTURE_CHARS = 500_000;
 const BLOCK_OUTPUT_FLUSH_MS = 750;
 const MAX_WS_BUFFERED_BYTES = 4_000_000;
+const MAX_WS_PAYLOAD_BYTES = 512 * 1024;
+const MAX_TERMINAL_INPUT_BYTES = 64 * 1024;
+const MAX_CWD_MARKER_BYTES = 4096;
+const MAX_OSC_MARKER_CHARS = 64 * 1024;
+const MAX_BLOCK_COMMAND_BYTES = 32 * 1024;
+const MAX_BLOCK_ID_CHARS = 180;
+const MAX_WORKER_STDIN_BUFFER_BYTES = 1024 * 1024;
+const MAX_SESSION_TITLE_CHARS = 80;
+const MAX_SESSION_PROFILE_CHARS = 40;
+const SESSION_PROFILE_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,39})$/;
+const WS_HEARTBEAT_INTERVAL_MS = clampNumber(process.env.WARPISH_WS_HEARTBEAT_MS, 30_000, 1000, 120_000);
+const PTY_RUNTIME_IDLE_GRACE_MS = clampNumber(process.env.WARPISH_PTY_IDLE_GRACE_MS, 30_000, 100, 600_000);
+const TMUX_COMMAND_TIMEOUT_MS = clampNumber(process.env.WARPISH_TMUX_TIMEOUT_MS, 5000, 250, 60_000);
+const TMUX_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 const TOKEN_FILE = path.resolve(process.env.WARPISH_TOKEN_FILE || path.join(__dirname, '.auth-token'));
 const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'server.lock');
 const INSTANCE_LOCK_ID = crypto.randomUUID();
@@ -41,6 +55,7 @@ const INSTANCE_LOCK_ID = crypto.randomUUID();
 const activeBlockIds = new Map();
 const pendingBlockOutputs = new Map();
 const sessionRuntimes = new Map();
+const workerWriteStates = new WeakMap();
 let instanceLockOwned = false;
 let storage;
 
@@ -272,13 +287,83 @@ function writeMetadata(meta) {
 function runTmux(args, options = {}) {
   const env = { ...process.env };
   delete env.TMUX;
-  return execFileSync(TMUX, args, {
-    cwd: __dirname,
-    env,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...options,
-  });
+  const timeout = clampNumber(options.timeout, TMUX_COMMAND_TIMEOUT_MS, 250, 60_000);
+  try {
+    return execFileSync(TMUX, args, {
+      cwd: __dirname,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...options,
+      timeout,
+      maxBuffer: TMUX_MAX_BUFFER_BYTES,
+    });
+  } catch (error) {
+    const stderr = Buffer.isBuffer(error?.stderr) ? error.stderr.toString('utf8') : String(error?.stderr || '');
+    const detail = stderr.trim() || String(error?.message || error).trim();
+    const operation = String(args?.[0] || 'command');
+    const timedOut = error?.code === 'ETIMEDOUT' || (error?.signal && error?.status === null && /timed?\s*out/iu.test(detail));
+    const message = timedOut
+      ? `tmux ${operation} timed out after ${timeout}ms`
+      : `tmux ${operation} failed${error?.status !== undefined && error?.status !== null ? ` (exit ${error.status})` : ''}`;
+    const wrapped = new Error(detail && !timedOut ? `${message}: ${detail}` : message, { cause: error });
+    wrapped.code = timedOut ? 'ETIMEDOUT' : error?.code;
+    wrapped.status = error?.status;
+    wrapped.signal = error?.signal;
+    wrapped.stdout = error?.stdout;
+    wrapped.stderr = error?.stderr;
+    throw wrapped;
+  }
+}
+
+function tmuxSessionEnvironmentValue(sessionId, name) {
+  try {
+    const line = runTmux(['show-environment', '-t', sessionId, name]).trim();
+    const prefix = `${name}=`;
+    return line.startsWith(prefix) ? line.slice(prefix.length) : null;
+  } catch {
+    return null;
+  }
+}
+
+function tmuxPaneCurrentPath(sessionId) {
+  try {
+    const cwd = runTmux(['display-message', '-p', '-t', sessionId, '#{pane_current_path}']).trim();
+    if (!path.isAbsolute(cwd) || !fs.statSync(cwd).isDirectory()) return null;
+    return path.resolve(cwd);
+  } catch {
+    return null;
+  }
+}
+
+function tmuxPaneHistoryState(sessionId) {
+  try {
+    const panes = runTmux(['list-panes', '-s', '-t', sessionId, '-F', '#{pane_id}\t#{history_limit}\t#{history_size}'])
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [paneId, limit, size] = line.split('\t');
+        return { paneId, limit: Number(limit), size: Number(size) };
+      })
+      .filter((pane) => /^%\d+$/u.test(pane.paneId) && Number.isFinite(pane.limit) && Number.isFinite(pane.size));
+    return { ok: panes.length > 0, panes };
+  } catch {
+    return { ok: false, panes: [] };
+  }
+}
+
+function privateSessionHistorySafe(sessionId) {
+  const state = tmuxPaneHistoryState(sessionId);
+  return state.ok && state.panes.every((pane) => pane.limit === 0);
+}
+
+function clearPrivateSessionHistory(sessionId) {
+  const state = tmuxPaneHistoryState(sessionId);
+  for (const pane of state.panes) {
+    try { runTmux(['clear-history', '-t', pane.paneId]); } catch {}
+  }
+  return { ...state, safe: state.ok && state.panes.every((pane) => pane.limit === 0) };
 }
 
 function shellQuote(value) {
@@ -313,7 +398,7 @@ function ensureShellIntegration() {
   fs.writeFileSync(path.join(ZDOTDIR, '.zshrc'), zshrc);
 }
 
-function warpishShellCommand(sessionId) {
+function warpishShellCommand(sessionId, { privateSession = false, profile = 'default' } = {}) {
   ensureShellIntegration();
   return [
     '/usr/bin/env',
@@ -326,6 +411,8 @@ function warpishShellCommand(sessionId) {
     `WARPISH_EVENT_RECORDER=${shellQuote(SHELL_EVENT_RECORDER)}`,
     `WARPISH_PYTHON=${shellQuote(PYTHON)}`,
     'WARPISH_BLOCK_INTEGRATION=1',
+    `WARPISH_PRIVATE_SESSION=${privateSession ? '1' : '0'}`,
+    `WARPISH_SESSION_PROFILE=${shellQuote(profile)}`,
     `ZDOTDIR=${shellQuote(ZDOTDIR)}`,
     shellQuote(SHELL),
     '-l',
@@ -346,11 +433,21 @@ function epochToIso(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return new Date().toISOString();
   const millis = number > 10_000_000_000 ? number : number * 1000;
-  return new Date(millis).toISOString();
+  const date = new Date(millis);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : new Date().toISOString();
+}
+
+function validMarkerEpoch(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return false;
+  const millis = number > 10_000_000_000 ? number : number * 1000;
+  return Number.isFinite(new Date(millis).getTime());
 }
 
 function parseMarkerPayload(payload) {
-  const [event, ...parts] = String(payload).split(';');
+  const value = String(payload || '');
+  if (!value || value.length > MAX_OSC_MARKER_CHARS) return null;
+  const [event, ...parts] = value.split(';');
   const fields = { event };
   for (const part of parts) {
     const index = part.indexOf('=');
@@ -360,13 +457,50 @@ function parseMarkerPayload(payload) {
   return fields;
 }
 
-function decodeBase64(value) {
-  if (!value) return '';
+function decodeMarkerCommand(value) {
+  const decoded = decodeBase64Strict(value, MAX_BLOCK_COMMAND_BYTES);
+  if (!decoded.ok) return null;
   try {
-    return Buffer.from(value, 'base64').toString('utf8');
+    return new TextDecoder('utf-8', { fatal: true }).decode(decoded.bytes);
   } catch {
-    return '';
+    return null;
   }
+}
+
+function validBlockMarkerId(sessionId, value) {
+  return typeof value === 'string'
+    && value.length <= MAX_BLOCK_ID_CHARS
+    && value.startsWith(`${sessionId}-`)
+    && /^[a-z0-9-]+$/u.test(value);
+}
+
+function validateBlockMarker(sessionId, marker) {
+  if (!validBlockMarkerId(sessionId, marker?.id)) return false;
+  if (marker.event === 'Start') {
+    if (!validMarkerEpoch(marker.started)) return false;
+    const command = decodeMarkerCommand(marker.command);
+    if (!command) return false;
+    marker.decodedCommand = command;
+    return true;
+  }
+  if (marker.event === 'End') {
+    const status = Number(marker.status);
+    return validMarkerEpoch(marker.ended) && Number.isInteger(status) && status >= 0 && status <= 255;
+  }
+  return false;
+}
+
+function decodeBase64Strict(value, maxBytes) {
+  if (typeof value !== 'string') return { ok: false, code: 'invalid-base64' };
+  if (value.length > Math.ceil(maxBytes / 3) * 4) return { ok: false, code: 'input-too-large' };
+  if (value === '') return { ok: true, bytes: Buffer.alloc(0) };
+  if (value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    return { ok: false, code: 'invalid-base64' };
+  }
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length > maxBytes) return { ok: false, code: 'input-too-large' };
+  if (bytes.toString('base64') !== value) return { ok: false, code: 'invalid-base64' };
+  return { ok: true, bytes };
 }
 
 function ensureSessionRecord(meta, sessionId) {
@@ -377,10 +511,18 @@ function ensureSessionRecord(meta, sessionId) {
       title: sessionId.replace(PREFIX, 'Terminal '),
       cwd: os.homedir(),
       createdAt: new Date().toISOString(),
+      shell: SHELL,
+      profile: 'default',
+      private: false,
     };
   }
   if (!Array.isArray(meta.sessions[sessionId].blocks)) meta.sessions[sessionId].blocks = [];
   return meta.sessions[sessionId];
+}
+
+function sessionIsPrivate(sessionId, meta = null) {
+  const metadata = meta || readMetadata();
+  return Boolean(metadata.sessions?.[sessionId]?.private);
 }
 
 function normalizeBlock(block) {
@@ -397,6 +539,7 @@ function normalizeBlock(block) {
 }
 
 function getBlocks(sessionId) {
+  if (sessionIsPrivate(sessionId)) return [];
   reconcileDatabaseEvents(sessionId);
   if (!flushPendingBlockOutput(sessionId)) refreshActiveBlockOutput(sessionId);
   const meta = readMetadata();
@@ -405,11 +548,13 @@ function getBlocks(sessionId) {
 }
 
 function upsertBlockStart(sessionId, marker) {
-  const id = marker.id || `${sessionId}-${Date.now()}`;
+  const id = marker.id;
+  if (!validBlockMarkerId(sessionId, id)) return null;
   const pending = pendingBlockOutputs.get(sessionId);
   if (pending && pending.blockId !== id) flushPendingBlockOutput(sessionId);
   const meta = readMetadata();
   const record = ensureSessionRecord(meta, sessionId);
+  if (record.private) return null;
   let block = record.blocks.find((candidate) => candidate.id === id);
   if (block && block.status !== 'running' && block.endedAt) {
     activeBlockIds.delete(sessionId);
@@ -420,7 +565,7 @@ function upsertBlockStart(sessionId, marker) {
     block = { id, output: '' };
     record.blocks.push(block);
   }
-  block.command = decodeBase64(marker.command) || block.command || '';
+  block.command = marker.decodedCommand || block.command || '';
   block.startedAt = block.startedAt || epochToIso(marker.started);
   block.endedAt = null;
   block.durationMs = null;
@@ -436,6 +581,7 @@ function upsertBlockStart(sessionId, marker) {
 
 function appendBlockOutput(sessionId, text) {
   if (!text) return null;
+  if (sessionIsPrivate(sessionId)) return null;
   let blockId = activeBlockIds.get(sessionId);
   if (!blockId) {
     const meta = readMetadata();
@@ -469,8 +615,10 @@ function flushPendingBlockOutput(sessionId, expectedBlockId = null) {
 function finishBlock(sessionId, marker) {
   let meta = readMetadata();
   let record = meta.sessions?.[sessionId];
+  if (record?.private) return null;
   if (!record || !Array.isArray(record.blocks)) return null;
-  const id = marker.id || record.activeBlockId;
+  const id = marker.id;
+  if (!validBlockMarkerId(sessionId, id)) return null;
   let block = record.blocks.find((candidate) => candidate.id === id);
   if (!block) return null;
   if (block.status !== 'running' && block.endedAt) {
@@ -500,25 +648,68 @@ function finishBlock(sessionId, marker) {
   return normalizeBlock(block);
 }
 
+function updateSessionCwd(sessionId, encodedPath) {
+  if (!isValidSessionId(sessionId)) return null;
+  const decoded = decodeBase64Strict(encodedPath, MAX_CWD_MARKER_BYTES);
+  if (!decoded.ok || decoded.bytes.length === 0 || decoded.bytes.includes(0)) return null;
+
+  let nextCwd;
+  try {
+    nextCwd = new TextDecoder('utf-8', { fatal: true }).decode(decoded.bytes);
+  } catch {
+    return null;
+  }
+  if (!path.isAbsolute(nextCwd)) return null;
+  nextCwd = path.resolve(nextCwd);
+  try {
+    if (!fs.statSync(nextCwd).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+
+  const meta = readMetadata();
+  const record = meta.sessions?.[sessionId];
+  if (!record) return null;
+  if (record.cwd !== nextCwd) {
+    record.cwd = nextCwd;
+    writeMetadata(meta);
+  }
+  const runtime = sessionRuntimes.get(sessionId);
+  if (runtime && !runtime.closed) runtime.cwd = nextCwd;
+  return { type: 'session-meta', sessionId, cwd: nextCwd };
+}
+
 function handleBlockMarker(sessionId, payload) {
   const marker = parseMarkerPayload(payload);
+  if (!marker) return null;
+  if ((marker.event === 'Start' || marker.event === 'End') && !validateBlockMarker(sessionId, marker)) return null;
+  if ((marker.event === 'Start' || marker.event === 'End') && sessionIsPrivate(sessionId)) return null;
   if (marker.event === 'Start') return { type: 'block-start', block: upsertBlockStart(sessionId, marker) };
   if (marker.event === 'End') {
     const block = finishBlock(sessionId, marker);
     return { type: 'block-end', block };
   }
+  if (marker.event === 'Cwd') return updateSessionCwd(sessionId, marker.path);
   return null;
 }
 
 function reconcileDatabaseEvents(sessionId, onBlockEvent = () => {}) {
+  const privateSession = sessionIsPrivate(sessionId);
   const processedIds = [];
   for (const row of storage.pendingEvents(sessionId)) {
     const event = handleBlockMarker(sessionId, row.payload.trim());
-    if (event?.block) onBlockEvent(event);
+    if (event) onBlockEvent(event);
     processedIds.push(row.id);
   }
-  storage.markEventsProcessed(processedIds);
-  if (processedIds.length) storage.pruneProcessedEvents(sessionId, 1000);
+  if (privateSession) {
+    // A private session's shell integration normally suppresses command events.
+    // Delete any rows produced during an upgrade/race instead of retaining even
+    // processed copies of private command lines in SQLite.
+    storage.deleteShellEvents(sessionId);
+  } else {
+    storage.markEventsProcessed(processedIds);
+    if (processedIds.length) storage.pruneProcessedEvents(sessionId, 1000);
+  }
 }
 
 function createEventReader(sessionId, onBlockEvent) {
@@ -610,6 +801,7 @@ function replaceBlockOutputFromPane(sessionId, blockId, {
 } = {}) {
   const before = readMetadata();
   const beforeRecord = before.sessions?.[sessionId];
+  if (beforeRecord?.private) return null;
   const beforeBlock = beforeRecord?.blocks?.find((candidate) => candidate.id === blockId);
   if (!beforeBlock) return null;
   if (requireActive && beforeRecord.activeBlockId !== blockId) return null;
@@ -643,6 +835,7 @@ function replaceBlockOutputFromPane(sessionId, blockId, {
 
 function refreshActiveBlockOutput(sessionId) {
   const meta = readMetadata();
+  if (meta.sessions?.[sessionId]?.private) return null;
   const blockId = meta.sessions?.[sessionId]?.activeBlockId;
   if (!blockId) return null;
   return replaceBlockOutputFromPane(sessionId, blockId, { requireActive: true });
@@ -694,6 +887,14 @@ function createOutputProcessor(sessionId, { onTerminalData, onBlockEvent, should
       const end = buffer.indexOf('\x07', start + markerPrefix.length);
       if (end === -1) {
         buffer = buffer.slice(start);
+        if (buffer.length > MAX_OSC_MARKER_CHARS) {
+          // A terminal program can print the marker prefix without a terminator.
+          // Drop only the private prefix and resume normal output instead of
+          // retaining an unbounded buffer and blanking the client forever.
+          const malformedPayload = buffer.slice(markerPrefix.length);
+          buffer = '';
+          forward(malformedPayload);
+        }
         return;
       }
 
@@ -701,7 +902,7 @@ function createOutputProcessor(sessionId, { onTerminalData, onBlockEvent, should
       buffer = buffer.slice(end + 1);
       if (buffer.startsWith('\x1b\\')) buffer = buffer.slice(2);
       const event = handleBlockMarker(sessionId, payload);
-      if (event?.block) onBlockEvent(event);
+      if (event) onBlockEvent(event);
     }
   }
 
@@ -751,6 +952,7 @@ function listActiveTmuxSessions() {
 }
 
 function capturePreview(id, lines = 28) {
+  if (sessionIsPrivate(id)) return '';
   try {
     const text = runTmux(['capture-pane', '-p', '-t', id, '-S', `-${lines}`]);
     return text
@@ -912,19 +1114,47 @@ function summarizeSessions() {
   const meta = readMetadata();
   const activeResult = listActiveTmuxSessions();
   const active = activeResult.sessions;
+  const privateHistorySafety = new Map();
   let changed = false;
 
   for (const [id, tmuxInfo] of activeResult.ok ? active.entries() : []) {
+    const privateEnvironment = tmuxSessionEnvironmentValue(id, 'WARPISH_PRIVATE_SESSION');
+    const profileEnvironment = tmuxSessionEnvironmentValue(id, 'WARPISH_SESSION_PROFILE');
     if (!meta.sessions[id]) {
+      // Unknown sessions may be remnants of a private create interrupted before
+      // SQLite commit. Default to private unless tmux explicitly says otherwise,
+      // so recovery never captures content merely because metadata is missing.
+      const adoptedPrivate = privateEnvironment !== '0';
       meta.sessions[id] = {
         id,
         title: id.replace(PREFIX, 'Terminal '),
-        cwd: os.homedir(),
+        cwd: tmuxPaneCurrentPath(id) || os.homedir(),
         createdAt: new Date(tmuxInfo.createdAt || Date.now()).toISOString(),
+        shell: SHELL,
+        profile: SESSION_PROFILE_PATTERN.test(profileEnvironment || '') ? profileEnvironment : 'default',
+        private: adoptedPrivate,
       };
       changed = true;
     }
-    const preview = capturePreview(id);
+    const record = meta.sessions[id];
+    if (privateEnvironment === '1' && !record.private) {
+      record.private = true;
+      changed = true;
+    }
+    if (SESSION_PROFILE_PATTERN.test(profileEnvironment || '') && record.profile !== profileEnvironment) {
+      record.profile = profileEnvironment;
+      changed = true;
+    }
+    if (record.private && (record.lastPreview || record.activeBlockId || record.blocks?.length)) {
+      delete record.lastPreview;
+      delete record.lastPreviewAt;
+      delete record.activeBlockId;
+      record.blocks = [];
+      storage.deleteShellEvents(id);
+      changed = true;
+    }
+    if (record.private) privateHistorySafety.set(id, clearPrivateSessionHistory(id).safe);
+    const preview = record.private ? '' : capturePreview(id);
     if (preview && meta.sessions[id].lastPreview !== preview) {
       meta.sessions[id].lastPreview = preview;
       meta.sessions[id].lastPreviewAt = new Date().toISOString();
@@ -956,7 +1186,13 @@ function summarizeSessions() {
         alive: Boolean(tmuxInfo),
         attached: tmuxInfo?.attached || 0,
         windows: tmuxInfo?.windows || 0,
-        preview: tmuxInfo ? (capturePreview(record.id) || record.lastPreview || '') : (record.lastPreview || ''),
+        shell: record.shell || SHELL,
+        profile: record.profile || 'default',
+        private: Boolean(record.private),
+        privacyQuarantined: Boolean(tmuxInfo && record.private && privateHistorySafety.get(record.id) !== true),
+        preview: record.private
+          ? ''
+          : (tmuxInfo ? (capturePreview(record.id) || record.lastPreview || '') : (record.lastPreview || '')),
       };
     })
     .sort((a, b) => {
@@ -965,25 +1201,91 @@ function summarizeSessions() {
     });
 }
 
-function createSession({ title, cwd } = {}) {
+function requestError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
+function validateSessionTitle(value, { allowEmpty = true } = {}) {
+  if (value !== undefined && value !== null && typeof value !== 'string') {
+    throw requestError('title must be a string');
+  }
+  const title = String(value || '').trim();
+  if (!allowEmpty && !title) throw requestError('title must not be empty');
+  if (title.length > MAX_SESSION_TITLE_CHARS) {
+    throw requestError(`title must be ${MAX_SESSION_TITLE_CHARS} characters or fewer`);
+  }
+  if (/[\u0000-\u001f\u007f]/u.test(title)) {
+    throw requestError('title must not contain control characters');
+  }
+  return title;
+}
+
+function validateNewSessionInput(input = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw requestError('request body must be a JSON object');
+  }
+
+  const title = validateSessionTitle(input.title);
+
+  let requestedCwd = input.cwd;
+  if (requestedCwd !== undefined && requestedCwd !== null && typeof requestedCwd !== 'string') {
+    throw requestError('cwd must be a string');
+  }
+  requestedCwd = String(requestedCwd || '').trim();
+  if (requestedCwd.includes('\u0000')) throw requestError('cwd must not contain NUL bytes');
+  if (!requestedCwd) requestedCwd = os.homedir();
+  if (requestedCwd === '~') requestedCwd = os.homedir();
+  else if (requestedCwd.startsWith('~/')) requestedCwd = path.join(os.homedir(), requestedCwd.slice(2));
+  if (!path.isAbsolute(requestedCwd)) {
+    throw requestError('cwd must be an absolute directory path or start with ~/');
+  }
+  const cwd = path.resolve(requestedCwd);
+  try {
+    if (!fs.statSync(cwd).isDirectory()) throw requestError('cwd must reference an existing directory');
+    fs.accessSync(cwd, fs.constants.X_OK);
+  } catch (error) {
+    if (error?.statusCode) throw error;
+    throw requestError('cwd must reference an existing accessible directory');
+  }
+
+  let profile = input.profile;
+  if (profile !== undefined && profile !== null && typeof profile !== 'string') {
+    throw requestError('profile must be a string');
+  }
+  profile = String(profile || 'default').trim();
+  if (profile.length > MAX_SESSION_PROFILE_CHARS || !SESSION_PROFILE_PATTERN.test(profile)) {
+    throw requestError(`profile must be a lowercase identifier of ${MAX_SESSION_PROFILE_CHARS} characters or fewer using letters, numbers, dot, underscore, or dash`);
+  }
+
+  if (input.private !== undefined && typeof input.private !== 'boolean') {
+    throw requestError('private must be a boolean');
+  }
+
+  return { title, cwd, profile, privateSession: Boolean(input.private) };
+}
+
+function createSession(input = {}) {
+  const { title, cwd, profile, privateSession } = validateNewSessionInput(input);
   const meta = readMetadata();
   const now = new Date();
   const index = meta.nextIndex || Object.keys(meta.sessions).length + 1;
   const id = `${PREFIX}${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
-  const resolvedCwd = path.resolve(cwd || os.homedir());
-  let safeCwd = os.homedir();
-  try {
-    if (fs.statSync(resolvedCwd).isDirectory()) safeCwd = resolvedCwd;
-  } catch {}
-  const sessionTitle = String(title || `Terminal ${index}`).trim().slice(0, 80) || `Terminal ${index}`;
+  const safeCwd = cwd;
+  const sessionTitle = title || `Terminal ${index}`;
   let tmuxCreated = false;
   let metadataWritten = false;
 
   try {
-    runTmux(['new-session', '-d', '-s', id, '-c', safeCwd, warpishShellCommand(id)]);
+    const bootstrapWindow = 'warpish-bootstrap';
+    // tmux copies history-limit into each pane only when that pane is created.
+    // Create a content-free bootstrap first, configure the session, then launch
+    // the real shell in a new pane so 0/50000 is effective rather than cosmetic.
+    runTmux(['new-session', '-d', '-s', id, '-n', bootstrapWindow, '-c', safeCwd, '/bin/sleep 60']);
     tmuxCreated = true;
     runTmux(['set-option', '-t', id, 'status', 'off']);
-    runTmux(['set-option', '-t', id, 'history-limit', '50000']);
+    runTmux(['set-option', '-t', id, 'history-limit', privateSession ? '0' : '50000']);
     runTmux(['set-option', '-t', id, 'allow-rename', 'off']);
     runTmux(['set-option', '-t', id, 'allow-passthrough', 'on']);
     runTmux(['set-option', '-t', id, 'focus-events', 'on']);
@@ -995,7 +1297,21 @@ function createSession({ title, cwd } = {}) {
     runTmux(['set-environment', '-t', id, 'WARPISH_EVENT_RECORDER', SHELL_EVENT_RECORDER]);
     runTmux(['set-environment', '-t', id, 'WARPISH_PYTHON', PYTHON]);
     runTmux(['set-environment', '-t', id, 'WARPISH_BLOCK_INTEGRATION', '1']);
+    runTmux(['set-environment', '-t', id, 'WARPISH_PRIVATE_SESSION', privateSession ? '1' : '0']);
+    runTmux(['set-environment', '-t', id, 'WARPISH_SESSION_PROFILE', profile]);
     runTmux(['set-environment', '-t', id, 'ZDOTDIR', ZDOTDIR]);
+    runTmux([
+      'new-window',
+      '-d',
+      '-t', `${id}:`,
+      '-n', 'terminal',
+      '-c', safeCwd,
+      warpishShellCommand(id, { privateSession, profile }),
+    ]);
+    runTmux(['kill-window', '-t', `${id}:${bootstrapWindow}`]);
+    if (privateSession && !clearPrivateSessionHistory(id).safe) {
+      throw new Error('private tmux pane was not created with an effective zero history limit');
+    }
 
     meta.nextIndex = index + 1;
     meta.sessions[id] = {
@@ -1004,11 +1320,14 @@ function createSession({ title, cwd } = {}) {
       cwd: safeCwd,
       createdAt: now.toISOString(),
       lastOpenedAt: now.toISOString(),
+      shell: SHELL,
+      profile,
+      private: privateSession,
       blocks: [],
     };
     writeMetadata(meta);
     metadataWritten = true;
-    ensureSessionRuntime({ id, cwd: safeCwd }, { cols: 120, rows: 36 });
+    ensureSessionRuntime({ id, cwd: safeCwd, private: privateSession }, { cols: 120, rows: 36 });
     return summarizeSessions().find((session) => session.id === id);
   } catch (error) {
     const runtime = sessionRuntimes.get(id);
@@ -1037,7 +1356,7 @@ function touchSession(id) {
 function renameSession(id, title) {
   const meta = readMetadata();
   if (!meta.sessions[id]) return null;
-  meta.sessions[id].title = String(title || '').trim().slice(0, 80) || meta.sessions[id].title;
+  meta.sessions[id].title = validateSessionTitle(title, { allowEmpty: false });
   writeMetadata(meta);
   return summarizeSessions().find((session) => session.id === id) || null;
 }
@@ -1050,10 +1369,11 @@ function clearSessionTransientState(id) {
 }
 
 function killSession(id) {
-  flushPendingBlockOutput(id);
   const meta = readMetadata();
+  const privateSession = Boolean(meta.sessions?.[id]?.private);
+  if (!privateSession) flushPendingBlockOutput(id);
   let preview = '';
-  if (meta.sessions[id]) {
+  if (meta.sessions[id] && !privateSession) {
     preview = capturePreview(id);
   }
   try {
@@ -1066,7 +1386,15 @@ function killSession(id) {
     }
   }
   if (meta.sessions[id]) {
-    if (preview) meta.sessions[id].lastPreview = preview;
+    if (privateSession) {
+      delete meta.sessions[id].lastPreview;
+      delete meta.sessions[id].lastPreviewAt;
+      delete meta.sessions[id].activeBlockId;
+      meta.sessions[id].blocks = [];
+      storage.deleteShellEvents(id);
+    } else if (preview) {
+      meta.sessions[id].lastPreview = preview;
+    }
     meta.sessions[id].stoppedAt = new Date().toISOString();
     writeMetadata(meta);
   }
@@ -1108,14 +1436,238 @@ function purgeStoppedSessions() {
   return purged;
 }
 
-function writeWorker(worker, message) {
-  if (!worker?.stdin || worker.stdin.destroyed || !worker.stdin.writable) return false;
-  try {
-    worker.stdin.write(`${JSON.stringify(message)}\n`);
-    return true;
-  } catch {
-    return false;
+function requireSessionRecord(id) {
+  const record = readMetadata().sessions?.[id];
+  if (!record) throw requestError('session not found', 404);
+  return record;
+}
+
+function requireLiveSession(id) {
+  const record = requireSessionRecord(id);
+  const activeResult = listActiveTmuxSessions();
+  if (!activeResult.ok) {
+    throw requestError('tmux session state is temporarily unavailable', 503);
   }
+  if (!activeResult.sessions.has(id)) {
+    throw requestError('session is stopped; pane operations require a live session', 409);
+  }
+  return record;
+}
+
+function paneCount(id) {
+  const value = Number.parseInt(runTmux(['display-message', '-p', '-t', id, '#{window_panes}']).trim(), 10);
+  return Number.isFinite(value) ? value : null;
+}
+
+function splitSessionPane(id, direction) {
+  const record = requireLiveSession(id);
+  if (record.private && !privateSessionHistorySafe(id)) {
+    throw requestError('private session is quarantined because an existing pane has nonzero tmux history capacity', 409);
+  }
+  if (direction !== 'vertical' && direction !== 'horizontal') {
+    throw requestError('direction must be either vertical or horizontal');
+  }
+  try {
+    const splitFlag = direction === 'vertical' ? '-h' : '-v';
+    const paneId = runTmux([
+      'split-window',
+      splitFlag,
+      '-P',
+      '-F',
+      '#{pane_id}',
+      '-t',
+      id,
+      '-c',
+      '#{pane_current_path}',
+      warpishShellCommand(id, {
+        privateSession: Boolean(record.private),
+        profile: record.profile || 'default',
+      }),
+    ]).trim();
+    if (record.private) clearPrivateSessionHistory(id);
+    return { paneId, panes: paneCount(id), direction };
+  } catch (error) {
+    error.statusCode = error.statusCode || 503;
+    throw error;
+  }
+}
+
+function selectNextSessionPane(id) {
+  const record = requireLiveSession(id);
+  if (record.private && !privateSessionHistorySafe(id)) {
+    throw requestError('private session is quarantined because an existing pane has nonzero tmux history capacity', 409);
+  }
+  try {
+    runTmux(['select-pane', '-t', `${id}:.+`]);
+    const paneId = runTmux(['display-message', '-p', '-t', id, '#{pane_id}']).trim();
+    return { paneId, panes: paneCount(id) };
+  } catch (error) {
+    error.statusCode = error.statusCode || 503;
+    throw error;
+  }
+}
+
+function exportFilename(record) {
+  const stem = String(record.title || record.id || 'terminal')
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || 'terminal';
+  const date = new Date().toISOString().slice(0, 10);
+  return `${stem}-${date}.txt`;
+}
+
+function sessionExport(id) {
+  const record = requireSessionRecord(id);
+  const privateSession = Boolean(record.private);
+  const activeResult = listActiveTmuxSessions();
+  const alive = activeResult.ok && activeResult.sessions.has(id);
+  const blocks = privateSession ? [] : getBlocks(id).slice().reverse();
+  let capture = '';
+
+  if (alive) {
+    if (!privateSession) {
+      const selected = choosePaneCapture(capturePaneState(id, { lines: 5000 }));
+      capture = selected.text;
+    }
+  } else if (!privateSession) {
+    capture = record.lastPreview || '';
+  }
+
+  const lines = [
+    `Warpish Terminal export`,
+    `Title: ${record.title || record.id}`,
+    `Session: ${record.id}`,
+    `Created: ${record.createdAt || 'unknown'}`,
+    `State: ${alive ? 'live' : 'stopped'}`,
+    `Working directory: ${record.cwd || os.homedir()}`,
+    `Shell: ${record.shell || SHELL}`,
+    `Profile: ${record.profile || 'default'}`,
+    `Private: ${privateSession ? 'yes' : 'no'}`,
+    `Exported: ${new Date().toISOString()}`,
+    '',
+  ];
+
+  if (privateSession) {
+    lines.push('Private session: command blocks, previews, scrollback, and terminal capture were not retained or exported.');
+    lines.push('');
+  }
+
+  if (blocks.length) {
+    lines.push('Command blocks', '==============', '');
+    blocks.forEach((block, index) => {
+      lines.push(
+        `[${index + 1}] ${block.command || '(empty command)'}`,
+        `Status: ${block.status || 'unknown'}${block.exitCode === null ? '' : ` (exit ${block.exitCode})`}`,
+        `Started: ${block.startedAt || 'unknown'}`,
+        `Ended: ${block.endedAt || 'unknown'}`,
+      );
+      if (block.output) lines.push('', stripAnsi(block.output));
+      lines.push('', '---', '');
+    });
+  }
+
+  if (capture) {
+    lines.push(privateSession ? 'Current pane' : 'Terminal capture', '================', '', stripAnsi(limitText(capture)), '');
+  } else {
+    lines.push(privateSession ? 'No private terminal content is available.' : 'No terminal capture is available.', '');
+  }
+
+  return { filename: exportFilename(record), text: lines.join('\n').trimEnd() + '\n' };
+}
+
+function workerWriteState(worker) {
+  let state = workerWriteStates.get(worker);
+  if (state) return state;
+  state = {
+    queue: [],
+    queuedBytes: 0,
+    waitingForDrain: false,
+    closed: false,
+  };
+  workerWriteStates.set(worker, state);
+  worker.stdin.once('close', () => {
+    state.closed = true;
+    state.queue = [];
+    state.queuedBytes = 0;
+  });
+  return state;
+}
+
+function flushWorkerWriteQueue(worker, state) {
+  if (state.closed || state.waitingForDrain || !worker?.stdin?.writable || worker.stdin.destroyed) return;
+  while (state.queue.length) {
+    const payload = state.queue.shift();
+    state.queuedBytes -= payload.length;
+    let accepted;
+    try {
+      accepted = worker.stdin.write(payload);
+    } catch (error) {
+      state.closed = true;
+      state.queue = [];
+      state.queuedBytes = 0;
+      try { worker.stdin.destroy(error); } catch {}
+      return;
+    }
+    if (!accepted) {
+      state.waitingForDrain = true;
+      worker.stdin.once('drain', () => {
+        state.waitingForDrain = false;
+        flushWorkerWriteQueue(worker, state);
+      });
+      return;
+    }
+  }
+}
+
+function queueWorkerMessage(worker, message) {
+  if (!worker?.stdin || worker.stdin.destroyed || !worker.stdin.writable) {
+    return { ok: false, code: 'pty-input-unavailable', message: 'PTY input is unavailable; reconnect to resume.' };
+  }
+  let payload;
+  try {
+    payload = Buffer.from(`${JSON.stringify(message)}\n`, 'utf8');
+  } catch {
+    return { ok: false, code: 'pty-input-invalid', message: 'PTY input could not be encoded.' };
+  }
+
+  const state = workerWriteState(worker);
+  const bufferedBytes = state.queuedBytes + (worker.stdin.writableLength || 0);
+  if (state.closed) {
+    return { ok: false, code: 'pty-input-unavailable', message: 'PTY input is unavailable; reconnect to resume.' };
+  }
+  if (bufferedBytes + payload.length > MAX_WORKER_STDIN_BUFFER_BYTES) {
+    return {
+      ok: false,
+      code: 'pty-input-backpressure',
+      message: 'PTY input queue is full; wait for the terminal to catch up and try again.',
+    };
+  }
+
+  if (state.waitingForDrain || state.queue.length) {
+    state.queue.push(payload);
+    state.queuedBytes += payload.length;
+    return { ok: true };
+  }
+
+  try {
+    if (!worker.stdin.write(payload)) {
+      state.waitingForDrain = true;
+      worker.stdin.once('drain', () => {
+        state.waitingForDrain = false;
+        flushWorkerWriteQueue(worker, state);
+      });
+    }
+    return { ok: true };
+  } catch (error) {
+    state.closed = true;
+    try { worker.stdin.destroy(error); } catch {}
+    return { ok: false, code: 'pty-input-unavailable', message: 'PTY input is unavailable; reconnect to resume.' };
+  }
+}
+
+function writeWorker(worker, message) {
+  return queueWorkerMessage(worker, message).ok;
 }
 
 function stripTerminalFocusReports(data) {
@@ -1206,13 +1758,15 @@ function writeTmuxInput(sessionId, data) {
   return true;
 }
 
-function createPtyWorker({ sessionId, cwd, cols, rows }) {
+function createPtyWorker({ sessionId, cwd, cols, rows, privateSession = false, profile = 'default' }) {
   const workerPath = path.join(__dirname, 'scripts/pty-worker.py');
   const env = {
     ...process.env,
     TERM: 'xterm-256color',
     COLORTERM: 'truecolor',
     WARPISH_TERMINAL: '1',
+    WARPISH_PRIVATE_SESSION: privateSession ? '1' : '0',
+    WARPISH_SESSION_PROFILE: profile,
   };
   delete env.TMUX;
   delete env.TMUX_PANE;
@@ -1225,6 +1779,7 @@ function createPtyWorker({ sessionId, cwd, cols, rows }) {
     '--rows', String(rows),
     '--tmux-bin', TMUX,
     '--tmux-session', sessionId,
+    '--max-pending-input-bytes', String(MAX_WORKER_STDIN_BUFFER_BYTES),
   ], {
     cwd: __dirname,
     env,
@@ -1318,19 +1873,71 @@ app.post('/api/sessions', (req, res) => {
     const session = createSession(req.body || {});
     res.status(201).json({ session, sessions: summarizeSessions() });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
   }
 });
 
 app.get('/api/sessions/:id/blocks', (req, res) => {
   const { id } = req.params;
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
+  if (!readMetadata().sessions?.[id]) return res.status(404).json({ error: 'session not found' });
   res.json({ blocks: getBlocks(id) });
+});
+
+app.get('/api/sessions/:id/export', (req, res) => {
+  const { id } = req.params;
+  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
+  try {
+    res.json(sessionExport(id));
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
+  }
+});
+
+app.post('/api/sessions/:id/panes', (req, res) => {
+  const { id } = req.params;
+  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
+  try {
+    const pane = splitSessionPane(id, req.body?.direction);
+    res.status(201).json({ ok: true, pane, sessions: summarizeSessions() });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
+  }
+});
+
+app.post('/api/sessions/:id/panes/next', (req, res) => {
+  const { id } = req.params;
+  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
+  try {
+    const pane = selectNextSessionPane(id);
+    res.json({ ok: true, pane, sessions: summarizeSessions() });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
+  }
 });
 
 app.get('/api/sessions/:id/capture', (req, res) => {
   const { id } = req.params;
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
+  const record = readMetadata().sessions?.[id];
+  if (!record) return res.status(404).json({ error: 'session not found' });
+  if (record.private) {
+    const alternateActive = paneAlternateScreenActive(id);
+    return res.json({
+      text: '',
+      normal: '',
+      alternate: '',
+      active: '',
+      savedPrimary: '',
+      history: '',
+      usingAlternate: alternateActive,
+      alternateActive,
+      captureReason: alternateActive ? 'alternate-active' : 'private-session',
+      ansi: req.query.ansi === '1' || req.query.escape === '1',
+      private: true,
+      warning: 'Private sessions do not expose terminal capture or scrollback.',
+    });
+  }
   const lines = clampNumber(req.query.lines, 600, 20, 5000);
   const escape = req.query.ansi === '1' || req.query.escape === '1';
   const capture = capturePaneState(id, { lines, escape });
@@ -1354,9 +1961,13 @@ app.get('/api/sessions/:id/capture', (req, res) => {
 app.patch('/api/sessions/:id', (req, res) => {
   const { id } = req.params;
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  const session = renameSession(id, req.body?.title);
-  if (!session) return res.status(404).json({ error: 'session not found' });
-  res.json({ session, sessions: summarizeSessions() });
+  try {
+    const session = renameSession(id, req.body?.title);
+    if (!session) return res.status(404).json({ error: 'session not found' });
+    res.json({ session, sessions: summarizeSessions() });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
+  }
 });
 
 app.delete('/api/sessions/:id', (req, res) => {
@@ -1376,6 +1987,7 @@ const vendor = {
   '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js',
   '/vendor/fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js',
   '/vendor/web-links.js': 'node_modules/@xterm/addon-web-links/lib/addon-web-links.js',
+  '/vendor/search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js',
 };
 
 for (const [route, relPath] of Object.entries(vendor)) {
@@ -1384,7 +1996,7 @@ for (const [route, relPath] of Object.entries(vendor)) {
 app.use(express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
 
 function sendWsControl(ws, message) {
   if (ws.readyState !== ws.OPEN) return false;
@@ -1394,6 +2006,20 @@ function sendWsControl(ws, message) {
   } catch {
     return false;
   }
+}
+
+function sendWsInputError(ws, code, message) {
+  return sendWsControl(ws, { type: 'server-error', code, message });
+}
+
+function writeRuntimeInput(runtime, ws, bytes) {
+  if (!bytes?.length) return true;
+  const result = queueWorkerMessage(runtime.worker, {
+    type: 'input',
+    data: Buffer.from(bytes).toString('base64'),
+  });
+  if (!result.ok) sendWsInputError(ws, result.code, result.message);
+  return result.ok;
 }
 
 function broadcastRuntimeControl(runtime, message) {
@@ -1466,6 +2092,7 @@ function promoteRuntimeController(runtime) {
 }
 
 function addRuntimeSubscriber(runtime, ws, dimensions) {
+  clearRuntimeTimer(runtime, 'idleTeardownTimer');
   runtime.subscribers.add(ws);
   runtime.clientDimensions.set(ws, dimensions);
   if (!runtimeSocketIsOpen(runtime.controller) || !runtime.subscribers.has(runtime.controller)) {
@@ -1483,6 +2110,7 @@ function removeRuntimeSubscriber(runtime, ws) {
     runtime.controller = null;
     promoteRuntimeController(runtime);
   }
+  if (runtime.subscribers.size === 0) scheduleRuntimeIdleTeardown(runtime);
   return true;
 }
 
@@ -1505,10 +2133,25 @@ function clearRuntimeTimer(runtime, name) {
   runtime[name] = null;
 }
 
+function scheduleRuntimeIdleTeardown(runtime) {
+  if (!runtime || runtime.closed || runtime.stopping || runtime.subscribers.size !== 0 || runtime.idleTeardownTimer) return;
+  runtime.idleTeardownTimer = setTimeout(() => {
+    runtime.idleTeardownTimer = null;
+    if (runtime.closed || runtime.stopping || runtime.subscribers.size !== 0) return;
+    if (sessionRuntimes.get(runtime.sessionId) !== runtime) return;
+    terminateSessionRuntime(runtime);
+  }, PTY_RUNTIME_IDLE_GRACE_MS);
+  runtime.idleTeardownTimer.unref?.();
+}
+
 function terminateSessionRuntime(runtime) {
   if (!runtime || runtime.closed || runtime.stopping) return;
   runtime.stopping = true;
+  clearRuntimeTimer(runtime, 'idleTeardownTimer');
   writeWorker(runtime.worker, { type: 'kill' });
+  if (Number.isInteger(runtime.workerPid) && runtime.workerPid > 0) {
+    try { process.kill(runtime.workerPid, 'SIGHUP'); } catch {}
+  }
   runtime.forceKillTimer = setTimeout(() => {
     if (runtime.worker.exitCode === null && runtime.worker.signalCode === null) {
       try { runtime.worker.kill('SIGTERM'); } catch {}
@@ -1518,6 +2161,7 @@ function terminateSessionRuntime(runtime) {
 }
 
 function closeRuntimeSubscribers(runtime, message) {
+  clearRuntimeTimer(runtime, 'idleTeardownTimer');
   const subscribers = [...runtime.subscribers];
   runtime.controller = null;
   runtime.subscribers.clear();
@@ -1530,27 +2174,46 @@ function closeRuntimeSubscribers(runtime, message) {
 
 function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   reconcileDatabaseEvents(session.id);
+  const persistedRecord = readMetadata().sessions?.[session.id];
+  const persistedCwd = persistedRecord?.cwd || session.cwd || os.homedir();
+  const privateSession = Boolean(persistedRecord?.private || session.private);
+  const profile = persistedRecord?.profile || session.profile || 'default';
+  let privateHistoryState = null;
   try {
-    // Existing tmux sessions may predate the create-time option below. Keep
-    // attach idempotent so raw-mode TUIs can receive browser focus events too.
+    // These options affect future panes. An existing private pane is accepted
+    // below only if its own immutable history capacity is already zero.
     runTmux(['set-option', '-t', session.id, 'focus-events', 'on']);
+    runTmux(['set-option', '-t', session.id, 'history-limit', privateSession ? '0' : '50000']);
     // This cannot rewrite the environment of an already-running shell, but it
     // makes respawned panes and future windows in older sessions color-capable.
     runTmux(['set-environment', '-u', '-t', session.id, 'NO_COLOR']);
     runTmux(['set-environment', '-t', session.id, 'COLORTERM', 'truecolor']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_TERMINAL', '1']);
+    runTmux(['set-environment', '-t', session.id, 'WARPISH_PRIVATE_SESSION', privateSession ? '1' : '0']);
+    runTmux(['set-environment', '-t', session.id, 'WARPISH_SESSION_PROFILE', profile]);
+    if (privateSession) privateHistoryState = clearPrivateSessionHistory(session.id);
   } catch (error) {
+    if (privateSession) {
+      throw requestError(`private session is quarantined because tmux privacy checks failed: ${error.message || error}`, 409);
+    }
     console.warn(`Could not refresh tmux capabilities for ${session.id}: ${error.message || error}`);
+  }
+  if (privateSession && !privateHistoryState?.safe) {
+    throw requestError('private session is quarantined because an existing pane has a nonzero tmux history capacity', 409);
   }
   const worker = createPtyWorker({
     sessionId: session.id,
-    cwd: session.cwd || os.homedir(),
+    cwd: persistedCwd,
+    privateSession,
+    profile,
     cols,
     rows,
   });
   const runtime = {
     sessionId: session.id,
-    cwd: session.cwd || os.homedir(),
+    cwd: persistedCwd,
+    private: privateSession,
+    profile,
     worker,
     workerPid: null,
     subscribers: new Set(),
@@ -1559,6 +2222,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     stdoutBuffer: '',
     stderrBuffer: '',
     forceKillTimer: null,
+    idleTeardownTimer: null,
     stopping: false,
     closed: false,
     lastExitMessage: null,
@@ -1567,7 +2231,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
 
   runtime.outputProcessor = createOutputProcessor(session.id, {
     shouldRecordOutput() {
-      return sessionRuntimes.get(runtime.sessionId) === runtime;
+      return !runtime.private && sessionRuntimes.get(runtime.sessionId) === runtime;
     },
     onTerminalData(bytes) {
       broadcastRuntimeData(runtime, bytes);
@@ -1616,6 +2280,11 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
       } else if (message.type === 'exit') {
         runtime.lastExitMessage = { type: 'detached', exitCode: message.exitCode, signal: message.signal };
         broadcastRuntimeControl(runtime, runtime.lastExitMessage);
+      } else if (message.type === 'error') {
+        const code = typeof message.code === 'string' ? message.code.slice(0, 80) : 'pty-worker-error';
+        const detail = typeof message.message === 'string' ? message.message.slice(0, 500) : 'PTY worker rejected input.';
+        runtime.stderrBuffer = `${runtime.stderrBuffer}\n${code}: ${detail}`.slice(-4096);
+        broadcastRuntimeControl(runtime, { type: 'server-error', code, message: detail });
       }
     }
   });
@@ -1632,6 +2301,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   worker.on('close', (code, signal) => {
     runtime.closed = true;
     clearRuntimeTimer(runtime, 'forceKillTimer');
+    clearRuntimeTimer(runtime, 'idleTeardownTimer');
     runtime.eventReader.poll();
     runtime.outputProcessor.flush();
     if (sessionRuntimes.get(runtime.sessionId) === runtime) sessionRuntimes.delete(runtime.sessionId);
@@ -1644,6 +2314,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     closeRuntimeSubscribers(runtime, detached);
   });
 
+  scheduleRuntimeIdleTeardown(runtime);
   return runtime;
 }
 
@@ -1693,6 +2364,12 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws, req) => {
+  ws.warpishAlive = true;
+  ws.on('pong', () => { ws.warpishAlive = true; });
+  ws.on('error', (error) => {
+    console.warn(`WebSocket client error: ${error?.message || error}`);
+  });
+
   let url;
   try {
     url = new URL(req.url || '/', 'http://localhost');
@@ -1714,11 +2391,33 @@ wss.on('connection', (ws, req) => {
     ws.close();
     return;
   }
+  if (session.privacyQuarantined) {
+    sendWsControl(ws, {
+      type: 'server-error',
+      code: 'private-history-quarantined',
+      message: 'Private session is quarantined because an existing tmux pane has nonzero history capacity. Kill it or continue it directly in tmux; Warpish will not attach or capture it.',
+    });
+    ws.close();
+    return;
+  }
 
   touchSession(sessionId);
   const cols = clampNumber(url.searchParams.get('cols'), 120, 20, 300);
   const rows = clampNumber(url.searchParams.get('rows'), 36, 5, 120);
-  const { runtime, created } = ensureSessionRuntime(session, { cols, rows });
+  let runtime;
+  let created;
+  try {
+    ({ runtime, created } = ensureSessionRuntime(session, { cols, rows }));
+  } catch (error) {
+    const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    const message = error?.message || 'Terminal runtime could not be attached.';
+    const code = statusCode === 409 && message.startsWith('private session is quarantined')
+      ? 'private-history-quarantined'
+      : 'runtime-attach-failed';
+    sendWsControl(ws, { type: 'server-error', code, statusCode, message });
+    try { ws.close(statusCode >= 500 ? 1011 : 1008, code); } catch {}
+    return;
+  }
   addRuntimeSubscriber(runtime, ws, { cols, rows });
   if (runtime.workerPid) {
     sendWsControl(ws, {
@@ -1732,23 +2431,39 @@ wss.on('connection', (ws, req) => {
   if (!created) sendRuntimeSnapshot(ws, sessionId);
 
   ws.on('message', (raw, isBinary) => {
-    if (isBinary) return;
+    if (isBinary) {
+      sendWsInputError(ws, 'unsupported-binary-frame', 'Send binary terminal input as JSON type=input-binary with base64 data.');
+      return;
+    }
+    const rawText = String(raw);
     let msg;
     try {
-      msg = JSON.parse(String(raw));
+      msg = JSON.parse(rawText);
     } catch {
       if (runtime.controller !== ws) {
         sendRuntimeRole(runtime, ws);
         return;
       }
+      if (Buffer.byteLength(rawText, 'utf8') > MAX_TERMINAL_INPUT_BYTES) {
+        sendWsInputError(ws, 'input-too-large', `Terminal input exceeds the ${MAX_TERMINAL_INPUT_BYTES}-byte limit.`);
+        return;
+      }
       const rawInputData = stripTerminalFocusReports(String(raw));
-      if (rawInputData) writeWorker(runtime.worker, { type: 'input', data: Buffer.from(rawInputData, 'utf8').toString('base64') });
+      if (rawInputData) writeRuntimeInput(runtime, ws, Buffer.from(rawInputData, 'utf8'));
       return;
     }
 
-    if (msg.type === 'input' && typeof msg.data === 'string') {
+    if (msg?.type === 'input') {
       if (runtime.controller !== ws) {
         sendRuntimeRole(runtime, ws);
+        return;
+      }
+      if (typeof msg.data !== 'string') {
+        sendWsInputError(ws, 'invalid-input', 'Terminal input data must be a string.');
+        return;
+      }
+      if (Buffer.byteLength(msg.data, 'utf8') > MAX_TERMINAL_INPUT_BYTES) {
+        sendWsInputError(ws, 'input-too-large', `Terminal input exceeds the ${MAX_TERMINAL_INPUT_BYTES}-byte limit.`);
         return;
       }
       const inputData = msg.allowFocusReports ? msg.data : stripTerminalFocusReports(msg.data);
@@ -1760,9 +2475,23 @@ wss.on('connection', (ws, req) => {
           sendWsControl(ws, { type: 'server-error', message: `tmux input failed: ${error.message || error}` });
         }
       } else {
-        writeWorker(runtime.worker, { type: 'input', data: Buffer.from(inputData, 'utf8').toString('base64') });
+        writeRuntimeInput(runtime, ws, Buffer.from(inputData, 'utf8'));
       }
-    } else if (msg.type === 'resize') {
+    } else if (msg?.type === 'input-binary') {
+      if (runtime.controller !== ws) {
+        sendRuntimeRole(runtime, ws);
+        return;
+      }
+      const decoded = decodeBase64Strict(msg.data, MAX_TERMINAL_INPUT_BYTES);
+      if (!decoded.ok) {
+        const message = decoded.code === 'input-too-large'
+          ? `Binary terminal input exceeds the ${MAX_TERMINAL_INPUT_BYTES}-byte limit.`
+          : 'Binary terminal input must contain canonical base64 data.';
+        sendWsInputError(ws, decoded.code, message);
+        return;
+      }
+      writeRuntimeInput(runtime, ws, decoded.bytes);
+    } else if (msg?.type === 'resize') {
       const dimensions = {
         cols: clampNumber(msg.cols, 120, 20, 300),
         rows: clampNumber(msg.rows, 36, 5, 120),
@@ -1771,7 +2500,7 @@ wss.on('connection', (ws, req) => {
       if (runtime.controller === ws) {
         resizeRuntime(runtime, dimensions);
       }
-    } else if (msg.type === 'take-control') {
+    } else if (msg?.type === 'take-control') {
       const currentDimensions = runtime.clientDimensions.get(ws) || { cols: 120, rows: 36 };
       const dimensions = {
         cols: clampNumber(msg.cols, currentDimensions.cols, 20, 300),
@@ -1779,7 +2508,7 @@ wss.on('connection', (ws, req) => {
       };
       runtime.clientDimensions.set(ws, dimensions);
       setRuntimeController(runtime, ws);
-    } else if (msg.type === 'detach') {
+    } else if (msg?.type === 'detach') {
       removeRuntimeSubscriber(runtime, ws);
       ws.close(1000, 'detached');
     }
@@ -1790,10 +2519,24 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+const wsHeartbeatTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.readyState !== ws.OPEN) continue;
+    if (ws.warpishAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.warpishAlive = false;
+    try { ws.ping(); } catch { ws.terminate(); }
+  }
+}, WS_HEARTBEAT_INTERVAL_MS);
+wsHeartbeatTimer.unref?.();
+
 let shuttingDown = false;
 function shutdownServer(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(wsHeartbeatTimer);
   for (const ws of wss.clients) {
     try { ws.close(1001, 'server shutting down'); } catch {}
   }

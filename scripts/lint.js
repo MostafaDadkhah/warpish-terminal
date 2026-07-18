@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const projectRoot = new URL('..', import.meta.url).pathname;
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 const failures = [];
 
 function read(relPath) {
@@ -15,6 +16,8 @@ function fail(message) {
 const appJs = read('public/app.js');
 const indexHtml = read('public/index.html');
 const pasteSafetyJs = read('public/paste-safety.js');
+const terminalKeyDataJs = read('public/terminal-key-data.js');
+const terminalPreferencesJs = read('public/terminal-preferences.js');
 const serverJs = read('server.js');
 const storageJs = read('storage.js');
 const shellIntegration = read('scripts/warpish-shell-integration.zsh');
@@ -84,6 +87,28 @@ if (/\bspawnSync\b/.test(uiAgentJs)) {
 
 if (packageJson.scripts?.regression !== 'node scripts/ui-stability-agent.js') {
   fail('package.json regression must run the browser suite once through the UI stability validator.');
+}
+
+const appScriptIndex = indexHtml.indexOf('<script src="/app.js"></script>');
+for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-preferences.js']) {
+  const scriptIndex = indexHtml.indexOf(`<script src="${clientScript}"></script>`);
+  if (scriptIndex < 0 || appScriptIndex < 0 || scriptIndex > appScriptIndex) {
+    fail(`${clientScript} must be loaded before /app.js.`);
+  }
+}
+
+if (!terminalKeyDataJs.includes('WarpishTerminalKeys')
+  || !terminalKeyDataJs.includes('terminalKeyData')
+  || !terminalPreferencesJs.includes('WarpishTerminalPreferences')
+  || !terminalPreferencesJs.includes('normalize')) {
+  fail('Terminal key mapping and preferences modules must expose their stable browser APIs.');
+}
+
+if (!packageJson.dependencies?.['@xterm/addon-search']
+  || !indexHtml.includes('<script src="/vendor/search.js"></script>')
+  || !serverJs.includes('/vendor/search.js')
+  || !serverJs.includes('@xterm/addon-search/lib/addon-search.js')) {
+  fail('The xterm search addon must be installed, served locally, and loaded by the terminal UI.');
 }
 
 if (!/function\s+prepareTerminalPasteText\s*\(/.test(appJs)

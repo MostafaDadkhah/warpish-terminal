@@ -1,6 +1,7 @@
 import '../public/paste-safety.js';
 
 const prepare = globalThis.WarpishPasteSafety?.prepareTerminalPasteText;
+const formatPreview = globalThis.WarpishPasteSafety?.formatMultilinePastePreview;
 
 function assert(condition, message, details = undefined) {
   if (condition) return;
@@ -9,6 +10,7 @@ function assert(condition, message, details = undefined) {
 }
 
 assert(typeof prepare === 'function', 'paste safety policy was not registered');
+assert(typeof formatPreview === 'function', 'paste preview formatter was not registered');
 
 const persian = 'این  متن می‌خواهد فاصله‌های  دقیق را حفظ کند\r\nخط دوم شامل ۱۲۳ است\r\n';
 const plain = prepare(persian, { bracketedPasteMode: false });
@@ -19,6 +21,18 @@ assert(
 );
 assert(!/[\r\n]/u.test(plain.text), 'plain terminal paste retained a submit byte', plain);
 assert(plain.internalLineBreaks === 1 && plain.removedTrailingLineBreak, 'plain paste diagnostics are incorrect', plain);
+assert(plain.requiresChoice && plain.multilineMode === 'single-line', 'plain multiline paste did not request an explicit choice', plain);
+
+const explicitlyPreserved = prepare(persian, { bracketedPasteMode: false, multilineMode: 'preserve' });
+assert(
+  explicitlyPreserved.text === 'این  متن می‌خواهد فاصله‌های  دقیق را حفظ کند\nخط دوم شامل ۱۲۳ است',
+  'explicit preserve-lines paste changed multiline content',
+  explicitlyPreserved,
+);
+assert(explicitlyPreserved.multilineMode === 'preserve', 'preserve-lines mode was not reported', explicitlyPreserved);
+
+const cancelled = prepare(persian, { bracketedPasteMode: false, multilineMode: 'cancel' });
+assert(cancelled.text === '' && cancelled.multilineMode === 'cancel', 'cancelled paste still returned terminal input', cancelled);
 
 const bracketed = prepare(persian, { bracketedPasteMode: true });
 assert(
@@ -48,5 +62,11 @@ assert(c1Escape.text === 'safe201~\nsecond line', 'C1 CSI can still inject termi
 
 const unbracketedTab = prepare('printf\tvalue\n', { bracketedPasteMode: false });
 assert(unbracketedTab.text === 'printf    value', 'unbracketed Tab can still trigger terminal completion', unbracketedTab);
+
+const longPreviewSource = `FIRST_DANGEROUS_COMMAND\n${'middle\n'.repeat(1000)}LAST_DANGEROUS_COMMAND`;
+const longPreview = formatPreview(longPreviewSource, 400);
+assert(longPreview.includes('FIRST_DANGEROUS_COMMAND'), 'truncated preview hid the beginning of the paste', longPreview);
+assert(longPreview.includes('LAST_DANGEROUS_COMMAND'), 'truncated preview hid the end of the paste', longPreview);
+assert(longPreview.includes('PREVIEW TRUNCATED') && longPreview.includes('lines'), 'truncated preview omitted its risk warning/counts', longPreview);
 
 console.log('paste-safety: multiline, Unicode, spacing, and explicit-submit guards passed');

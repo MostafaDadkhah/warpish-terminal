@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { migrateLegacyStorage, openStorage } from '../storage.js';
 
@@ -23,6 +24,8 @@ fs.writeFileSync(metadataFile, JSON.stringify({
       id: sessionId,
       title: 'Migrated session',
       cwd: '/tmp',
+      shell: '/bin/zsh',
+      profile: 'development',
       createdAt: '2026-01-01T00:00:00.000Z',
       activeBlockId: `${sessionId}-running`,
       eventFile: path.join(eventsDir, `${sessionId}.events`),
@@ -68,13 +71,16 @@ try {
   const migratedSession = migrated.sessions[sessionId];
   assert(migrated.nextIndex === 8, 'next session index was not migrated');
   assert(migratedSession?.blocks.length === 2, 'session block rows were not reconstructed');
+  assert(migratedSession.shell === '/bin/zsh', 'session shell did not survive migration');
+  assert(migratedSession.profile === 'development', 'session profile did not survive migration');
+  assert(migratedSession.private === false, 'legacy session unexpectedly became private');
   assert(migratedSession.blocks[1].exitCode === null, 'nullable exit code changed during SQLite round trip');
   assert(migratedSession.blocks[1].durationMs === null, 'nullable duration changed during SQLite round trip');
   assert(storage.pendingEvents(sessionId).length === 1, 'legacy shell event is not pending in SQLite');
 
   const recordedPayload = `Start;id=${sessionId}-python;started=1767225605;command=cHJpbnRmIHB5dGhvbg==`;
   execFileSync('/usr/bin/python3', [
-    path.join(new URL('..', import.meta.url).pathname, 'scripts/record-shell-event.py'),
+    path.join(fileURLToPath(new URL('..', import.meta.url)), 'scripts/record-shell-event.py'),
     '--database', databaseFile,
     '--session-id', sessionId,
     '--payload', recordedPayload,
@@ -82,6 +88,17 @@ try {
   assert(storage.pendingEvents(sessionId).some((row) => row.payload === recordedPayload), 'Python shell-event recorder did not write to SQLite');
 
   storage.writeMetadata(migrated);
+  migratedSession.private = true;
+  migratedSession.blocks.push({
+    id: `${sessionId}-private`,
+    command: 'printf secret',
+    output: 'secret',
+    status: 'success',
+  });
+  storage.writeMetadata(migrated);
+  const privateRoundTrip = storage.readMetadata().sessions[sessionId];
+  assert(privateRoundTrip.private === true, 'private session flag did not round trip');
+  assert(privateRoundTrip.blocks.length === 0, 'private session persisted command blocks');
   assert(storage.check(), 'SQLite quick_check failed');
   console.log('storage: SQLite round trip, legacy migration, and shell-event recorder passed');
 } finally {

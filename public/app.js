@@ -15,6 +15,20 @@ const blocksToggleButton = document.getElementById('blocksToggle');
 const copySelection = document.getElementById('copySelection');
 const bidiToggleButton = document.getElementById('bidiToggle');
 const mouseModeToggleButton = document.getElementById('mouseModeToggle');
+const tuiModeToggleButton = document.getElementById('tuiModeToggle');
+const tuiModeStatus = document.getElementById('tuiModeStatus');
+const terminalSearchToggleButton = document.getElementById('terminalSearchToggle');
+const terminalSearchPanel = document.getElementById('terminalSearchPanel');
+const terminalSearchInput = document.getElementById('terminalSearchInput');
+const terminalSearchCount = document.getElementById('terminalSearchCount');
+const terminalSearchPrevious = document.getElementById('terminalSearchPrevious');
+const terminalSearchNext = document.getElementById('terminalSearchNext');
+const terminalSearchClose = document.getElementById('terminalSearchClose');
+const settingsToggleButton = document.getElementById('settingsToggle');
+const exportSessionButton = document.getElementById('exportSession');
+const splitVerticalButton = document.getElementById('splitVertical');
+const splitHorizontalButton = document.getElementById('splitHorizontal');
+const nextPaneButton = document.getElementById('nextPane');
 const bidiReader = document.getElementById('bidiReader');
 const bidiReaderLines = document.getElementById('bidiReaderLines');
 const detachSessionButton = document.getElementById('detachSession');
@@ -23,13 +37,34 @@ const blockList = document.getElementById('blockList');
 const blockSearch = document.getElementById('blockSearch');
 const blocksCount = document.getElementById('blocksCount');
 const refreshBlocksButton = document.getElementById('refreshBlocks');
+const newSessionDialog = document.getElementById('newSessionDialog');
+const newSessionForm = document.getElementById('newSessionForm');
+const newSessionTitleInput = document.getElementById('newSessionTitle');
+const newSessionCwdInput = document.getElementById('newSessionCwd');
+const newSessionProfileInput = document.getElementById('newSessionProfile');
+const newSessionPrivateInput = document.getElementById('newSessionPrivate');
+const newSessionError = document.getElementById('newSessionError');
+const settingsDialog = document.getElementById('settingsDialog');
+const settingsForm = document.getElementById('settingsForm');
+const settingsResetButton = document.getElementById('settingsReset');
+const pasteDialog = document.getElementById('pasteDialog');
+const pastePreview = document.getElementById('pastePreview');
+const mobileTerminalKeys = document.querySelector('.mobile-terminal-keys');
 
 const TerminalCtor = window.Terminal;
 const FitAddonCtor = window.FitAddon?.FitAddon;
 const WebLinksAddonCtor = window.WebLinksAddon?.WebLinksAddon;
+const SearchAddonCtor = window.SearchAddon?.SearchAddon;
+const terminalInputApi = window.WarpishTerminalInput;
+const terminalPreferencesApi = window.WarpishTerminalPreferences;
+let terminalPreferences = terminalPreferencesApi?.load?.() || {
+  fontSize: 13.5, lineHeight: 1.16, scrollback: 50000, theme: 'midnight',
+  cursorBlink: true, screenReaderMode: false, notifications: false,
+  defaultCwd: '', defaultProfile: 'default', privateByDefault: false,
+};
 const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
-const TERMINAL_THEME = Object.freeze({
+const FALLBACK_TERMINAL_THEME = Object.freeze({
   background: '#070711',
   foreground: '#f4f1ff',
   cursor: '#22d3ee',
@@ -39,25 +74,30 @@ const TERMINAL_THEME = Object.freeze({
   brightBlack: '#6b7280', brightRed: '#fda4af', brightGreen: '#86efac', brightYellow: '#fde68a',
   brightBlue: '#93c5fd', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#ffffff',
 });
+const TERMINAL_THEME = terminalPreferencesApi?.THEMES?.[terminalPreferences.theme] || FALLBACK_TERMINAL_THEME;
 
 const term = new TerminalCtor({
-  cursorBlink: !prefersReducedMotion,
+  cursorBlink: terminalPreferences.cursorBlink && !prefersReducedMotion,
   cursorStyle: 'bar',
   macOptionIsMeta: true,
   convertEol: false,
   fontFamily: '"SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
-  fontSize: 13.5,
-  lineHeight: 1.16,
+  fontSize: terminalPreferences.fontSize,
+  lineHeight: terminalPreferences.lineHeight,
   letterSpacing: 0,
-  scrollback: 50000,
+  scrollback: terminalPreferences.scrollback,
+  screenReaderMode: terminalPreferences.screenReaderMode,
   allowTransparency: true,
   theme: TERMINAL_THEME,
 });
 
 const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
+const searchAddon = SearchAddonCtor ? new SearchAddonCtor() : null;
 if (fitAddon) term.loadAddon(fitAddon);
 if (WebLinksAddonCtor) term.loadAddon(new WebLinksAddonCtor());
+if (searchAddon) term.loadAddon(searchAddon);
 term.open(terminalEl);
+document.body.dataset.terminalTheme = terminalPreferences.theme;
 const terminalHelperTextarea = () => terminalEl?.querySelector?.('.xterm-helper-textarea') || null;
 const helperTextarea = terminalHelperTextarea();
 if (helperTextarea) {
@@ -87,12 +127,17 @@ let sessionsRefreshPending = false;
 let sessionsRefreshQueued = null;
 let sessionsMutationDepth = 0;
 let pendingTerminalInputs = [];
+let terminalInputFlushTimer = null;
+const busyControls = new WeakSet();
 const intentionallyClosedSockets = new WeakSet();
 let refreshTimer = null;
 let blockFilter = '';
 let blocksOpen = localStorage.getItem('warpish_blocks_open') === 'on';
 let bidiReaderEnabled = localStorage.getItem('warpish_readable_terminal_v1') !== 'off';
 let readerMouseMode = localStorage.getItem('warpish_reader_mouse_mode_v1') === 'raw' ? 'raw' : 'reader';
+let tuiAutoEnabled = localStorage.getItem('warpish_tui_auto_mode_v1') !== 'off';
+let detectedTuiActive = false;
+let detectedTuiCaptureReason = '';
 let bidiReaderUpdatePending = false;
 
 const RTL_CHAR_RE = /[\u0590-\u08ff\ufb1d-\ufdff\ufe70-\ufefc]/u;
@@ -110,7 +155,7 @@ const TERMINAL_FOCUS_REPORT_SUPPRESS_MS = 1200;
 const XTERM_COLOR_MODE_PALETTE = 0x1000000;
 const XTERM_COLOR_MODE_P256 = 0x2000000;
 const XTERM_COLOR_MODE_RGB = 0x3000000;
-const ANSI_PALETTE = [
+let ANSI_PALETTE = [
   TERMINAL_THEME.black, TERMINAL_THEME.red, TERMINAL_THEME.green, TERMINAL_THEME.yellow,
   TERMINAL_THEME.blue, TERMINAL_THEME.magenta, TERMINAL_THEME.cyan, TERMINAL_THEME.white,
   TERMINAL_THEME.brightBlack, TERMINAL_THEME.brightRed, TERMINAL_THEME.brightGreen, TERMINAL_THEME.brightYellow,
@@ -119,7 +164,9 @@ const ANSI_PALETTE = [
 const BLOCK_RENDER_LIMIT = 60;
 const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
 const SESSION_PREVIEW_CHARS = 900;
-const MAX_PENDING_TERMINAL_INPUT_CHARS = 100000;
+const MAX_TERMINAL_INPUT_MESSAGE_BYTES = terminalInputApi?.MAX_MESSAGE_BYTES || 64 * 1024;
+const MAX_PENDING_TERMINAL_INPUT_BYTES = terminalInputApi?.MAX_PENDING_BYTES || 1024 * 1024;
+const MAX_BROWSER_SOCKET_BUFFERED_BYTES = 256 * 1024;
 let blockRenderPending = false;
 let bidiReaderUpdateTimer = null;
 let lastBidiReaderRenderAt = 0;
@@ -148,11 +195,189 @@ let terminalFocusFollowupTimers = [];
 let terminalFitRaf = null;
 let lastSentTerminalSize = '';
 let suppressTerminalFocusReportsUntil = 0;
+let terminalSearchQuery = '';
+let readableSearchMatches = [];
+let readableSearchIndex = -1;
+let terminalSearchUsesNativeSurface = false;
+let activeTerminalTitle = '';
+let pendingMultilinePaste = null;
 
 function compactText(text = '', maxChars = BLOCK_OUTPUT_PREVIEW_CHARS) {
   const value = String(text || '');
   if (value.length <= maxChars) return value;
   return `… truncated ${value.length - maxChars} chars …\n${value.slice(-maxChars)}`;
+}
+
+function applyTerminalPreferences(nextPreferences = terminalPreferences) {
+  terminalPreferences = terminalPreferencesApi?.normalize?.(nextPreferences) || nextPreferences;
+  const theme = terminalPreferencesApi?.THEMES?.[terminalPreferences.theme] || FALLBACK_TERMINAL_THEME;
+  term.options.fontSize = terminalPreferences.fontSize;
+  term.options.lineHeight = terminalPreferences.lineHeight;
+  term.options.scrollback = terminalPreferences.scrollback;
+  term.options.cursorBlink = terminalPreferences.cursorBlink && !prefersReducedMotion;
+  term.options.screenReaderMode = terminalPreferences.screenReaderMode;
+  term.options.theme = theme;
+  terminalCard?.style.setProperty('--reader-bg', theme.background);
+  terminalCard?.style.setProperty('--reader-fg', theme.foreground);
+  terminalCard?.style.setProperty('--reader-border', theme.cursor);
+  terminalCard?.style.setProperty('--reader-link', theme.cyan);
+  terminalCard?.style.setProperty('--reader-cursor', theme.cursor);
+  terminalCard?.style.setProperty('--reader-ghost', theme.brightBlack);
+  ANSI_PALETTE = [
+    theme.black, theme.red, theme.green, theme.yellow,
+    theme.blue, theme.magenta, theme.cyan, theme.white,
+    theme.brightBlack, theme.brightRed, theme.brightGreen, theme.brightYellow,
+    theme.brightBlue, theme.brightMagenta, theme.brightCyan, theme.brightWhite,
+  ];
+  document.body.dataset.terminalTheme = terminalPreferences.theme;
+  lastBidiReaderRenderKey = '';
+  refitTerminal();
+  scheduleBidiReaderUpdate({ immediate: true });
+}
+
+function populateSettingsForm(preferences = terminalPreferences) {
+  const fields = {
+    settingFontSize: preferences.fontSize,
+    settingLineHeight: preferences.lineHeight,
+    settingScrollback: preferences.scrollback,
+    settingTheme: preferences.theme,
+    settingDefaultCwd: preferences.defaultCwd,
+    settingDefaultProfile: preferences.defaultProfile,
+  };
+  for (const [id, value] of Object.entries(fields)) {
+    const element = document.getElementById(id);
+    if (element) element.value = value;
+  }
+  const checks = {
+    settingCursorBlink: preferences.cursorBlink,
+    settingScreenReader: preferences.screenReaderMode,
+    settingNotifications: preferences.notifications,
+    settingPrivateDefault: preferences.privateByDefault,
+  };
+  for (const [id, checked] of Object.entries(checks)) {
+    const element = document.getElementById(id);
+    if (element) element.checked = Boolean(checked);
+  }
+}
+
+function settingsFromForm() {
+  return {
+    fontSize: document.getElementById('settingFontSize')?.value,
+    lineHeight: document.getElementById('settingLineHeight')?.value,
+    scrollback: document.getElementById('settingScrollback')?.value,
+    theme: document.getElementById('settingTheme')?.value,
+    defaultCwd: document.getElementById('settingDefaultCwd')?.value,
+    defaultProfile: document.getElementById('settingDefaultProfile')?.value,
+    cursorBlink: document.getElementById('settingCursorBlink')?.checked,
+    screenReaderMode: document.getElementById('settingScreenReader')?.checked,
+    notifications: document.getElementById('settingNotifications')?.checked,
+    privateByDefault: document.getElementById('settingPrivateDefault')?.checked,
+  };
+}
+
+function openSettingsDialog() {
+  populateSettingsForm();
+  settingsDialog?.showModal?.();
+}
+
+function clearReadableSearchMatches() {
+  for (const line of readableSearchMatches) line.classList.remove('search-match');
+  readableSearchMatches = [];
+  readableSearchIndex = -1;
+}
+
+function setTerminalSearchNativeSurface(enabled) {
+  terminalSearchUsesNativeSurface = Boolean(enabled);
+  document.body.classList.toggle('terminal-search-native', terminalSearchUsesNativeSurface);
+}
+
+function updateTerminalSearchCount(found, total = null) {
+  if (!terminalSearchCount) return;
+  if (Number.isInteger(total)) {
+    terminalSearchCount.textContent = total ? `${Math.max(0, readableSearchIndex + 1)}/${total}` : '0 matches';
+  } else {
+    terminalSearchCount.textContent = found ? 'match' : '0 matches';
+  }
+}
+
+function updateReadableSearchMatches({ keepIndex = false } = {}) {
+  if (terminalSearchUsesNativeSurface) return false;
+  const priorIndex = readableSearchIndex;
+  clearReadableSearchMatches();
+  const query = terminalSearchQuery.trim().toLocaleLowerCase();
+  if (!query || !isReadableSurfaceActive() || !bidiReaderLines) {
+    updateTerminalSearchCount(false, 0);
+    return false;
+  }
+  readableSearchMatches = [...bidiReaderLines.querySelectorAll('.bidi-line')]
+    .filter((line) => String(line.dataset.logicalText || line.textContent || '').toLocaleLowerCase().includes(query));
+  if (!readableSearchMatches.length) {
+    updateTerminalSearchCount(false, 0);
+    return false;
+  }
+  readableSearchIndex = keepIndex ? Math.min(Math.max(priorIndex, 0), readableSearchMatches.length - 1) : 0;
+  const active = readableSearchMatches[readableSearchIndex];
+  active.classList.add('search-match');
+  active.scrollIntoView({ block: 'center' });
+  updateTerminalSearchCount(true, readableSearchMatches.length);
+  return true;
+}
+
+function runTerminalSearch(direction = 'next', { incremental = false } = {}) {
+  terminalSearchQuery = terminalSearchInput?.value || '';
+  if (!terminalSearchQuery) {
+    searchAddon?.clearDecorations?.();
+    clearReadableSearchMatches();
+    setTerminalSearchNativeSurface(false);
+    updateTerminalSearchCount(false, 0);
+    return false;
+  }
+  if (isReadableSurfaceActive()) {
+    if (!readableSearchMatches.length || incremental) {
+      if (updateReadableSearchMatches()) {
+        searchAddon?.clearDecorations?.();
+        setTerminalSearchNativeSurface(false);
+        return true;
+      }
+    } else {
+      readableSearchMatches[readableSearchIndex]?.classList.remove('search-match');
+      const delta = direction === 'previous' ? -1 : 1;
+      readableSearchIndex = (readableSearchIndex + delta + readableSearchMatches.length) % readableSearchMatches.length;
+      const active = readableSearchMatches[readableSearchIndex];
+      active.classList.add('search-match');
+      active.scrollIntoView({ block: 'center' });
+      updateTerminalSearchCount(true, readableSearchMatches.length);
+      return true;
+    }
+    // A pane switch can make the readable mirror narrower than xterm's local
+    // scrollback. Fall through to SearchAddon so earlier visible output remains
+    // discoverable instead of reporting a false zero-match result.
+  }
+  const options = { incremental, caseSensitive: false, wholeWord: false, regex: false };
+  const found = direction === 'previous'
+    ? searchAddon?.findPrevious?.(terminalSearchQuery, options)
+    : searchAddon?.findNext?.(terminalSearchQuery, options);
+  setTerminalSearchNativeSurface(Boolean(found) && isReadableSurfaceActive());
+  updateTerminalSearchCount(Boolean(found));
+  return Boolean(found);
+}
+
+function setTerminalSearchOpen(open) {
+  if (!terminalSearchPanel) return;
+  terminalSearchPanel.hidden = !open;
+  terminalSearchToggleButton?.setAttribute('aria-expanded', String(open));
+  if (open) {
+    terminalSearchInput?.focus();
+    terminalSearchInput?.select();
+    runTerminalSearch('next', { incremental: true });
+  } else {
+    searchAddon?.clearDecorations?.();
+    clearReadableSearchMatches();
+    terminalSearchQuery = '';
+    if (terminalSearchInput) terminalSearchInput.value = '';
+    setTerminalSearchNativeSurface(false);
+    focusTerminalSoon();
+  }
 }
 
 function bidiDirection(text = '') {
@@ -934,6 +1159,7 @@ function renderBidiReader(input = getReadableTerminalEntries(), { force = false,
     bidiReaderLines.scrollTop = Math.min(previousScrollTop, maxScrollTop);
   }
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
+  if (terminalSearchQuery) updateReadableSearchMatches({ keepIndex: true });
 }
 
 function isBidiReaderHistoryMode() {
@@ -991,7 +1217,7 @@ function scheduleBidiReaderUpdate({ immediate = false } = {}) {
 }
 
 function scheduleBidiReaderCaptureAfterOutput() {
-  if (!bidiReaderEnabled || !currentSessionId) return;
+  if ((!bidiReaderEnabled && !tuiAutoEnabled) || !currentSessionId) return;
   if (bidiReaderCaptureSettleTimer) window.clearTimeout(bidiReaderCaptureSettleTimer);
   const sinceLastCapture = performance.now() - lastBidiReaderCaptureAt;
   const delay = Math.max(BIDI_CAPTURE_SETTLE_DELAY_MS, BIDI_CAPTURE_REFRESH_INTERVAL_MS - sinceLastCapture);
@@ -1021,8 +1247,8 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
     }
     return;
   }
-  if (!bidiReaderEnabled || !currentSessionId) {
-    renderBidiReader(getReadableTerminalEntries(), { keepScroll, preserveAwayFromBottom });
+  if ((!bidiReaderEnabled && !tuiAutoEnabled) || !currentSessionId) {
+    if (bidiReaderEnabled) renderBidiReader(getReadableTerminalEntries(), { keepScroll, preserveAwayFromBottom });
     return;
   }
   const requestSessionId = currentSessionId;
@@ -1035,6 +1261,8 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
     const payload = await api(`/api/sessions/${encodeURIComponent(requestSessionId)}/capture?lines=5000&ansi=1`);
     if (!requestIsCurrent()) return;
     bidiReaderCaptureSuccessCount += 1;
+    updateTuiModeFromCapture(payload);
+    if (!bidiReaderEnabled) return;
     const capturedSnapshot = parseAnsiCaptureEntries(payload.text || '')
       .slice(-BIDI_READER_MAX_LINES);
     const captureIsHistory = !payload.usingAlternate || payload.captureReason === 'normal-rich-history';
@@ -1110,13 +1338,65 @@ function setBlocksOpen(open) {
   if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
 }
 
-function applyBidiMode() {
-  document.body.classList.toggle('bidi-mode', bidiReaderEnabled);
-  if (bidiToggleButton) {
-    bidiToggleButton.textContent = `Readable: ${bidiReaderEnabled ? 'on' : 'off'}`;
-    bidiToggleButton.setAttribute('aria-pressed', String(bidiReaderEnabled));
+function isAutoTuiModeActive() {
+  return tuiAutoEnabled && detectedTuiActive;
+}
+
+function isReadableSurfaceActive() {
+  return bidiReaderEnabled && !isAutoTuiModeActive();
+}
+
+function effectiveReaderMouseMode() {
+  return isAutoTuiModeActive() ? 'raw' : readerMouseMode;
+}
+
+function captureIndicatesStandaloneTui(payload = {}) {
+  return payload.alternateActive === true
+    && payload.usingAlternate === true
+    && payload.captureReason === 'alternate-active';
+}
+
+function applyTuiModeUi() {
+  const autoActive = isAutoTuiModeActive();
+  document.body.classList.toggle('auto-tui-active', autoActive);
+  if (tuiModeToggleButton) {
+    tuiModeToggleButton.textContent = autoActive
+      ? 'TUI: auto raw'
+      : `TUI: ${tuiAutoEnabled ? 'auto' : 'manual'}`;
+    tuiModeToggleButton.setAttribute('aria-pressed', String(tuiAutoEnabled));
+    tuiModeToggleButton.setAttribute('aria-label', autoActive
+      ? 'Automatic TUI mode is active. Use manual mode to restore your readable display and mouse preferences.'
+      : tuiAutoEnabled
+        ? 'Automatic TUI detection is enabled'
+        : 'Automatic TUI detection is disabled; display and mouse modes are manual');
+    tuiModeToggleButton.title = autoActive
+      ? `Full-screen TUI detected${detectedTuiCaptureReason ? ` (${detectedTuiCaptureReason})` : ''}. Native display and raw mouse passthrough are active; click to override.`
+      : tuiAutoEnabled
+        ? 'Automatically use the native terminal display and raw mouse passthrough for detected full-screen TUI apps.'
+        : 'Manual override is active. Click to restore automatic full-screen TUI detection.';
   }
-  if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!bidiReaderEnabled));
+  if (tuiModeStatus) {
+    tuiModeStatus.hidden = !autoActive;
+    tuiModeStatus.textContent = autoActive ? 'Full-screen TUI · raw display + mouse' : '';
+  }
+  terminalEl?.setAttribute('aria-label', autoActive
+    ? 'Terminal display. Full-screen TUI detected; native display and raw mouse passthrough enabled automatically.'
+    : 'Terminal display');
+}
+
+function applyBidiMode({ refresh = true } = {}) {
+  const readableActive = isReadableSurfaceActive();
+  document.body.classList.toggle('bidi-mode', readableActive);
+  if (bidiToggleButton) {
+    bidiToggleButton.textContent = isAutoTuiModeActive()
+      ? 'Readable: auto raw'
+      : `Readable: ${bidiReaderEnabled ? 'on' : 'off'}`;
+    bidiToggleButton.setAttribute('aria-pressed', String(readableActive));
+    bidiToggleButton.setAttribute('aria-label', isAutoTuiModeActive()
+      ? 'Readable display is temporarily hidden by automatic TUI mode; click to override and show it'
+      : `${bidiReaderEnabled ? 'Disable' : 'Enable'} the readable terminal display`);
+  }
+  if (bidiReader) bidiReader.setAttribute('aria-hidden', String(!readableActive));
   if (!bidiReaderEnabled) setBidiReaderHasContent(false);
   if (bidiReaderUpdateTimer) window.clearTimeout(bidiReaderUpdateTimer);
   if (bidiReaderCaptureSettleTimer) window.clearTimeout(bidiReaderCaptureSettleTimer);
@@ -1127,22 +1407,65 @@ function applyBidiMode() {
   lastBidiReaderRenderKey = '';
   lastBidiReaderRenderSource = 'xterm';
   bidiReaderPinnedToBottom = true;
-  if (bidiReaderEnabled) refreshBidiReaderFromCapture({ preferCapture: true }).catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
+  if (refresh && (bidiReaderEnabled || tuiAutoEnabled)) {
+    refreshBidiReaderFromCapture({ preferCapture: true })
+      .catch(() => {
+        if (bidiReaderEnabled) renderBidiReader(getReadableTerminalEntries(), { force: true });
+      });
+  }
   refitTerminal();
 }
 
 function applyReaderMouseMode() {
-  const raw = readerMouseMode === 'raw';
+  const autoActive = isAutoTuiModeActive();
+  const raw = effectiveReaderMouseMode() === 'raw';
   document.body.classList.toggle('reader-mouse-raw', raw);
   document.body.classList.toggle('reader-mouse-reader', !raw);
   if (mouseModeToggleButton) {
-    mouseModeToggleButton.textContent = `Mouse: ${raw ? 'raw' : 'reader'}`;
+    mouseModeToggleButton.textContent = autoActive ? 'Mouse: auto raw' : `Mouse: ${raw ? 'raw' : 'reader'}`;
     mouseModeToggleButton.setAttribute('aria-pressed', String(raw));
-    mouseModeToggleButton.setAttribute('aria-label', raw ? 'Use raw terminal mouse mode' : 'Use readable terminal mouse mode');
-    mouseModeToggleButton.title = raw
+    mouseModeToggleButton.setAttribute('aria-label', autoActive
+      ? 'Raw mouse passthrough is temporarily enabled by automatic TUI mode; click to override with reader mouse mode'
+      : raw ? 'Use raw terminal mouse mode' : 'Use readable terminal mouse mode');
+    mouseModeToggleButton.title = autoActive
+      ? 'Full-screen TUI detected. Mouse events pass through to xterm automatically; click to override.'
+      : raw
       ? 'Mouse goes through the readable overlay to raw xterm/TUI apps; switch to reader for selection and links.'
       : 'Mouse selects/scrolls readable text and opens links; switch to raw for mouse-enabled TUI apps.';
   }
+}
+
+function applyTuiPresentation({ refreshReader = false } = {}) {
+  applyTuiModeUi();
+  applyReaderMouseMode();
+  applyBidiMode({ refresh: refreshReader });
+}
+
+function updateTuiModeFromCapture(payload) {
+  if (!tuiAutoEnabled) return;
+  const active = captureIndicatesStandaloneTui(payload);
+  const reason = active ? String(payload.captureReason || '') : '';
+  if (active === detectedTuiActive && reason === detectedTuiCaptureReason) return;
+  detectedTuiActive = active;
+  detectedTuiCaptureReason = reason;
+  applyTuiPresentation({ refreshReader: false });
+}
+
+function setTuiAutoEnabled(enabled) {
+  tuiAutoEnabled = Boolean(enabled);
+  localStorage.setItem('warpish_tui_auto_mode_v1', tuiAutoEnabled ? 'on' : 'off');
+  if (!tuiAutoEnabled) {
+    detectedTuiActive = false;
+    detectedTuiCaptureReason = '';
+  }
+  applyTuiPresentation({ refreshReader: true });
+}
+
+function resetTuiDetection() {
+  if (!detectedTuiActive && !detectedTuiCaptureReason) return;
+  detectedTuiActive = false;
+  detectedTuiCaptureReason = '';
+  applyTuiPresentation({ refreshReader: false });
 }
 
 function setReaderMouseMode(mode) {
@@ -1177,7 +1500,7 @@ function isTerminalFocusReport(data) {
 }
 
 function shouldStripTerminalFocusReports() {
-  if (readerMouseMode !== 'raw') return true;
+  if (effectiveReaderMouseMode() !== 'raw') return true;
   return performance.now() <= suppressTerminalFocusReportsUntil;
 }
 
@@ -1267,6 +1590,12 @@ function handleTerminalInput(data) {
   if (!filtered) return;
   if (isTerminalFocusReport(filtered) && terminalControlRole !== 'controller') return;
   sendRaw(filtered, { sessionId: currentSessionId });
+}
+
+function handleTerminalBinaryInput(data) {
+  terminalInputEventSerial += 1;
+  if (terminalWriteDepth > 0 && terminalControlRole !== 'controller') return;
+  sendBinary(data, { sessionId: currentSessionId });
 }
 
 const initialParams = new URLSearchParams(window.location.search);
@@ -1368,18 +1697,51 @@ function activeSession() {
   return sessions.find((session) => session.id === currentSessionId) || null;
 }
 
+function setControlBusy(control, busy) {
+  if (!control) return;
+  if (busy) busyControls.add(control);
+  else busyControls.delete(control);
+  updateHeader();
+}
+
+function controlIsBusy(control) {
+  return Boolean(control && busyControls.has(control));
+}
+
+function selectedSessionAcceptsInput(sessionId = currentSessionId) {
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  return Boolean(session?.alive
+    && !session.privacyQuarantined
+    && terminalControlRole !== 'history'
+    && terminalControlRole !== 'quarantine');
+}
+
 function updateHeader() {
   const session = activeSession();
   if (!session) {
     sessionTitle.textContent = 'No terminal selected';
     sessionMeta.textContent = 'Create a new terminal or choose a live session from the sidebar.';
     terminalTitle.textContent = 'No session attached';
+    for (const control of [renameSessionButton, copySelection, detachSessionButton, killSessionButton, splitVerticalButton, splitHorizontalButton, nextPaneButton, exportSessionButton]) {
+      if (control) control.disabled = true;
+    }
     return;
   }
   sessionTitle.textContent = session.title;
-  sessionMeta.textContent = `${session.alive ? 'Live tmux session' : 'Stopped'} • ${session.cwd || '~'} • ${formatRelative(session.lastOpenedAt || session.createdAt)}`;
-  terminalTitle.textContent = session.title;
+  sessionMeta.textContent = `${session.alive ? 'Live tmux session' : 'Stopped history'} • ${session.cwd || '~'} • ${session.profile || 'default'}${session.private ? ' • private' : ''}${session.privacyQuarantined ? ' • privacy quarantine' : ''} • ${formatRelative(session.lastOpenedAt || session.createdAt)}`;
+  terminalTitle.textContent = activeTerminalTitle ? `${session.title} — ${activeTerminalTitle}` : session.title;
   terminalTitle.title = session.id;
+  for (const control of [detachSessionButton, splitVerticalButton, splitHorizontalButton, nextPaneButton]) {
+    if (control) control.disabled = controlIsBusy(control) || !session.alive || Boolean(session.privacyQuarantined);
+  }
+  if (exportSessionButton) exportSessionButton.disabled = controlIsBusy(exportSessionButton);
+  if (renameSessionButton) renameSessionButton.disabled = controlIsBusy(renameSessionButton);
+  if (copySelection) copySelection.disabled = controlIsBusy(copySelection);
+  if (killSessionButton) {
+    killSessionButton.disabled = controlIsBusy(killSessionButton);
+    killSessionButton.textContent = session.alive ? 'Kill session' : 'Delete history';
+    killSessionButton.title = session.alive ? 'Kill selected tmux session' : 'Permanently delete this stopped session history';
+  }
 }
 
 function updateSessionHistoryActions() {
@@ -1429,7 +1791,6 @@ function renderSessions() {
   for (const session of sessions) {
     const button = document.createElement('button');
     button.className = `session-card ${session.id === currentSessionId ? 'active' : ''} ${session.alive ? '' : 'dead'}`;
-    button.disabled = !session.alive;
     button.dataset.sessionId = session.id;
     if (session.id === currentSessionId) button.setAttribute('aria-current', 'true');
 
@@ -1439,7 +1800,11 @@ function renderSessions() {
     titleText.textContent = session.title;
     const pill = document.createElement('span');
     pill.className = 'session-pill';
-    pill.textContent = session.alive ? (session.attached ? `${session.attached} attached` : 'live') : 'stopped';
+    pill.textContent = session.privacyQuarantined
+      ? 'privacy quarantine'
+      : session.private
+      ? (session.alive ? 'private' : 'private stopped')
+      : session.alive ? (session.attached ? `${session.attached} attached` : 'live') : 'stopped history';
     title.append(titleText, pill);
 
     const meta = document.createElement('div');
@@ -1452,11 +1817,19 @@ function renderSessions() {
 
     const preview = document.createElement('div');
     preview.className = 'session-preview';
-    const previewText = compactText(session.preview || (session.alive ? 'fresh terminal — no output yet' : 'no saved preview'), SESSION_PREVIEW_CHARS);
+    const previewText = compactText(session.preview
+      || (session.privacyQuarantined
+        ? 'attach blocked: pane has nonzero history capacity'
+        : session.private
+        ? 'private output is not retained'
+        : session.alive ? 'fresh terminal — no output yet' : 'no saved preview'), SESSION_PREVIEW_CHARS);
     applyBidiText(preview, previewText);
 
     button.append(title, meta, preview);
-    button.addEventListener('click', () => connectToSession(session.id));
+    button.addEventListener('click', () => {
+      if (session.alive) connectToSession(session.id);
+      else selectStoppedSession(session.id);
+    });
     sessionList.appendChild(button);
   }
   updateHeader();
@@ -1546,7 +1919,9 @@ function renderBlocks() {
   if (!filtered.length) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
-    empty.textContent = blocks.length
+    empty.textContent = activeSession()?.private
+      ? 'Private session: command blocks and output history are not retained.'
+      : blocks.length
       ? 'No blocks match this search.'
       : 'No command blocks yet. New sessions record commands with shell integration; run a command to create the first block.';
     blockList.appendChild(empty);
@@ -1661,6 +2036,7 @@ function endSessionsMutation() {
 
 function resetTerminalSurface() {
   blocks = [];
+  resetTuiDetection();
   resetCapturedReaderState();
   lastBidiReaderCaptureAt = 0;
   bidiReaderCaptureSuccessCount = 0;
@@ -1670,6 +2046,70 @@ function resetTerminalSurface() {
   term.reset();
   lastBidiReaderRenderKey = '';
   bidiReaderPinnedToBottom = true;
+  scheduleBidiReaderUpdate({ immediate: true });
+}
+
+function safeHistoricalPreview(text = '') {
+  return String(text || '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/gu, '')
+    .replace(/\x1bP[\s\S]*?\x1b\\/gu, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, '')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/gu, '')
+    .replace(/\r\n?/gu, '\n');
+}
+
+function selectStoppedSession(sessionId) {
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  if (!session || session.alive) return;
+  clearReconnectTimer();
+  connectionSerial += 1;
+  sessionGeneration += 1;
+  blocksRequestSerial += 1;
+  terminalFocusSerial += 1;
+  clearTerminalFocusFollowups();
+  const previousSessionId = currentSessionId;
+  disconnectCurrent({ quiet: true });
+  if (previousSessionId) discardPendingTerminalInputs(previousSessionId);
+  discardPendingTerminalInputs(sessionId);
+  currentSessionId = sessionId;
+  terminalControlRole = 'history';
+  if (terminalCard) terminalCard.dataset.controlRole = terminalControlRole;
+  controlClaimPending = false;
+  activeTerminalTitle = '';
+  resetTerminalSurface();
+  renderSessions();
+  if (blocksOpen) loadBlocks(sessionId, { force: true }).catch(() => {});
+  const preview = safeHistoricalPreview(session.preview || '');
+  term.writeln('\x1b[2mStopped session history (read-only)\x1b[0m');
+  if (preview) term.write(preview.replace(/\n/gu, '\r\n'));
+  else term.writeln('\r\nNo retained terminal preview. Open Blocks to inspect saved commands.');
+  setStatus('warn', 'stopped history', `${session.title} • read-only`);
+  scheduleBidiReaderUpdate({ immediate: true });
+}
+
+function selectQuarantinedSession(sessionId) {
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  if (!session?.alive || !session.privacyQuarantined) return;
+  clearReconnectTimer();
+  connectionSerial += 1;
+  sessionGeneration += 1;
+  blocksRequestSerial += 1;
+  terminalFocusSerial += 1;
+  clearTerminalFocusFollowups();
+  const previousSessionId = currentSessionId;
+  disconnectCurrent({ quiet: true });
+  if (previousSessionId) discardPendingTerminalInputs(previousSessionId);
+  discardPendingTerminalInputs(sessionId);
+  currentSessionId = sessionId;
+  terminalControlRole = 'quarantine';
+  if (terminalCard) terminalCard.dataset.controlRole = terminalControlRole;
+  controlClaimPending = false;
+  activeTerminalTitle = '';
+  resetTerminalSurface();
+  renderSessions();
+  term.writeln('\x1b[31mPrivate session quarantined\x1b[0m');
+  term.writeln('\r\nThis tmux pane was created with nonzero history capacity. Warpish will not attach, capture, or send input to it. Kill it here or continue it directly in tmux.');
+  setStatus('bad', 'privacy quarantine', `${session.title} • attach blocked`);
   scheduleBidiReaderUpdate({ immediate: true });
 }
 
@@ -1698,10 +2138,14 @@ async function refreshSessions(options = {}) {
     renderSessions();
 
     const targetId = selectId
-      || (currentSessionId && sessions.some((session) => session.id === currentSessionId && session.alive) ? currentSessionId : null)
-      || sessions.find((session) => session.alive)?.id;
+      || (currentSessionId && sessions.some((session) => session.id === currentSessionId) ? currentSessionId : null)
+      || sessions.find((session) => session.alive)?.id
+      || sessions[0]?.id;
+    const target = sessions.find((session) => session.id === targetId);
 
-    if (targetId && targetId !== currentSessionId) connectToSession(targetId);
+    if (target?.privacyQuarantined && (targetId !== currentSessionId || terminalControlRole !== 'quarantine' || ws)) selectQuarantinedSession(targetId);
+    else if (target?.alive && (targetId !== currentSessionId || terminalControlRole === 'quarantine')) connectToSession(targetId);
+    else if (target && !target.alive && (targetId !== currentSessionId || terminalControlRole !== 'history' || ws)) selectStoppedSession(targetId);
     else if (targetId && blocksOpen) loadBlocks(targetId, { force: true }).catch(() => {});
     if (!targetId) {
       clearReconnectTimer();
@@ -1759,6 +2203,8 @@ function socketUrl(sessionId) {
 }
 
 function disconnectCurrent({ quiet = false } = {}) {
+  if (terminalInputFlushTimer) window.clearTimeout(terminalInputFlushTimer);
+  terminalInputFlushTimer = null;
   const socket = ws;
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
     if (quiet) intentionallyClosedSockets.add(socket);
@@ -1790,58 +2236,99 @@ function scheduleReconnect(sessionId) {
   }, delay);
 }
 
-function pendingInputChars(sessionId) {
+function terminalInputByteLength(item) {
+  if (terminalInputApi?.byteLength) return terminalInputApi.byteLength(item.kind, item.data);
+  return item.kind === 'binary' ? String(item.data || '').length : new TextEncoder().encode(String(item.data || '')).byteLength;
+}
+
+function splitTerminalInput(item) {
+  return terminalInputApi?.splitInput?.(item, MAX_TERMINAL_INPUT_MESSAGE_BYTES) || [item];
+}
+
+function pendingInputBytes(sessionId) {
   return pendingTerminalInputs
     .filter((item) => item.sessionId === sessionId)
-    .reduce((total, item) => total + item.data.length, 0);
+    .reduce((total, item) => total + terminalInputByteLength(item), 0);
 }
 
 function discardPendingTerminalInputs(sessionId) {
-  const discarded = pendingInputChars(sessionId);
+  const discarded = pendingInputBytes(sessionId);
   pendingTerminalInputs = pendingTerminalInputs.filter((item) => item.sessionId !== sessionId);
   return discarded;
 }
 
-function queueTerminalInput({ data, directTmux, sessionId }) {
-  const value = String(data || '');
-  if (!value) return true;
-  if (pendingInputChars(sessionId) + value.length > MAX_PENDING_TERMINAL_INPUT_CHARS) {
+function queueTerminalInput({ kind = 'text', data, directTmux, sessionId }) {
+  const chunks = splitTerminalInput({ kind, data: String(data || ''), directTmux, sessionId });
+  if (!chunks.length) return true;
+  const incomingBytes = chunks.reduce((total, item) => total + terminalInputByteLength(item), 0);
+  if (pendingInputBytes(sessionId) + incomingBytes > MAX_PENDING_TERMINAL_INPUT_BYTES) {
     setStatus('bad', 'input queue full', 'wait for the terminal to connect before sending more input');
     return false;
   }
-  const last = pendingTerminalInputs.at(-1);
-  if (last && last.sessionId === sessionId && last.directTmux === directTmux) {
-    last.data += value;
-  } else {
-    pendingTerminalInputs.push({ data: value, directTmux: Boolean(directTmux), sessionId });
+
+  for (const chunk of chunks) {
+    const item = { ...chunk, directTmux: Boolean(chunk.directTmux), sessionId };
+    const last = pendingTerminalInputs.at(-1);
+    const canMerge = last
+      && last.sessionId === sessionId
+      && last.kind === item.kind
+      && last.directTmux === item.directTmux
+      && terminalInputByteLength({ ...last, data: last.data + item.data }) <= MAX_TERMINAL_INPUT_MESSAGE_BYTES;
+    if (canMerge) last.data += item.data;
+    else pendingTerminalInputs.push(item);
   }
   return true;
 }
 
+function binaryStringToBase64(data) {
+  return window.btoa(String(data || ''));
+}
+
 function sendTerminalInputOverSocket(socket, item) {
   if (!socket || socket.readyState !== WebSocket.OPEN || terminalControlRole !== 'controller') return false;
-  const allowFocusReports = readerMouseMode === 'raw' && performance.now() > suppressTerminalFocusReportsUntil;
   try {
-    socket.send(JSON.stringify({ type: 'input', data: item.data, directTmux: item.directTmux, allowFocusReports }));
+    if (item.kind === 'binary') {
+      socket.send(JSON.stringify({ type: 'input-binary', data: binaryStringToBase64(item.data) }));
+    } else {
+      const allowFocusReports = effectiveReaderMouseMode() === 'raw' && performance.now() > suppressTerminalFocusReportsUntil;
+      socket.send(JSON.stringify({ type: 'input', data: item.data, directTmux: item.directTmux, allowFocusReports }));
+    }
     return true;
   } catch {
     return false;
   }
 }
 
+function schedulePendingTerminalInputFlush(socket, sessionId) {
+  if (terminalInputFlushTimer || !socket || socket.readyState !== WebSocket.OPEN) return;
+  terminalInputFlushTimer = window.setTimeout(() => {
+    terminalInputFlushTimer = null;
+    if (socket === ws && sessionId === currentSessionId) flushPendingTerminalInputs(socket, sessionId);
+  }, 25);
+}
+
 function flushPendingTerminalInputs(socket, sessionId) {
   if (terminalControlRole !== 'controller') return;
   const remaining = [];
+  let socketBackpressured = false;
   for (const item of pendingTerminalInputs) {
     if (item.sessionId !== sessionId) {
       remaining.push(item);
       continue;
     }
-    if (sessionId !== currentSessionId || ws !== socket || !sendTerminalInputOverSocket(socket, item)) {
+    if (socketBackpressured
+      || sessionId !== currentSessionId
+      || ws !== socket
+      || socket?.bufferedAmount > MAX_BROWSER_SOCKET_BUFFERED_BYTES
+      || !sendTerminalInputOverSocket(socket, item)) {
       remaining.push(item);
+      socketBackpressured = true;
     }
   }
   pendingTerminalInputs = remaining;
+  if (pendingTerminalInputs.some((item) => item.sessionId === sessionId)) {
+    schedulePendingTerminalInputFlush(socket, sessionId);
+  }
 }
 
 function claimTerminalControl() {
@@ -1872,7 +2359,7 @@ function applyTerminalControlRole(role, sessionTitle = activeSession()?.title ||
     setStatus('ok', 'connected', `${sessionTitle} • this tab has control`);
   } else {
     setStatus('warn', 'view only', `${sessionTitle} • type or click the terminal to take control`);
-    if (pendingInputChars(currentSessionId) > 0) claimTerminalControl();
+    if (pendingInputBytes(currentSessionId) > 0) claimTerminalControl();
   }
 }
 
@@ -1891,16 +2378,22 @@ function writeTerminalOutput(data) {
 }
 
 function refreshReadableFromTmuxSoon(delay = 250, preferCapture = false) {
-  if (!bidiReaderEnabled || !currentSessionId) return;
+  if ((!bidiReaderEnabled && !tuiAutoEnabled) || !currentSessionId) return;
   setTimeout(() => {
-    if (!bidiReaderEnabled || !currentSessionId) return;
-    refreshBidiReaderFromCapture({ preferCapture }).catch(() => renderBidiReader(getReadableTerminalEntries(), { force: true }));
+    if ((!bidiReaderEnabled && !tuiAutoEnabled) || !currentSessionId) return;
+    refreshBidiReaderFromCapture({ preferCapture }).catch(() => {
+      if (bidiReaderEnabled) renderBidiReader(getReadableTerminalEntries(), { force: true });
+    });
   }, delay);
 }
 
 function connectToSession(sessionId, { reconnecting = false } = {}) {
   const session = sessions.find((candidate) => candidate.id === sessionId);
   if (!session?.alive) return;
+  if (session.privacyQuarantined) {
+    selectQuarantinedSession(sessionId);
+    return;
+  }
 
   clearReconnectTimer({ resetAttempts: !reconnecting });
   connectionSerial += 1;
@@ -1913,6 +2406,8 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
   clearTerminalFocusFollowups();
   disconnectCurrent({ quiet: true });
   currentSessionId = sessionId;
+  activeTerminalTitle = '';
+  resetTuiDetection();
   terminalControlRole = 'pending';
   controlClaimPending = false;
   lastSentTerminalSize = '';
@@ -1976,6 +2471,10 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
       scheduleBidiReaderUpdate();
     } else if (msg.type === 'detached') {
       if (!intentionallyClosedSockets.has(socket)) setStatus('bad', 'detached', 'session still exists in sidebar');
+    } else if (msg.type === 'session-meta' && msg.sessionId === sessionId) {
+      const liveSession = sessions.find((candidate) => candidate.id === sessionId);
+      if (liveSession && typeof msg.cwd === 'string') liveSession.cwd = msg.cwd;
+      renderSessions();
     } else if (['block-start', 'block-update', 'block-end'].includes(msg.type)) {
       upsertBlock(msg.block);
       if (msg.type === 'block-end') clearAutoRawInput('block-end');
@@ -2010,15 +2509,46 @@ function sendRaw(data, { directTmux = false, sessionId = currentSessionId } = {}
     return;
   }
   if (sessionId !== currentSessionId) return;
-  const item = { data: String(data || ''), directTmux: Boolean(directTmux), sessionId };
-  if (ws?.readyState === WebSocket.OPEN && sendTerminalInputOverSocket(ws, item)) return;
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  if (!selectedSessionAcceptsInput(sessionId)) {
+    setStatus('warn', 'read only', session?.privacyQuarantined
+      ? 'this private session is quarantined and cannot accept input'
+      : 'stopped session history does not accept terminal input');
+    return;
+  }
+  const item = { kind: 'text', data: String(data || ''), directTmux: Boolean(directTmux), sessionId };
   if (!queueTerminalInput(item)) return;
   if (ws?.readyState === WebSocket.OPEN) {
-    claimTerminalControl();
+    if (terminalControlRole === 'controller') flushPendingTerminalInputs(ws, sessionId);
+    else claimTerminalControl();
     return;
   }
   if (ws?.readyState === WebSocket.CONNECTING) {
-    setStatus('warn', 'attaching…', `${pendingInputChars(sessionId)} input chars queued`);
+    setStatus('warn', 'attaching…', `${pendingInputBytes(sessionId)} input bytes queued`);
+    return;
+  }
+  connectToSession(sessionId);
+}
+
+function sendBinary(data, { sessionId = currentSessionId } = {}) {
+  if (!sessionId || sessionId !== currentSessionId) return;
+  const session = sessions.find((candidate) => candidate.id === sessionId);
+  if (!selectedSessionAcceptsInput(sessionId)) {
+    setStatus('warn', 'read only', session?.privacyQuarantined
+      ? 'this private session is quarantined and cannot accept input'
+      : 'stopped session history does not accept terminal input');
+    return;
+  }
+  const item = { kind: 'binary', data: String(data || ''), directTmux: false, sessionId };
+  if (!item.data) return;
+  if (!queueTerminalInput(item)) return;
+  if (ws?.readyState === WebSocket.OPEN) {
+    if (terminalControlRole === 'controller') flushPendingTerminalInputs(ws, sessionId);
+    else claimTerminalControl();
+    return;
+  }
+  if (ws?.readyState === WebSocket.CONNECTING) {
+    setStatus('warn', 'attaching…', `${pendingInputBytes(sessionId)} input bytes queued`);
     return;
   }
   connectToSession(sessionId);
@@ -2057,43 +2587,6 @@ function isTerminalKeyTarget(event) {
   return !target.closest?.('button, input, textarea, select, a, [contenteditable="true"]');
 }
 
-function ctrlKeyData(key) {
-  if (!key) return null;
-  if (key === ' ') return '\x00';
-  if (key === '[') return '\x1b';
-  if (key === '\\') return '\x1c';
-  if (key === ']') return '\x1d';
-  if (key === '^') return '\x1e';
-  if (key === '_') return '\x1f';
-  const upper = key.toUpperCase();
-  if (upper.length === 1 && upper >= 'A' && upper <= 'Z') return String.fromCharCode(upper.charCodeAt(0) - 64);
-  return null;
-}
-
-function terminalKeyData(event) {
-  if (!event || event.isComposing || event.metaKey) return null;
-  if (event.ctrlKey) return ctrlKeyData(event.key);
-  if (event.altKey) return null;
-  const keyMap = {
-    Enter: '\r',
-    Backspace: '\x7f',
-    Tab: '\t',
-    Escape: '\x1b',
-    ArrowUp: '\x1b[A',
-    ArrowDown: '\x1b[B',
-    ArrowRight: '\x1b[C',
-    ArrowLeft: '\x1b[D',
-    Home: '\x1b[H',
-    End: '\x1b[F',
-    Delete: '\x1b[3~',
-    PageUp: '\x1b[5~',
-    PageDown: '\x1b[6~',
-  };
-  if (keyMap[event.key]) return keyMap[event.key];
-  if (event.key && event.key.length === 1) return event.key;
-  return null;
-}
-
 function forwardReaderKeyToXterm(event) {
   const helper = terminalHelperTextarea();
   if (!helper) return false;
@@ -2121,55 +2614,92 @@ function forwardReaderKeyToXterm(event) {
 }
 
 function handleReadableTerminalKeydown(event) {
-  if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
+  if (!isReadableSurfaceActive() || !isTerminalKeyTarget(event)) return;
   if (isXtermHelperTarget(event.target) || event.isComposing || event.metaKey) return;
   if (event.ctrlKey && event.shiftKey && ['c', 'v'].includes(event.key.toLowerCase())) return;
   event.preventDefault();
   event.stopPropagation();
   suppressTerminalFocusReports();
   if (forwardReaderKeyToXterm(event)) return;
-  const data = terminalKeyData(event);
+  const data = window.WarpishTerminalKeys?.terminalKeyData(event, term.modes);
   if (data) term.input(data, true);
 }
 
-function prepareTerminalPasteText(rawText, { bracketedPasteMode = false } = {}) {
-  return window.WarpishPasteSafety.prepareTerminalPasteText(rawText, { bracketedPasteMode });
+function prepareTerminalPasteText(rawText, { bracketedPasteMode = false, multilineMode = 'single-line' } = {}) {
+  return window.WarpishPasteSafety.prepareTerminalPasteText(rawText, { bracketedPasteMode, multilineMode });
+}
+
+function insertPreparedPaste(prepared) {
+  focusTerminalOnceWithoutScroll();
+  if (prepared.text) term.paste(prepared.text);
+  const lineDetail = prepared.internalLineBreaks
+    ? `${prepared.internalLineBreaks + 1} lines • ${prepared.multilineMode === 'preserve' ? 'line breaks preserved' : 'joined safely'}`
+    : 'text inserted safely';
+  setStatus(prepared.multilineMode === 'preserve' && prepared.internalLineBreaks ? 'warn' : 'ok',
+    prepared.multilineMode === 'preserve' ? 'multiline paste inserted' : 'pasted — press Enter to run',
+    lineDetail);
 }
 
 function handleTerminalPaste(event) {
   if (!isTerminalKeyTarget(event)) return;
   const text = event.clipboardData?.getData('text/plain');
   if (!text) return;
+  if (!selectedSessionAcceptsInput()) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    setStatus('warn', 'read only', activeSession()?.privacyQuarantined
+      ? 'this private session is quarantined and cannot accept input'
+      : 'stopped session history does not accept terminal input');
+    return;
+  }
   const prepared = prepareTerminalPasteText(text, {
     bracketedPasteMode: Boolean(term.modes?.bracketedPasteMode),
   });
   event.preventDefault();
   event.stopPropagation();
   event.stopImmediatePropagation();
-  focusTerminalOnceWithoutScroll();
-  if (prepared.text) term.paste(prepared.text);
-  const lineDetail = prepared.internalLineBreaks
-    ? `${prepared.internalLineBreaks + 1} lines inserted safely`
-    : 'text inserted safely';
-  setStatus('ok', 'pasted — press Enter to run', lineDetail);
+  if (prepared.requiresChoice && pasteDialog?.showModal) {
+    pendingMultilinePaste = { text, bracketedPasteMode: false, sessionId: currentSessionId };
+    pastePreview.textContent = window.WarpishPasteSafety.formatMultilinePastePreview(text, 2400);
+    pasteDialog.returnValue = 'cancel';
+    pasteDialog.showModal();
+    return;
+  }
+  insertPreparedPaste(prepared);
 }
 
 term.onData((data) => handleTerminalInput(data));
+term.onBinary((data) => handleTerminalBinaryInput(data));
 term.onResize(({ cols, rows }) => {
   sendResizeIfChanged(cols, rows);
+});
+term.onTitleChange((title) => {
+  activeTerminalTitle = String(title || '').trim().slice(0, 160);
+  updateHeader();
+});
+term.onBell(() => {
+  if (!terminalPreferences.notifications || !document.hidden || window.Notification?.permission !== 'granted') return;
+  try {
+    new Notification(activeSession()?.title || 'Warpish Terminal', {
+      body: activeTerminalTitle || 'Terminal bell',
+      tag: `warpish-bell-${currentSessionId || 'terminal'}`,
+    });
+  } catch {}
 });
 
 const resizeObserver = new ResizeObserver(() => {
   refitTerminal();
 });
 function shouldOpenReaderOnTrappedScroll() {
-  const text = getReadableTerminalLines(40).join('\n');
-  return /Welcome to Hermes Agent|\bgpt-[\w.]+\b|ctx --|❯/.test(text);
+  return !isAutoTuiModeActive()
+    && bidiReaderCaptureMode === 'history'
+    && capturedReaderHistoryState.known;
 }
 
 function handleBidiReaderScroll() {
   bidiReaderPinnedToBottom = isBidiReaderNearBottom();
-  if (!bidiReaderEnabled || !currentSessionId) return;
+  if (!isReadableSurfaceActive() || !currentSessionId) return;
   preferBidiReaderHistoryForScroll();
   if (bidiReaderCaptureForScrollPending) return;
   if (performance.now() - lastBidiReaderCaptureAt <= BIDI_CAPTURE_REFRESH_INTERVAL_MS) return;
@@ -2196,8 +2726,8 @@ async function refreshBidiReaderForScroll(deltaY) {
 }
 
 function handleBidiReaderWheel(event) {
-  if (!bidiReaderEnabled || !bidiReaderLines) return;
-  if (readerMouseMode === 'raw') return;
+  if (!isReadableSurfaceActive() || !bidiReaderLines) return;
+  if (effectiveReaderMouseMode() === 'raw') return;
   event.preventDefault();
   event.stopPropagation();
   const needsTmuxHistory = event.deltaY !== 0;
@@ -2212,7 +2742,7 @@ terminalEl.addEventListener('pointerdown', () => {
   focusTerminalSoon();
 });
 terminalCard?.addEventListener('pointerdown', (event) => {
-  if (readerMouseMode === 'reader' && event.target?.closest?.('#bidiReader')) return;
+  if (effectiveReaderMouseMode() === 'reader' && event.target?.closest?.('#bidiReader')) return;
   if (!shouldPreserveControlFocus(event)) focusTerminalSoon();
 });
 terminalCard?.addEventListener('click', (event) => {
@@ -2223,13 +2753,13 @@ terminalCard?.addEventListener('keydown', handleReadableTerminalKeydown, { captu
 terminalCard?.addEventListener('paste', handleTerminalPaste, { capture: true });
 bidiReaderLines?.addEventListener('scroll', handleBidiReaderScroll, { passive: true });
 document.addEventListener('selectionchange', () => {
-  if (!readerSelectionIsActive() && bidiReaderEnabled) scheduleBidiReaderUpdate({ immediate: true });
+  if (!readerSelectionIsActive() && isReadableSurfaceActive()) scheduleBidiReaderUpdate({ immediate: true });
 });
 bidiReader?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 bidiReaderLines?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 terminalEl.addEventListener('wheel', (event) => {
   if (event.ctrlKey) return;
-  if (readerMouseMode === 'raw' && term.modes?.mouseTrackingMode !== 'none') return;
+  if (effectiveReaderMouseMode() === 'raw' && term.modes?.mouseTrackingMode !== 'none') return;
   event.stopPropagation();
   const lineHeight = 18;
   const lines = Math.max(1, Math.min(12, Math.round(Math.abs(event.deltaY) / lineHeight)));
@@ -2248,21 +2778,104 @@ terminalEl.addEventListener('wheel', (event) => {
   event.preventDefault();
 }, { capture: true, passive: false });
 
-newSessionButton.addEventListener('click', async () => {
+newSessionButton.addEventListener('click', () => {
+  newSessionTitleInput.value = '';
+  newSessionCwdInput.value = terminalPreferences.defaultCwd || '';
+  newSessionProfileInput.value = terminalPreferences.defaultProfile || 'default';
+  newSessionPrivateInput.checked = Boolean(terminalPreferences.privateByDefault);
+  if (newSessionError) {
+    newSessionError.hidden = true;
+    newSessionError.textContent = '';
+  }
+  newSessionDialog?.showModal?.();
+  window.setTimeout(() => newSessionTitleInput?.focus(), 0);
+});
+
+newSessionForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
   const selectedAtRequestStart = currentSessionId;
-  newSessionButton.disabled = true;
+  const submitButton = event.submitter;
+  if (submitButton) submitButton.disabled = true;
   beginSessionsMutation();
   try {
-    const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({}), timeoutMs: 20_000 });
+    if (newSessionError) {
+      newSessionError.hidden = true;
+      newSessionError.textContent = '';
+    }
+    const request = {
+      title: newSessionTitleInput.value.trim() || undefined,
+      cwd: newSessionCwdInput.value.trim() || undefined,
+      profile: newSessionProfileInput.value.trim() || 'default',
+      private: newSessionPrivateInput.checked,
+    };
+    const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify(request), timeoutMs: 20_000 });
     sessions = created.sessions || [created.session];
+    newSessionDialog.close('created');
     renderSessions();
     if (!currentSessionId || currentSessionId === selectedAtRequestStart) connectToSession(created.session.id);
   } catch (error) {
     setStatus('bad', 'create failed', error.message);
+    if (newSessionError) {
+      newSessionError.textContent = error.message;
+      newSessionError.hidden = false;
+    }
   } finally {
     endSessionsMutation();
-    newSessionButton.disabled = false;
+    if (submitButton) submitButton.disabled = false;
   }
+});
+
+for (const cancelButton of document.querySelectorAll('[data-dialog-cancel]')) {
+  cancelButton.addEventListener('click', () => cancelButton.closest('dialog')?.close?.('cancel'));
+}
+
+settingsToggleButton?.addEventListener('click', openSettingsDialog);
+settingsResetButton?.addEventListener('click', () => populateSettingsForm(terminalPreferencesApi?.DEFAULTS || terminalPreferences));
+settingsForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const next = terminalPreferencesApi?.save?.(settingsFromForm()) || settingsFromForm();
+  if (next.notifications && window.Notification?.permission === 'default') {
+    try { await Notification.requestPermission(); } catch {}
+  }
+  applyTerminalPreferences(next);
+  settingsDialog.close('applied');
+  setStatus('ok', 'settings saved', `${next.theme} • ${next.fontSize}px • ${next.scrollback.toLocaleString()} lines`);
+});
+
+terminalSearchToggleButton?.addEventListener('click', () => setTerminalSearchOpen(terminalSearchPanel?.hidden !== false));
+terminalSearchClose?.addEventListener('click', () => setTerminalSearchOpen(false));
+terminalSearchPrevious?.addEventListener('click', () => runTerminalSearch('previous'));
+terminalSearchNext?.addEventListener('click', () => runTerminalSearch('next'));
+terminalSearchInput?.addEventListener('input', () => runTerminalSearch('next', { incremental: true }));
+terminalSearchInput?.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    runTerminalSearch(event.shiftKey ? 'previous' : 'next');
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    setTerminalSearchOpen(false);
+  }
+});
+
+pasteDialog?.addEventListener('close', () => {
+  const pending = pendingMultilinePaste;
+  pendingMultilinePaste = null;
+  if (!pending || !['single-line', 'preserve'].includes(pasteDialog.returnValue)) {
+    focusTerminalSoon();
+    return;
+  }
+  if (!pending.sessionId
+    || pending.sessionId !== currentSessionId
+    || !sessions.find((session) => session.id === pending.sessionId)?.alive) {
+    setStatus('warn', 'paste cancelled', 'the selected terminal changed while the paste dialog was open');
+    focusTerminalSoon();
+    return;
+  }
+  const prepared = prepareTerminalPasteText(pending.text, {
+    bracketedPasteMode: pending.bracketedPasteMode,
+    multilineMode: pasteDialog.returnValue,
+  });
+  insertPreparedPaste(prepared);
 });
 
 refreshSessionsButton.addEventListener('click', () => refreshSessions().catch((error) => setStatus('bad', 'refresh failed', error.message)));
@@ -2278,7 +2891,7 @@ renameSessionButton.addEventListener('click', async () => {
   if (!session) return;
   const title = window.prompt('Rename terminal session:', session.title)?.trim();
   if (!title || title === session.title) return;
-  renameSessionButton.disabled = true;
+  setControlBusy(renameSessionButton, true);
   beginSessionsMutation();
   try {
     const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'PATCH', body: JSON.stringify({ title }) });
@@ -2289,25 +2902,121 @@ renameSessionButton.addEventListener('click', async () => {
     setStatus('bad', 'rename failed', error.message);
   } finally {
     endSessionsMutation();
-    renameSessionButton.disabled = false;
+    setControlBusy(renameSessionButton, false);
   }
 });
 
 copySelection.addEventListener('click', async () => {
-  copySelection.disabled = true;
+  setControlBusy(copySelection, true);
   try {
     await copyTerminalSelection();
   } catch (error) {
     setStatus('bad', 'copy failed', error.message);
   } finally {
-    copySelection.disabled = false;
+    setControlBusy(copySelection, false);
   }
 });
 
+exportSessionButton?.addEventListener('click', async () => {
+  const session = activeSession();
+  if (!session) return;
+  setControlBusy(exportSessionButton, true);
+  try {
+    const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}/export`, { timeoutMs: 20_000 });
+    const blob = new Blob([String(payload.text || '')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = payload.filename || `${session.title || session.id}.txt`;
+    const filename = anchor.download;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    setStatus('ok', 'exported', filename);
+  } catch (error) {
+    setStatus('bad', 'export failed', error.message);
+  } finally {
+    setControlBusy(exportSessionButton, false);
+  }
+});
+
+async function runPaneAction(path, button, successText, body = {}) {
+  const session = activeSession();
+  if (!session?.alive) return;
+  setControlBusy(button, true);
+  try {
+    await api(path, { method: 'POST', body: JSON.stringify(body), timeoutMs: 15_000 });
+    setStatus('ok', successText, session.title);
+    refreshReadableFromTmuxSoon(150, true);
+    focusTerminalSoon();
+  } catch (error) {
+    setStatus('bad', 'pane action failed', error.message);
+  } finally {
+    setControlBusy(button, false);
+  }
+}
+
+splitVerticalButton?.addEventListener('click', () => {
+  const session = activeSession();
+  if (!session) return;
+  runPaneAction(`/api/sessions/${encodeURIComponent(session.id)}/panes`, splitVerticalButton, 'pane split left/right', { direction: 'vertical' })
+    .catch(() => {});
+});
+splitHorizontalButton?.addEventListener('click', () => {
+  const session = activeSession();
+  if (!session) return;
+  runPaneAction(`/api/sessions/${encodeURIComponent(session.id)}/panes`, splitHorizontalButton, 'pane split top/bottom', { direction: 'horizontal' })
+    .catch(() => {});
+});
+nextPaneButton?.addEventListener('click', () => {
+  const session = activeSession();
+  if (!session) return;
+  runPaneAction(`/api/sessions/${encodeURIComponent(session.id)}/panes/next`, nextPaneButton, 'next pane selected')
+    .catch(() => {});
+});
+
+mobileTerminalKeys?.addEventListener('click', (event) => {
+  const button = event.target.closest('button');
+  if (!button) return;
+  const controlData = { 'ctrl-c': '\x03', 'ctrl-d': '\x04' }[button.dataset.terminalData];
+  const data = controlData || window.WarpishTerminalKeys?.terminalKeyData({
+    key: button.dataset.terminalKey,
+    code: button.dataset.terminalKey,
+    ctrlKey: false,
+    shiftKey: false,
+    altKey: false,
+    metaKey: false,
+    isComposing: false,
+  }, term.modes);
+  if (data) term.input(data, true);
+  focusTerminalSoon();
+});
+
 blocksToggleButton?.addEventListener('click', () => setBlocksOpen(!blocksOpen));
-mouseModeToggleButton?.addEventListener('click', () => setReaderMouseMode(readerMouseMode === 'raw' ? 'reader' : 'raw'));
+mouseModeToggleButton?.addEventListener('click', () => {
+  if (isAutoTuiModeActive()) {
+    readerMouseMode = 'reader';
+    localStorage.setItem('warpish_reader_mouse_mode_v1', readerMouseMode);
+    setTuiAutoEnabled(false);
+    focusTerminalSoon();
+  } else {
+    setReaderMouseMode(readerMouseMode === 'raw' ? 'reader' : 'raw');
+  }
+});
+tuiModeToggleButton?.addEventListener('click', () => {
+  setTuiAutoEnabled(!tuiAutoEnabled);
+  focusTerminalSoon();
+});
 
 bidiToggleButton.addEventListener('click', () => {
+  if (isAutoTuiModeActive()) {
+    bidiReaderEnabled = true;
+    localStorage.setItem('warpish_readable_terminal_v1', 'on');
+    setTuiAutoEnabled(false);
+    focusTerminalSoon();
+    return;
+  }
   bidiReaderEnabled = !bidiReaderEnabled;
   localStorage.setItem('warpish_readable_terminal_v1', bidiReaderEnabled ? 'on' : 'off');
   applyBidiMode();
@@ -2323,9 +3032,12 @@ detachSessionButton.addEventListener('click', () => {
 killSessionButton.addEventListener('click', async () => {
   const session = activeSession();
   if (!session) return;
-  if (!window.confirm(`Kill tmux session "${session.title}"? This stops the terminal process, not just the browser attach.`)) return;
-  killSessionButton.disabled = true;
-  detachSessionButton.disabled = true;
+  const confirmation = session.alive
+    ? `Kill tmux session "${session.title}"? This stops the terminal process, but keeps its saved history.`
+    : `Permanently delete saved history for "${session.title}"? This cannot be undone.`;
+  if (!window.confirm(confirmation)) return;
+  setControlBusy(killSessionButton, true);
+  setControlBusy(detachSessionButton, true);
   beginSessionsMutation();
   discardPendingTerminalInputs(session.id);
   if (currentSessionId === session.id) {
@@ -2335,12 +3047,13 @@ killSessionButton.addEventListener('click', async () => {
     disconnectCurrent({ quiet: true });
   }
   try {
-    const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE', timeoutMs: 20_000 });
+    const purge = session.alive ? '' : '?purge=1';
+    const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}${purge}`, { method: 'DELETE', timeoutMs: 20_000 });
     sessions = payload.sessions || sessions.filter((candidate) => candidate.id !== session.id);
     if (currentSessionId === session.id) {
       currentSessionId = null;
       resetTerminalSurface();
-      setStatus('warn', 'session killed', 'choosing another terminal…');
+      setStatus('warn', session.alive ? 'session killed' : 'history deleted', 'choosing another terminal…');
     }
     renderSessions();
     queueSessionsRefresh({ createIfEmpty: true });
@@ -2349,21 +3062,28 @@ killSessionButton.addEventListener('click', async () => {
     queueSessionsRefresh({ selectId: currentSessionId === session.id ? session.id : undefined });
   } finally {
     endSessionsMutation();
-    killSessionButton.disabled = false;
-    detachSessionButton.disabled = false;
+    setControlBusy(killSessionButton, false);
+    setControlBusy(detachSessionButton, false);
   }
 });
 
 window.addEventListener('keydown', (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+    event.preventDefault();
+    event.stopPropagation();
+    setTerminalSearchOpen(true);
+    return;
+  }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
     event.preventDefault();
+    event.stopPropagation();
     focusTerminalReliably();
   }
-});
+}, { capture: true });
 
+applyTerminalPreferences(terminalPreferences);
 applyPanelMode();
-applyReaderMouseMode();
-applyBidiMode();
+applyTuiPresentation({ refreshReader: false });
 
 refreshSessions({ createIfEmpty: true }).catch((error) => {
   setStatus('bad', 'startup failed', error.message);

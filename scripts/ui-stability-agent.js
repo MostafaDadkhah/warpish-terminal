@@ -2,8 +2,9 @@ import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
-const projectRoot = new URL('..', import.meta.url).pathname;
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 const startedAt = Date.now();
 const timeoutMs = Number(process.env.WARPISH_UI_TIMEOUT_MS || 600_000);
 const runtimeRoot = fs.mkdtempSync(path.join('/tmp', 'warpish-ui-agent-'));

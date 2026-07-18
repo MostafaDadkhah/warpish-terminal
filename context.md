@@ -17,12 +17,15 @@ Implemented capabilities:
   - live/stopped state,
   - attached count,
   - recent output preview,
-  - click-to-reattach behavior,
+  - click-to-reattach behavior for live sessions and read-only preview/block inspection for stopped sessions,
   - clear-stopped-history control that purges only stopped SQLite session/block/event rows and keeps live `tmux` sessions running.
 - Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
 - Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask keeps LTR shell prompts separate from compact Word-style RTL suffix segments while preserving English commands, paths, flags, and code as isolated LTR islands.
 - The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs. The readable surface owns wheel scrolling when enabled: it stops wheel events from becoming shell history/navigation input, refreshes tmux-captured history when xterm has no scrollback, preserves xterm focus for old-session reattaches, and uses direct tmux-pane input for readable-mode keystrokes when attach-session input is stale.
-- Session rename, copy selection, detach, and kill controls.
+- New-session title, validated CWD, profile label, and private-mode controls. Private sessions retain no blocks, preview, capture, or tmux scrollback.
+- Session rename, copy selection, text export, detach, kill/delete-history, terminal search, settings, bell notifications, mobile accessory keys, and tmux split/next-pane controls.
+- State-aware keyboard fallback and binary-input forwarding for terminal protocols, plus generic full-screen TUI auto/manual presentation.
+- Bounded input queues/payloads across browser, WebSocket, Node, and Python; WebSocket heartbeat; tmux timeouts; idle attach-PTY teardown; and live CWD metadata updates.
 - Warp-style command blocks for sessions created with the current shell integration:
   - command text,
   - output preview,
@@ -47,8 +50,11 @@ Main files:
 - `scripts/warpish-shell-integration.zsh` — scoped zsh integration that emits command start/end events through `preexec`/`precmd`.
 - `public/index.html` — app shell markup.
 - `public/app.js` — browser state, WebSocket handling, xterm.js integration, session list, command blocks UI.
+- `public/terminal-key-data.js` — pure state-aware terminal key-sequence mapping.
+- `public/terminal-input.js` — pure byte-aware UTF-8/binary chunking shared by the bounded browser input queue.
+- `public/terminal-preferences.js` — normalized browser-local terminal settings and themes.
 - `public/styles.css` — visual design for sidebar, terminal, default bidi/plaintext terminal styling, reader overlay, and block panel.
-- `scripts/smoke.js` — end-to-end smoke test for server health, isolated session creation, reconnect/resume, command-block capture, bidi output, and stopped-history cleanup.
+- `scripts/smoke.js` — end-to-end smoke test for server health, isolated session creation, reconnect, real web-server restart/resume, command-block capture, bidi output, and stopped-history cleanup.
 - `scripts/browser-regressions.js` — headless Chrome/CDP regression suite that starts an isolated server and verifies readable-terminal Hermes palette ANSI styles, safe clickable links, XSS-safe session metadata, API error handling, mobile toolbar/blocks layout, mouse-mode passthrough, empty-reader non-blanking, long Hermes scrollback readability, and no stale-capture flicker while typing.
 - `start.sh` / `stop.sh` — local lifecycle helpers.
 - `README.md` — user-facing run/security notes.
@@ -76,6 +82,9 @@ Important behavior:
 - Kill: UI/API explicitly kills the backing tmux session.
 - Clear stopped history: UI/API removes only stopped-session rows and their related block/event rows from SQLite; it does not kill active `tmux` sessions.
 - Previews: backend uses `tmux capture-pane` for sidebar previews and smoke-test resume evidence.
+- Attach PTYs are shared per session while clients are present, then torn down after an idle grace period; this never kills the backing tmux session.
+- WebSocket controller/spectator leases, heartbeat, bounded queues, and runtime snapshots protect fidelity and memory during reconnects or slow clients.
+- tmux pane history limits are applied before the real shell pane is created; private pane splits inherit zero history, and unknown recovered sessions default to private unless tmux explicitly marks them otherwise. Existing panes with nonzero immutable history capacity are quarantined and cannot be attached through Warpish.
 
 ### 2. Command blocks use scoped shell integration
 
@@ -111,6 +120,8 @@ This is especially important for Hermes/Persian output, where raw terminal order
 
 The app binds to `127.0.0.1` by default and requires a random local token. Non-loopback binds are refused in code unless `WARPISH_ALLOW_REMOTE=1` is explicitly set; if remote/mobile access is added later, put it behind an authenticated private network or gateway with stronger auth/TLS/allowlisting.
 
+Private mode is a persistence boundary, not an authentication mode: it suppresses shell command markers, block/output/preview storage, capture/export content, and tmux history. The current live screen remains visible to the attached user.
+
 ### 6. Git hygiene
 
 The repository tracks source, docs, scripts, and lockfiles only. It must not track local runtime state, terminal history, generated tokens, logs, or `node_modules`.
@@ -124,6 +135,8 @@ Local smoke test passed with these checks:
 - a session was created,
 - a command marker was sent through the browser/PTY path,
 - session resume was verified after reconnect,
+- the Node web server was restarted with a new PID while tmux stayed alive; the session, four SQLite blocks, terminal snapshot, and a new post-restart command were verified,
+- private create/split panes reported history limit and history size zero; blocks/events/preview/capture/export stayed empty, including after deleting and recovering SQLite session metadata,
 - sidebar preview contained the marker,
 - command block capture was verified,
 - block command was recorded,
@@ -144,6 +157,8 @@ Browser QA also verified:
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
+- Browser QA verified new-session CWD/profile/private fields, persistent terminal settings, live CWD updates, search, split/next-pane actions, stopped-history read-only mode, toolbar hit targets, and no console warnings/errors.
+- Browser regression verified Ctrl/Cmd+F does not leak a control byte, 140KB mixed UTF-8 input remains ordered, cross-session paste is cancelled, stopped history never queues input, and light theme colors reach the readable overlay.
 - Browser QA verified against the user's Word screenshot: prompt + `سلام عزیزم koja بودی` renders as an LTR prompt followed by one compact RTL suffix segment whose visual order matches Word (`سلام`/`عزیزم` on the right, `koja` as an LTR island, `بودی` on the left). Mixed output keeps Persian phrase runs and readable LTR/code islands.
 - Browser QA verified readable terminal interaction fixes: old live session reattach returns focus to `xterm-helper-textarea`; readable-mode keypresses use direct tmux-pane input if attach input is stale, with prompt-only stale recovery via `C-g C-u`; real keyboard input reached Terminal 44 and appeared in both DOM and `tmux capture-pane`; wheel over the readable surface expands from xterm's 23 visible rows to tmux-captured history (149/360 lines in QA) without sending `^[[A`/history input; synthetic inline suggestion text after the cursor renders as `.bidi-ghost` opacity `0.46`; live ANSI/palette/truecolor styles render as `.bidi-style-run` spans (`RED`, `GREEN`, bold blue, truecolor orange, and background color verified); alternate-screen Hermes chat on Terminal 55 was verified to use tmux-captured reader content instead of a blank/`Waiting for terminal output…` overlay or sparse `<F3>` xterm artifact; fast 320-line streaming output rendered only 3 readable redraws with the underlying xterm screen opacity at `0` only when reader content exists, reducing flicker.
 - Browser QA verified terminal typing after blur: with `Readable: on`, focus was moved to toolbar, then clicking the terminal surface returned focus to `xterm-helper-textarea`; real keyboard keypress `z` reached the PTY and produced `zsh: command not found: z`.
@@ -152,7 +167,8 @@ Browser QA also verified:
 
 - This is not a full Warp clone; it implements the core local workflow primitives first.
 - Command-block output is a preview, not a perfect structured transcript for every possible full-screen/TUI command.
-- Default readable terminal-mask rendering improves readability for normal text input echo/output; full-screen TUIs can still bypass this because they paint their own terminal grid.
+- Generic alternate-screen TUI detection switches to native/raw presentation automatically, but command-block output for arbitrary full-screen programs remains best-effort.
+- A profile is currently a validated session label/environment value, not a full shell-command/theme preset system.
 - Direct terminal typing is the only default input path; no input-mask section should split commands away from output. The readable mask is default-on, while raw xterm and blocks remain toggles so the terminal remains usable as a daily driver.
 - Existing tmux sessions created before the shell integration may not have complete command-block history.
 - Multi-user auth, TLS, public exposure, and remote/mobile access are intentionally not implemented yet.

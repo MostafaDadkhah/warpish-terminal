@@ -4,11 +4,12 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import WebSocket from 'ws';
 
 const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
-const projectRoot = new URL('..', import.meta.url).pathname;
+const projectRoot = fileURLToPath(new URL('..', import.meta.url));
 const smokeRoot = fs.mkdtempSync(path.join('/tmp', 'warpish-smoke-'));
 const smokeDataDir = path.join(smokeRoot, 'data');
 const smokeTokenFile = path.join(smokeRoot, 'token');
@@ -26,35 +27,56 @@ function isolatedTmuxEnvironment(extra = {}) {
   return env;
 }
 
-const child = spawn(process.execPath, ['server.js'], {
-  cwd: projectRoot,
-  env: isolatedTmuxEnvironment({
-    PORT: String(port),
-    HOST: '127.0.0.1',
-    WARPISH_DATA_DIR: smokeDataDir,
-    WARPISH_TOKEN_FILE: smokeTokenFile,
-    WARPISH_SESSION_PREFIX: smokePrefix,
-    WARPISH_SKIP_USER_ZSHRC: '1',
-    TMUX_TMPDIR: smokeTmuxDir,
-    TERM: 'dumb',
-    NO_COLOR: '1',
-    COLORTERM: '',
-  }),
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+function paneHistoryState(sessionId) {
+  const output = execFileSync(tmuxBin, [
+    'list-panes', '-s', '-t', sessionId, '-F', '#{pane_id}\t#{history_limit}\t#{history_size}',
+  ], { encoding: 'utf8', env: isolatedTmuxEnvironment() });
+  return output.trim().split('\n').filter(Boolean).map((line) => {
+    const [paneId, limit, size] = line.split('\t');
+    return { paneId, limit: Number(limit), size: Number(size) };
+  });
+}
 
+let child;
 let stdout = '';
 let stderr = '';
 let tokenUrl;
 let smokeSessionId;
 let stoppedCleanupSessionId;
+let privateSessionId;
+let quarantinedSessionId;
 
-child.stdout.on('data', (chunk) => {
-  stdout += chunk.toString();
-  const match = stdout.match(/URL: (http:\/\/[^\s]+)/);
-  if (match) tokenUrl = match[1];
-});
-child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+function startServerProcess() {
+  stdout = '';
+  stderr = '';
+  tokenUrl = undefined;
+  const serverProcess = spawn(process.execPath, ['server.js'], {
+    cwd: projectRoot,
+    env: isolatedTmuxEnvironment({
+      PORT: String(port),
+      HOST: '127.0.0.1',
+      WARPISH_DATA_DIR: smokeDataDir,
+      WARPISH_TOKEN_FILE: smokeTokenFile,
+      WARPISH_SESSION_PREFIX: smokePrefix,
+      WARPISH_SKIP_USER_ZSHRC: '1',
+      TMUX_TMPDIR: smokeTmuxDir,
+      TERM: 'dumb',
+      NO_COLOR: '1',
+      COLORTERM: '',
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  serverProcess.stdout.on('data', (chunk) => {
+    stdout += chunk.toString();
+    const match = stdout.match(/URL: (http:\/\/[^\s]+)/);
+    if (match) tokenUrl = match[1];
+  });
+  serverProcess.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  child = serverProcess;
+  return serverProcess;
+}
+
+startServerProcess();
 
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -75,6 +97,17 @@ async function waitForServer() {
     await delay(100);
   }
   throw new Error(`server did not print URL. stdout=${stdout} stderr=${stderr}`);
+}
+
+async function waitForSessionPreview({ token, sessionId, needle }) {
+  let lastSession = null;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const payload = await httpJson('/api/sessions', { token });
+    lastSession = payload.sessions?.find((session) => session.id === sessionId) || null;
+    if (lastSession?.preview?.includes(needle)) return lastSession;
+    await delay(100);
+  }
+  throw new Error(`session preview did not contain ${needle}. session=${JSON.stringify(lastSession)}`);
 }
 
 function httpResponse(pathname, {
@@ -481,6 +514,33 @@ async function wsUntilMarker({
   });
 }
 
+async function wsUntilServerError({ token, sessionId }) {
+  const wsUrl = new URL('/ws', tokenUrl);
+  wsUrl.protocol = 'ws:';
+  wsUrl.searchParams.set('token', token);
+  wsUrl.searchParams.set('sessionId', sessionId);
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const timer = setTimeout(() => {
+      try { ws.terminate(); } catch {}
+      reject(new Error('timeout waiting for WebSocket server-error'));
+    }, 5000);
+    ws.on('message', (raw) => {
+      try {
+        const message = JSON.parse(String(raw));
+        if (message.type !== 'server-error') return;
+        clearTimeout(timer);
+        try { ws.close(); } catch {}
+        resolve(message);
+      } catch {}
+    });
+    ws.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 async function waitForBlock({ token, sessionId, commandNeedle, outputNeedle }) {
   for (let i = 0; i < 160; i += 1) {
     const payload = await httpJson(`/api/sessions/${sessionId}/blocks`, { token });
@@ -530,6 +590,32 @@ try {
   const nonLoopbackBindRefusal = verifyNonLoopbackBindRefusal();
   const exclusiveDataDirOwnership = await verifyExclusiveDataDirOwnership(token);
   const security = await verifyHttpAndWebSocketSecurity(token);
+  quarantinedSessionId = `${smokePrefix}quarantine-${Date.now().toString(36)}`;
+  const quarantineSecret = `__WARPISH_QUARANTINE_SECRET_${Date.now().toString(36)}__`;
+  const quarantineScript = `import sys,time; print(${JSON.stringify(quarantineSecret)}); [print('legacy-private-history-%04d' % index) for index in range(100)]; sys.stdout.flush(); time.sleep(60)`;
+  execFileSync(tmuxBin, ['new-session', '-d', '-s', quarantinedSessionId, `python3 -c ${shellQuote(quarantineScript)}`], {
+    env: isolatedTmuxEnvironment(),
+    stdio: 'pipe',
+  });
+  execFileSync(tmuxBin, ['set-environment', '-t', quarantinedSessionId, 'WARPISH_PRIVATE_SESSION', '1'], { env: isolatedTmuxEnvironment() });
+  execFileSync(tmuxBin, ['set-environment', '-t', quarantinedSessionId, 'WARPISH_SESSION_PROFILE', 'legacy-private'], { env: isolatedTmuxEnvironment() });
+  await delay(250);
+  const quarantineSessions = await httpJson('/api/sessions', { token });
+  const quarantinedSession = quarantineSessions.sessions.find((session) => session.id === quarantinedSessionId);
+  const quarantineCapture = await httpJson(`/api/sessions/${quarantinedSessionId}/capture?lines=5000&ansi=1`, { token });
+  const quarantineWsError = await wsUntilServerError({ token, sessionId: quarantinedSessionId });
+  const quarantineHistoryState = paneHistoryState(quarantinedSessionId);
+  assert(
+    quarantinedSession?.private === true
+      && quarantinedSession.privacyQuarantined === true
+      && quarantinedSession.preview === ''
+      && !String(quarantineCapture.text || '').includes(quarantineSecret)
+      && quarantineWsError.code === 'private-history-quarantined'
+      && quarantineHistoryState.every((pane) => pane.limit > 0 && pane.size === 0),
+    'legacy private pane with nonzero history capacity was not fail-closed and quarantined',
+    { quarantinedSession, quarantineCapture, quarantineWsError, quarantineHistoryState },
+  );
+  const privateQuarantineVerified = true;
   const health = await httpJson('/healthz');
   const readiness = await httpJson('/readyz', { token });
   const indexHtml = await httpText('/', { token });
@@ -586,6 +672,24 @@ try {
     body: { title: 'Smoke resume session' },
   });
   smokeSessionId = created.session.id;
+  const normalHistoryState = paneHistoryState(smokeSessionId);
+  assert(
+    normalHistoryState.length === 1 && normalHistoryState.every((pane) => pane.limit === 50000),
+    'normal pane did not inherit configured 50000-line history limit at creation',
+    normalHistoryState,
+  );
+  const invalidRenameType = await httpResponse(`/api/sessions/${smokeSessionId}`, {
+    method: 'PATCH', token, body: { title: { unsafe: true } },
+  });
+  const invalidRenameControl = await httpResponse(`/api/sessions/${smokeSessionId}`, {
+    method: 'PATCH', token, body: { title: 'unsafe\nheader' },
+  });
+  assert(
+    invalidRenameType.status === 400 && invalidRenameControl.status === 400,
+    'rename API accepted a non-string or control-character title',
+    { invalidRenameType, invalidRenameControl },
+  );
+  const renameValidationVerified = true;
 
   const markerRegex = /__WARPISH_SMOKE__:[^$:\r\n]+:\/Users\/[^\r\n]+/;
   await wsUntilMarker({
@@ -595,6 +699,29 @@ try {
     markerRegex,
     directTmux: true,
   });
+  const forgedBlockId = `${smokeSessionId}-forged-marker`;
+  const forgedMarkerAfter = `__WARPISH_FORGED_MARKER_SURVIVED_${Date.now().toString(36)}__`;
+  const forgedMarkerOutput = `\x1b]697;Start;id=${forgedBlockId};started=1e300;command=${Buffer.from('echo forged').toString('base64')}\x07\n${forgedMarkerAfter}\n`;
+  const forgedMarkerScript = `import sys; sys.stdout.write(${JSON.stringify(forgedMarkerOutput)}); sys.stdout.flush()`;
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `python3 -c ${shellQuote(forgedMarkerScript)}\r`,
+    markerRegex: new RegExp(forgedMarkerAfter),
+    directTmux: true,
+  });
+  const malformedMarkerAfter = `__WARPISH_MALFORMED_MARKER_SURVIVED_${Date.now().toString(36)}__`;
+  const malformedMarkerScript = `import sys; sys.stdout.write('\\x1b]697;' + ('x' * 70000) + '\\n${malformedMarkerAfter}\\n'); sys.stdout.flush()`;
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `python3 -c ${shellQuote(malformedMarkerScript)}\r`,
+    markerRegex: new RegExp(malformedMarkerAfter),
+    directTmux: true,
+  });
+  const forgedMarkerBlocks = await httpJson(`/api/sessions/${smokeSessionId}/blocks`, { token });
+  assert(!forgedMarkerBlocks.blocks.some((blockItem) => blockItem.id === forgedBlockId), 'invalid forged OSC marker was persisted as a command block', forgedMarkerBlocks);
+  const markerHardeningVerified = true;
   const colorEnvironmentMarker = '__WARPISH_COLOR_ENV_OK__';
   const colorEnvironmentPrefix = `\x1b[38;2;205;127;50m${colorEnvironmentMarker}`;
   const colorEnvironmentOutput = await wsUntilMarker({
@@ -839,7 +966,7 @@ try {
     markerRegex: new RegExp(postRedrawMarker),
     directTmux: true,
   });
-  await waitForBlock({
+  const postRedrawBlock = await waitForBlock({
     token,
     sessionId: smokeSessionId,
     commandNeedle: postRedrawMarker,
@@ -859,6 +986,163 @@ try {
     after: redrawAfterDuplicateEnd,
   });
   const duplicateEndReplayVerified = true;
+
+  // Restart the actual web server while leaving this isolated tmux server and
+  // SQLite data directory intact. This verifies the production lifecycle, not
+  // merely a second WebSocket connection to the same Node process.
+  const restartResumeMarker = `__WARPISH_RESTART_RESUME_${Date.now().toString(36)}__`;
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `echo ${restartResumeMarker}\r`,
+    markerRegex: new RegExp(restartResumeMarker),
+    directTmux: true,
+  });
+  const restartMarkerBlock = await waitForBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: restartResumeMarker,
+    outputNeedle: restartResumeMarker,
+  });
+  const firstServerPid = child.pid;
+  await terminateChild(child, 5000);
+  assert(child.exitCode !== null || child.signalCode !== null, 'first web server did not exit before restart', {
+    pid: firstServerPid,
+    stdout,
+    stderr,
+  });
+  const tmuxSurvivedRestart = spawnSync(tmuxBin, ['has-session', '-t', smokeSessionId], {
+    env: isolatedTmuxEnvironment(),
+    stdio: 'ignore',
+    timeout: 3000,
+  });
+  assert(tmuxSurvivedRestart.status === 0, 'tmux session did not survive the web-server shutdown', {
+    sessionId: smokeSessionId,
+    status: tmuxSurvivedRestart.status,
+    error: tmuxSurvivedRestart.error?.message,
+  });
+
+  startServerProcess();
+  await waitForServer();
+  const restartedServerPid = child.pid;
+  const restartedToken = new URL(tokenUrl).searchParams.get('token');
+  assert(restartedServerPid !== firstServerPid, 'restart reused the original web-server process', {
+    firstServerPid,
+    restartedServerPid,
+  });
+  assert(restartedToken === token, 'server restart did not preserve the isolated runtime token', {
+    before: token,
+    after: restartedToken,
+  });
+  const restartReadiness = await httpJson('/readyz', { token: restartedToken });
+  assert(restartReadiness.ok === true, 'restarted server did not become ready', restartReadiness);
+
+  const restartedSessions = await httpJson('/api/sessions', { token: restartedToken });
+  const restartedSession = restartedSessions.sessions?.find((session) => session.id === smokeSessionId);
+  assert(restartedSession?.alive === true, 'persisted tmux session was not discoverable after web-server restart', {
+    sessionId: smokeSessionId,
+    sessions: restartedSessions.sessions,
+  });
+  const blocksAfterRestart = await httpJson(`/api/sessions/${smokeSessionId}/blocks`, { token: restartedToken });
+  const expectedPersistentBlocks = [block, finishedRedrawBlock, postRedrawBlock, restartMarkerBlock];
+  for (const expectedBlock of expectedPersistentBlocks) {
+    const persisted = blocksAfterRestart.blocks?.find((candidate) => candidate.id === expectedBlock.id);
+    assert(persisted, 'command block was missing after web-server restart', {
+      expectedBlock,
+      blockIds: blocksAfterRestart.blocks?.map((candidate) => candidate.id),
+    });
+    assert(persisted.status === expectedBlock.status && persisted.output === expectedBlock.output, 'command block changed across web-server restart', {
+      before: expectedBlock,
+      after: persisted,
+    });
+  }
+  const restartSnapshot = await wsUntilMarker({
+    token: restartedToken,
+    sessionId: smokeSessionId,
+    sendCommand: '',
+    markerRegex: new RegExp(restartResumeMarker),
+  });
+  assert(restartSnapshot.includes(restartResumeMarker), 'reconnected PTY snapshot did not restore the pre-restart terminal screen', restartSnapshot.slice(-1600));
+  const postRestartMarker = `__WARPISH_POST_RESTART_${Date.now().toString(36)}__`;
+  await wsUntilMarker({
+    token: restartedToken,
+    sessionId: smokeSessionId,
+    sendCommand: `echo ${postRestartMarker}\r`,
+    markerRegex: new RegExp(postRestartMarker),
+    directTmux: true,
+  });
+  const postRestartBlock = await waitForBlock({
+    token: restartedToken,
+    sessionId: smokeSessionId,
+    commandNeedle: postRestartMarker,
+    outputNeedle: postRestartMarker,
+  });
+  assert(postRestartBlock.status === 'success', 'resumed terminal could not complete a command after restart', postRestartBlock);
+  const serverRestartResumeVerified = true;
+
+  const privateCreated = await httpJson('/api/sessions', {
+    method: 'POST',
+    token: restartedToken,
+    body: { title: 'Private smoke session', profile: 'private-smoke', private: true },
+  });
+  privateSessionId = privateCreated.session.id;
+  let privateHistoryState = paneHistoryState(privateSessionId);
+  assert(
+    privateHistoryState.length === 1 && privateHistoryState.every((pane) => pane.limit === 0 && pane.size === 0),
+    'private pane retained tmux scrollback or inherited a nonzero history limit',
+    privateHistoryState,
+  );
+  const privateSecret = `__WARPISH_PRIVATE_SECRET_${Date.now().toString(36)}__`;
+  await wsUntilMarker({
+    token: restartedToken,
+    sessionId: privateSessionId,
+    sendCommand: `echo ${privateSecret}\r`,
+    markerRegex: new RegExp(privateSecret),
+    directTmux: true,
+  });
+  await httpJson(`/api/sessions/${privateSessionId}/panes`, {
+    method: 'POST',
+    token: restartedToken,
+    body: { direction: 'vertical' },
+  });
+  privateHistoryState = paneHistoryState(privateSessionId);
+  assert(
+    privateHistoryState.length === 2 && privateHistoryState.every((pane) => pane.limit === 0 && pane.size === 0),
+    'private split pane did not inherit zero scrollback',
+    privateHistoryState,
+  );
+  const privateSessions = await httpJson('/api/sessions', { token: restartedToken });
+  const privateSummary = privateSessions.sessions.find((session) => session.id === privateSessionId);
+  const privateCapture = await httpJson(`/api/sessions/${privateSessionId}/capture?lines=5000&ansi=1`, { token: restartedToken });
+  const privateExport = await httpJson(`/api/sessions/${privateSessionId}/export`, { token: restartedToken });
+  const privateBlocks = await httpJson(`/api/sessions/${privateSessionId}/blocks`, { token: restartedToken });
+  assert(privateSummary?.private === true && privateSummary.preview === '', 'private session leaked content into its sidebar summary', privateSummary);
+  assert(!String(privateCapture.text || '').includes(privateSecret) && privateCapture.private === true, 'private capture endpoint leaked terminal content', privateCapture);
+  assert(!String(privateExport.text || '').includes(privateSecret), 'private export leaked terminal content', privateExport);
+  assert(privateBlocks.blocks.length === 0, 'private command markers were retained as blocks', privateBlocks);
+  const privateDatabase = new Database(path.join(smokeDataDir, 'warpish.sqlite3'), { readonly: true });
+  const privateStoredBlocks = privateDatabase.prepare('SELECT COUNT(*) AS count FROM blocks WHERE session_id = ?').get(privateSessionId).count;
+  const privateStoredEvents = privateDatabase.prepare('SELECT COUNT(*) AS count FROM shell_events WHERE session_id = ?').get(privateSessionId).count;
+  privateDatabase.close();
+  assert(
+    privateStoredBlocks === 0 && privateStoredEvents === 0,
+    'private terminal content reached durable SQLite rows',
+    { privateStoredBlocks, privateStoredEvents },
+  );
+  const recoveryDatabase = new Database(path.join(smokeDataDir, 'warpish.sqlite3'));
+  recoveryDatabase.prepare('DELETE FROM sessions WHERE id = ?').run(privateSessionId);
+  recoveryDatabase.close();
+  const recoveredPrivateSessions = await httpJson('/api/sessions', { token: restartedToken });
+  const recoveredPrivate = recoveredPrivateSessions.sessions.find((session) => session.id === privateSessionId);
+  assert(
+    recoveredPrivate?.private === true
+      && recoveredPrivate.profile === 'private-smoke'
+      && recoveredPrivate.preview === '',
+    'private tmux session was adopted as non-private after SQLite metadata loss',
+    recoveredPrivate,
+  );
+  const privateModeVerified = true;
+  const privateRecoveryVerified = true;
 
   const stoppedCreated = await httpJson('/api/sessions', {
     method: 'POST',
@@ -882,19 +1166,54 @@ try {
     throw new Error(`stopped cleanup failed. payload=${JSON.stringify(cleanupPayload)}`);
   }
 
-  const listed = await httpJson('/api/sessions', { token });
-  const listedSession = listed.sessions.find((session) => session.id === smokeSessionId);
+  const sidebarPreviewMarker = `__WARPISH_SIDEBAR_PREVIEW_${Date.now().toString(36)}__`;
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `echo ${sidebarPreviewMarker}\r`,
+    markerRegex: new RegExp(sidebarPreviewMarker),
+    directTmux: true,
+  });
+  await waitForBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: sidebarPreviewMarker,
+    outputNeedle: sidebarPreviewMarker,
+  });
+  const listedSession = await waitForSessionPreview({
+    token,
+    sessionId: smokeSessionId,
+    needle: sidebarPreviewMarker,
+  });
+  const sidebarPreviewHasMarker = listedSession.preview.includes(sidebarPreviewMarker);
+  assert(sidebarPreviewHasMarker, 'sidebar preview marker was only reported, not verified', listedSession);
 
   console.log(JSON.stringify({
     ok: true,
     health,
     readinessOk: readiness.ok,
     security,
+    privateQuarantineVerified,
     nonLoopbackBindRefusal,
     exclusiveDataDirOwnership,
     createdSession: smokeSessionId,
     resumeVerified: Boolean(listedSession?.alive),
-    sidebarPreviewHasMarker: Boolean(listedSession?.preview?.includes('__WARPISH_SMOKE__')),
+    serverRestartResumeVerified,
+    privateModeVerified,
+    privateRecoveryVerified,
+    renameValidationVerified,
+    markerHardeningVerified,
+    privateHistoryState,
+    restart: {
+      firstServerPid,
+      restartedServerPid,
+      tmuxSessionSurvived: true,
+      sessionDiscovered: restartedSession.alive,
+      terminalSnapshotRestored: true,
+      persistedBlockCount: expectedPersistentBlocks.length,
+      postRestartCommandBlockId: postRestartBlock.id,
+    },
+    sidebarPreviewHasMarker,
     terminalNativeUiVerified,
     colorEnvironmentVerified,
     directTmuxInputVerified: true,
@@ -930,6 +1249,8 @@ try {
       const token = new URL(tokenUrl).searchParams.get('token');
       if (smokeSessionId) await httpJson(`/api/sessions/${smokeSessionId}?purge=1`, { method: 'DELETE', token });
       if (stoppedCleanupSessionId) await httpJson(`/api/sessions/${stoppedCleanupSessionId}?purge=1`, { method: 'DELETE', token });
+      if (privateSessionId) await httpJson(`/api/sessions/${privateSessionId}?purge=1`, { method: 'DELETE', token });
+      if (quarantinedSessionId) await httpJson(`/api/sessions/${quarantinedSessionId}?purge=1`, { method: 'DELETE', token });
     }
   } catch {}
   await terminateChild(child);

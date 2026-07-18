@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 function defaultMetadata() {
   return { sessions: {}, nextIndex: 1 };
@@ -22,6 +22,9 @@ function normalizeMetadata(meta) {
       continue;
     }
     record.id = record.id || id;
+    record.shell = typeof record.shell === 'string' ? record.shell : '';
+    record.profile = typeof record.profile === 'string' ? record.profile : 'default';
+    record.private = Boolean(record.private);
     if (!Array.isArray(record.blocks)) record.blocks = [];
   }
   return meta;
@@ -38,6 +41,9 @@ function databaseRecord(row) {
     lastPreview: row.last_preview || undefined,
     lastPreviewAt: row.last_preview_at || undefined,
     activeBlockId: row.active_block_id || undefined,
+    shell: row.shell || undefined,
+    profile: row.profile || 'default',
+    private: row.is_private === 1,
     blocks: [],
   };
 }
@@ -78,7 +84,10 @@ export function openStorage(databaseFile) {
       stopped_at TEXT,
       last_preview TEXT,
       last_preview_at TEXT,
-      active_block_id TEXT
+      active_block_id TEXT,
+      shell TEXT,
+      profile TEXT NOT NULL DEFAULT 'default',
+      is_private INTEGER NOT NULL DEFAULT 0 CHECK (is_private IN (0, 1))
     ) STRICT;
 
     CREATE TABLE IF NOT EXISTS blocks (
@@ -108,6 +117,10 @@ export function openStorage(databaseFile) {
     CREATE INDEX IF NOT EXISTS shell_events_pending
       ON shell_events(session_id, id) WHERE processed_at IS NULL;
   `);
+  const sessionColumns = new Set(database.pragma('table_info(sessions)').map((column) => column.name));
+  if (!sessionColumns.has('shell')) database.exec('ALTER TABLE sessions ADD COLUMN shell TEXT');
+  if (!sessionColumns.has('profile')) database.exec("ALTER TABLE sessions ADD COLUMN profile TEXT NOT NULL DEFAULT 'default'");
+  if (!sessionColumns.has('is_private')) database.exec('ALTER TABLE sessions ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0 CHECK (is_private IN (0, 1))');
   database.pragma(`user_version = ${SCHEMA_VERSION}`);
 
   const selectState = database.prepare('SELECT value FROM app_state WHERE key = ?');
@@ -122,10 +135,10 @@ export function openStorage(databaseFile) {
   const upsertSession = database.prepare(`
     INSERT INTO sessions (
       id, title, cwd, created_at, last_opened_at, stopped_at,
-      last_preview, last_preview_at, active_block_id
+      last_preview, last_preview_at, active_block_id, shell, profile, is_private
     ) VALUES (
       @id, @title, @cwd, @createdAt, @lastOpenedAt, @stoppedAt,
-      @lastPreview, @lastPreviewAt, @activeBlockId
+      @lastPreview, @lastPreviewAt, @activeBlockId, @shell, @profile, @isPrivate
     )
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
@@ -135,7 +148,10 @@ export function openStorage(databaseFile) {
       stopped_at = excluded.stopped_at,
       last_preview = excluded.last_preview,
       last_preview_at = excluded.last_preview_at,
-      active_block_id = excluded.active_block_id
+      active_block_id = excluded.active_block_id,
+      shell = excluded.shell,
+      profile = excluded.profile,
+      is_private = excluded.is_private
   `);
   const deleteBlocks = database.prepare('DELETE FROM blocks WHERE session_id = ?');
   const insertBlock = database.prepare(`
@@ -195,8 +211,12 @@ export function openStorage(databaseFile) {
         lastPreview: record.lastPreview || null,
         lastPreviewAt: record.lastPreviewAt || null,
         activeBlockId: record.activeBlockId || null,
+        shell: record.shell || null,
+        profile: String(record.profile || 'default').slice(0, 40),
+        isPrivate: record.private ? 1 : 0,
       });
       deleteBlocks.run(id);
+      if (record.private) continue;
       for (const [ordinal, rawBlock] of record.blocks.entries()) {
         const block = rawBlock || {};
         insertBlock.run({
