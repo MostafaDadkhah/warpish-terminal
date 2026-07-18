@@ -27,25 +27,22 @@ __warpish_emit() {
   command printf '\033]697;%s\007' "$1"
 }
 
-__warpish_file_event() {
-  if [[ -n "${WARPISH_EVENT_FILE:-}" ]]; then
-    command mkdir -p "${WARPISH_EVENT_FILE:h}" 2>/dev/null || true
-    command printf '%s\n' "$1" >> "$WARPISH_EVENT_FILE" 2>/dev/null || true
-    local event_size
-    event_size="$(command wc -c < "$WARPISH_EVENT_FILE" 2>/dev/null)" || return 0
-    if (( ${event_size:-0} > 1048576 )); then
-      local compact_file="${WARPISH_EVENT_FILE}.compact.$$.$RANDOM"
-      if command tail -c 524288 "$WARPISH_EVENT_FILE" > "$compact_file" 2>/dev/null; then
-        command mv -f "$compact_file" "$WARPISH_EVENT_FILE" 2>/dev/null || true
-      fi
-      command rm -f "$compact_file" 2>/dev/null || true
-    fi
-  fi
+__warpish_database_event() {
+  [[ -n "${WARPISH_DATABASE_FILE:-}" ]] || return 0
+  [[ -n "${WARPISH_EVENT_RECORDER:-}" ]] || return 0
+  [[ -n "${WARPISH_PYTHON:-}" ]] || return 0
+  [[ -n "${WARPISH_SESSION_ID:-}" ]] || return 0
+  command "$WARPISH_PYTHON" "$WARPISH_EVENT_RECORDER" \
+    --database "$WARPISH_DATABASE_FILE" \
+    --session-id "$WARPISH_SESSION_ID" \
+    --payload "$1" >/dev/null 2>&1 || true
 }
 
 __warpish_marker() {
+  # The database journal preserves markers across server restarts. OSC keeps
+  # the active browser responsive; the server de-duplicates replayed markers.
+  __warpish_database_event "$1"
   __warpish_emit "$1"
-  __warpish_file_event "$1"
 }
 
 __warpish_preexec() {

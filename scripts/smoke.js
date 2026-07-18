@@ -4,6 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
+import Database from 'better-sqlite3';
 import WebSocket from 'ws';
 
 const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
@@ -536,6 +537,8 @@ try {
   const pasteSafetyJs = await httpText('/paste-safety.js', { token });
   const stylesCss = await httpText('/styles.css', { token });
   const serverJs = fs.readFileSync(path.join(projectRoot, 'server.js'), 'utf8');
+  const storageJs = fs.readFileSync(path.join(projectRoot, 'storage.js'), 'utf8');
+  const shellIntegration = fs.readFileSync(path.join(projectRoot, 'scripts/warpish-shell-integration.zsh'), 'utf8');
   const sourceChecks = [
     ['legacy terminal input mask is absent', !indexHtml.includes('terminal-input-mask')],
     ['legacy RTL composer toggle is absent', !indexHtml.includes('composerToggle')],
@@ -565,7 +568,7 @@ try {
     ['empty reader cannot hide xterm', stylesCss.includes('body.bidi-mode:not(.bidi-reader-has-content) .bidi-reader') && stylesCss.includes('body.bidi-mode.bidi-reader-has-content #terminal .xterm-screen')],
     ['RTL reader lines retain explicit direction and plaintext bidi', stylesCss.includes('.bidi-line.rtl') && stylesCss.includes('direction: rtl') && stylesCss.includes('unicode-bidi: plaintext')],
     ['shell stays configurable and launches login-interactive', serverJs.includes("const SHELL = process.env.WARPISH_SHELL || '/bin/zsh'") && /shellQuote\(SHELL\),\s*['"]-l['"],\s*['"]-i['"]/.test(serverJs)],
-    ['metadata writes use per-process randomized temporary files', !serverJs.includes('`${METADATA_FILE}.tmp`') && /temporaryFile\s*=\s*`\$\{METADATA_FILE\}[^`]*\$\{process\.pid\}[^`]*\$\{crypto\.randomBytes\(/.test(serverJs)],
+    ['runtime persistence uses SQLite instead of JSON or event sidecar files', serverJs.includes('openStorage(DATABASE_FILE)') && storageJs.includes('CREATE TABLE IF NOT EXISTS sessions') && storageJs.includes('CREATE TABLE IF NOT EXISTS blocks') && storageJs.includes('CREATE TABLE IF NOT EXISTS shell_events') && shellIntegration.includes('__warpish_database_event') && !shellIntegration.includes('WARPISH_EVENT_FILE')],
     ['WebSocket input strips focus reports in JSON and raw modes', /function\s+stripTerminalFocusReports\s*\(/.test(serverJs) && serverJs.includes('stripTerminalFocusReports(String(raw))') && serverJs.includes('stripTerminalFocusReports(msg.data)')],
     ['WebSocket resize values remain bounded', /cols:\s*clampNumber\(msg\.cols,\s*120,\s*20,\s*300\)/.test(serverJs) && /rows:\s*clampNumber\(msg\.rows,\s*36,\s*5,\s*120\)/.test(serverJs)],
     ['terminal paste removes implicit submits and control injection on every input surface', indexHtml.includes('/paste-safety.js') && /function\s+prepareTerminalPasteText\s*\(/.test(appJs) && /function\s+handleTerminalPaste\s*\(/.test(appJs) && pasteSafetyJs.includes('withoutImplicitSubmit') && pasteSafetyJs.includes('withoutTerminalControls') && appJs.includes('event.stopImmediatePropagation()') && !/function\s+handleTerminalPaste\s*\([^)]*\)[\s\S]{0,180}(?:!bidiReaderEnabled|isXtermHelperTarget\(event\.target\)\) return)/.test(appJs)],
@@ -842,10 +845,13 @@ try {
     commandNeedle: postRedrawMarker,
     outputNeedle: postRedrawMarker,
   });
-  const metadataAfterRedraw = JSON.parse(fs.readFileSync(path.join(smokeDataDir, 'sessions.json'), 'utf8'));
-  const redrawEventFile = metadataAfterRedraw.sessions?.[smokeSessionId]?.eventFile;
-  assert(redrawEventFile, 'redraw replay regression could not locate the session event file', metadataAfterRedraw.sessions?.[smokeSessionId]);
-  fs.appendFileSync(redrawEventFile, `End;id=${finishedRedrawBlock.id};ended=${Date.now() / 1000};status=0\n`);
+  const smokeDatabaseFile = path.join(smokeDataDir, 'warpish.sqlite3');
+  const smokeDatabase = new Database(smokeDatabaseFile);
+  smokeDatabase.prepare('INSERT INTO shell_events (session_id, payload) VALUES (?, ?)').run(
+    smokeSessionId,
+    `End;id=${finishedRedrawBlock.id};ended=${Date.now() / 1000};status=0`,
+  );
+  smokeDatabase.close();
   const replayedBlocks = await httpJson(`/api/sessions/${smokeSessionId}/blocks`, { token });
   const redrawAfterDuplicateEnd = replayedBlocks.blocks?.find((candidate) => candidate.id === finishedRedrawBlock.id);
   assert(JSON.stringify(redrawAfterDuplicateEnd) === JSON.stringify(finishedRedrawBlock), 'duplicate/replayed End mutated historical block output or metadata', {

@@ -16,6 +16,8 @@ const appJs = read('public/app.js');
 const indexHtml = read('public/index.html');
 const pasteSafetyJs = read('public/paste-safety.js');
 const serverJs = read('server.js');
+const storageJs = read('storage.js');
+const shellIntegration = read('scripts/warpish-shell-integration.zsh');
 const stylesCss = read('public/styles.css');
 const smokeJs = read('scripts/smoke.js');
 const browserRegressionJs = read('scripts/browser-regressions.js');
@@ -36,6 +38,16 @@ if (/httpOnly:\s*false/.test(serverJs)) {
 
 if (!serverJs.includes('WARPISH_ALLOW_REMOTE') || !serverJs.includes('isAllowedOrigin')) {
   fail('server.js must preserve non-loopback bind guard and Origin checks.');
+}
+
+if (!packageJson.dependencies?.['better-sqlite3']
+  || !serverJs.includes('openStorage(DATABASE_FILE)')
+  || !storageJs.includes('CREATE TABLE IF NOT EXISTS sessions')
+  || !storageJs.includes('CREATE TABLE IF NOT EXISTS blocks')
+  || !storageJs.includes('CREATE TABLE IF NOT EXISTS shell_events')
+  || shellIntegration.includes('WARPISH_EVENT_FILE')
+  || !shellIntegration.includes('__warpish_database_event')) {
+  fail('Runtime session, block, and shell-event persistence must use the standalone SQLite database without JSON/event sidecar files.');
 }
 
 if (/\.toolbar-actions\s*\{[^}]*display:\s*none/s.test(stylesCss)) {

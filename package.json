@@ -8,7 +8,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "lint": "node scripts/lint.js",
-    "check": "npm run lint && node --check server.js && node --check public/app.js && node --check public/paste-safety.js && node --check scripts/smoke.js && node --check scripts/browser-regressions.js && node --check scripts/ui-stability-agent.js && node scripts/paste-safety.test.js && python3 -m py_compile scripts/pty-worker.py && zsh -n scripts/warpish-shell-integration.zsh && bash -n start.sh stop.sh && git diff --check",
+    "check": "npm run lint && node --check server.js && node --check storage.js && node --check public/app.js && node --check public/paste-safety.js && node --check scripts/smoke.js && node --check scripts/browser-regressions.js && node --check scripts/ui-stability-agent.js && node scripts/paste-safety.test.js && node scripts/hermes-choice-policy.test.js && node scripts/storage.test.js && python3 -m py_compile scripts/pty-worker.py scripts/record-shell-event.py && zsh -n scripts/warpish-shell-integration.zsh && bash -n start.sh stop.sh && git diff --check",
     "smoke": "node scripts/smoke.js",
     "regression": "node scripts/ui-stability-agent.js",
     "ui-agent": "node scripts/ui-stability-agent.js",
@@ -22,6 +22,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
+    "better-sqlite3": "^12.11.1",
     "express": "^5.2.1",
     "ws": "^8.17.1"
   }

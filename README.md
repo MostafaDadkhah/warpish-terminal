@@ -11,6 +11,7 @@ What it does:
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
 - Adds Warp-style command blocks for new sessions; the block panel is hidden by default and opens only when you ask for it.
+- Stores sessions, command blocks, previews, and the durable shell-event journal in the standalone `.warpish/warpish.sqlite3` database; runtime state is no longer persisted in JSON or per-session event files.
 - Uses a terminal-native layout: normal xterm input goes to the real shell, while input echo and output are shown through a default readable terminal mask. When an LTR shell prompt is followed by Persian/Arabic input, the prompt stays LTR and the typed suffix becomes a compact Word-style RTL segment; English commands, paths, flags, and code stay isolated LTR islands. The readable surface keeps typing focus across old-session reattaches, sends readable-mode keystrokes directly to the backing tmux pane when xterm attach input is stale, handles wheel scrolling through tmux-captured history instead of shell history, turns visible `http(s)`/`www` links into safe new-tab anchors, preserves live xterm and tmux-captured ANSI/truecolor styles, dims inline suggestions after the cursor, keeps tmux-captured full-screen/alternate-screen apps such as Hermes visible instead of showing an empty waiting overlay, and throttles redraws to avoid streaming flicker. You can toggle back to raw xterm with `Readable: off` for edge-case TUIs, or use `Mouse: raw` to keep the readable mask visible while passing mouse events through to xterm/TUI apps.
 - Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
 
@@ -39,6 +40,8 @@ cd warpish-terminal
 ```
 
 Note: stopping the web server does not necessarily kill live `tmux` sessions. Use the UI's `Kill session` button to stop a specific terminal session.
+
+On the first start after upgrading from the file-based storage version, Warpish imports `sessions.json` and legacy event files into SQLite, then moves the originals into a timestamped `.warpish/legacy-storage-*` recovery directory. All subsequent reads and writes use SQLite.
 
 Dev/manual:
 

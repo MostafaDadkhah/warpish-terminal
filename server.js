@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 
+import { migrateLegacyStorage, openStorage } from './storage.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const APP_NAME = 'warpish-terminal';
@@ -21,14 +23,15 @@ const PYTHON = process.env.PYTHON || '/usr/bin/python3';
 const TMUX = process.env.TMUX_BIN || findExecutable(['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'], 'tmux');
 const PREFIX = (process.env.WARPISH_SESSION_PREFIX || 'warpish-').replace(/[^a-z0-9-]/gi, '').toLowerCase() || 'warpish-';
 const DATA_DIR = path.resolve(process.env.WARPISH_DATA_DIR || path.join(__dirname, '.warpish'));
-const METADATA_FILE = path.join(DATA_DIR, 'sessions.json');
+const DATABASE_FILE = path.resolve(process.env.WARPISH_DATABASE_FILE || path.join(DATA_DIR, 'warpish.sqlite3'));
+const LEGACY_METADATA_FILE = path.join(DATA_DIR, 'sessions.json');
+const LEGACY_EVENTS_DIR = path.join(DATA_DIR, 'events');
 const ZDOTDIR = path.join(DATA_DIR, 'zdotdir');
-const EVENTS_DIR = path.join(DATA_DIR, 'events');
 const SHELL_INTEGRATION = path.join(__dirname, 'scripts/warpish-shell-integration.zsh');
+const SHELL_EVENT_RECORDER = path.join(__dirname, 'scripts/record-shell-event.py');
 const MAX_BLOCKS_PER_SESSION = 300;
 const MAX_BLOCK_OUTPUT_CHARS = 24000;
 const MAX_CAPTURE_CHARS = 500_000;
-const MAX_EVENT_READ_BYTES = 1_000_000;
 const BLOCK_OUTPUT_FLUSH_MS = 750;
 const MAX_WS_BUFFERED_BYTES = 4_000_000;
 const TOKEN_FILE = path.resolve(process.env.WARPISH_TOKEN_FILE || path.join(__dirname, '.auth-token'));
@@ -37,23 +40,33 @@ const INSTANCE_LOCK_ID = crypto.randomUUID();
 
 const activeBlockIds = new Map();
 const pendingBlockOutputs = new Map();
-const eventReadStates = new Map();
 const sessionRuntimes = new Map();
 let instanceLockOwned = false;
+let storage;
 
 ensureLocalBindAllowed();
 const TOKEN = process.env.WARPISH_TOKEN || readOrCreateToken(TOKEN_FILE);
 fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-fs.mkdirSync(EVENTS_DIR, { recursive: true, mode: 0o700 });
 try { fs.chmodSync(DATA_DIR, 0o700); } catch {}
-try { fs.chmodSync(EVENTS_DIR, 0o700); } catch {}
 try {
   acquireInstanceLock();
+  storage = openStorage(DATABASE_FILE);
+  const migration = migrateLegacyStorage(storage, {
+    metadataFile: LEGACY_METADATA_FILE,
+    eventsDir: LEGACY_EVENTS_DIR,
+  });
+  if (migration) {
+    console.log(`Migrated legacy session storage to SQLite. Recovery copy: ${migration.archiveDir}`);
+  }
 } catch (error) {
+  releaseInstanceLock();
   console.error(error.message || error);
   process.exit(1);
 }
-process.once('exit', releaseInstanceLock);
+process.once('exit', () => {
+  try { storage?.close(); } catch {}
+  releaseInstanceLock();
+});
 
 function findExecutable(candidates, fallback) {
   for (const candidate of candidates) {
@@ -126,13 +139,31 @@ function processIsAlive(pid) {
   }
 }
 
+function parseInstanceLock(text) {
+  const value = String(text || '').trim();
+  const [id, pid, startedAt, port] = value.split('\t');
+  if (id && /^\d+$/.test(pid || '')) {
+    return { id, pid: Number(pid), startedAt, port: Number(port) || null };
+  }
+
+  // Read the old lock shape during the storage migration without treating the
+  // lock as application JSON storage. This keeps a running pre-SQLite server
+  // protected from a second instance during a rolling local upgrade.
+  const legacyPid = Number(value.match(/"pid"\s*:\s*(\d+)/)?.[1]);
+  return {
+    id: value.match(/"id"\s*:\s*"([^"]+)"/)?.[1] || '',
+    pid: Number.isInteger(legacyPid) ? legacyPid : null,
+    port: Number(value.match(/"port"\s*:\s*(\d+)/)?.[1]) || null,
+  };
+}
+
 function acquireInstanceLock() {
   fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let fd;
     try {
       fd = fs.openSync(INSTANCE_LOCK_FILE, 'wx', 0o600);
-      fs.writeFileSync(fd, `${JSON.stringify({ id: INSTANCE_LOCK_ID, pid: process.pid, startedAt: new Date().toISOString(), port: PORT })}\n`);
+      fs.writeFileSync(fd, `${INSTANCE_LOCK_ID}\t${process.pid}\t${new Date().toISOString()}\t${PORT}\n`);
       fs.closeSync(fd);
       fd = null;
       instanceLockOwned = true;
@@ -146,7 +177,7 @@ function acquireInstanceLock() {
       let owner = null;
       let ageMs = 0;
       try {
-        owner = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
+        owner = parseInstanceLock(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
         ageMs = Date.now() - fs.statSync(INSTANCE_LOCK_FILE).mtimeMs;
       } catch {
         try { ageMs = Date.now() - fs.statSync(INSTANCE_LOCK_FILE).mtimeMs; } catch {}
@@ -169,7 +200,7 @@ function acquireInstanceLock() {
 function releaseInstanceLock() {
   if (!instanceLockOwned) return;
   try {
-    const owner = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
+    const owner = parseInstanceLock(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
     if (owner?.id === INSTANCE_LOCK_ID) fs.unlinkSync(INSTANCE_LOCK_FILE);
   } catch {}
   instanceLockOwned = false;
@@ -230,58 +261,12 @@ function isValidSessionId(id) {
   return typeof id === 'string' && id.startsWith(PREFIX) && /^[a-z0-9-]+$/.test(id);
 }
 
-function defaultMetadata() {
-  return { sessions: {}, nextIndex: 1 };
-}
-
-function normalizeMetadata(meta) {
-  if (!meta || typeof meta !== 'object') return defaultMetadata();
-  if (!meta.sessions || typeof meta.sessions !== 'object' || Array.isArray(meta.sessions)) meta.sessions = {};
-  const nextIndex = Number(meta.nextIndex);
-  meta.nextIndex = Number.isFinite(nextIndex) && nextIndex > 0 ? Math.floor(nextIndex) : Object.keys(meta.sessions).length + 1;
-  for (const [id, record] of Object.entries(meta.sessions)) {
-    if (!record || typeof record !== 'object') {
-      delete meta.sessions[id];
-      continue;
-    }
-    record.id = record.id || id;
-    if (!Array.isArray(record.blocks)) record.blocks = [];
-  }
-  return meta;
-}
-
-function quarantineCorruptMetadata(error) {
-  try {
-    if (!fs.existsSync(METADATA_FILE)) return;
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const corruptPath = `${METADATA_FILE}.corrupt-${stamp}`;
-    fs.renameSync(METADATA_FILE, corruptPath);
-    console.error(`Warpish metadata was corrupt and was moved to ${corruptPath}: ${error.message || error}`);
-  } catch (moveError) {
-    console.error(`Warpish metadata is corrupt and could not be moved aside: ${moveError.message || moveError}`);
-  }
-}
-
 function readMetadata() {
-  try {
-    return normalizeMetadata(JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8')));
-  } catch (error) {
-    if (error?.code === 'ENOENT') return defaultMetadata();
-    quarantineCorruptMetadata(error);
-    return defaultMetadata();
-  }
+  return storage.readMetadata();
 }
 
 function writeMetadata(meta) {
-  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  const temporaryFile = `${METADATA_FILE}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(temporaryFile, JSON.stringify(meta, null, 2), { mode: 0o600 });
-    fs.chmodSync(temporaryFile, 0o600);
-    fs.renameSync(temporaryFile, METADATA_FILE);
-  } finally {
-    try { fs.unlinkSync(temporaryFile); } catch {}
-  }
+  storage.writeMetadata(meta);
 }
 
 function runTmux(args, options = {}) {
@@ -328,7 +313,7 @@ function ensureShellIntegration() {
   fs.writeFileSync(path.join(ZDOTDIR, '.zshrc'), zshrc);
 }
 
-function warpishShellCommand(sessionId, eventFile) {
+function warpishShellCommand(sessionId) {
   ensureShellIntegration();
   return [
     '/usr/bin/env',
@@ -337,7 +322,9 @@ function warpishShellCommand(sessionId, eventFile) {
     'COLORTERM=truecolor',
     'WARPISH_TERMINAL=1',
     `WARPISH_SESSION_ID=${shellQuote(sessionId)}`,
-    `WARPISH_EVENT_FILE=${shellQuote(eventFile)}`,
+    `WARPISH_DATABASE_FILE=${shellQuote(DATABASE_FILE)}`,
+    `WARPISH_EVENT_RECORDER=${shellQuote(SHELL_EVENT_RECORDER)}`,
+    `WARPISH_PYTHON=${shellQuote(PYTHON)}`,
     'WARPISH_BLOCK_INTEGRATION=1',
     `ZDOTDIR=${shellQuote(ZDOTDIR)}`,
     shellQuote(SHELL),
@@ -410,7 +397,7 @@ function normalizeBlock(block) {
 }
 
 function getBlocks(sessionId) {
-  reconcileEventFile(sessionId);
+  reconcileDatabaseEvents(sessionId);
   if (!flushPendingBlockOutput(sessionId)) refreshActiveBlockOutput(sessionId);
   const meta = readMetadata();
   const record = meta.sessions?.[sessionId];
@@ -491,7 +478,7 @@ function finishBlock(sessionId, marker) {
     return normalizeBlock(block);
   }
 
-  // End markers are intentionally replayable (OSC plus the event file). Settle
+  // End markers are intentionally replayable (OSC plus the database journal). Settle
   // and persist only on the first running -> finished transition; historical or
   // duplicate End events must never overwrite an older block with today's pane.
   flushPendingBlockOutput(sessionId, id);
@@ -523,66 +510,21 @@ function handleBlockMarker(sessionId, payload) {
   return null;
 }
 
-function eventFileForSession(sessionId) {
-  const meta = readMetadata();
-  return meta.sessions?.[sessionId]?.eventFile || path.join(EVENTS_DIR, `${sessionId}.events`);
-}
-
-function reconcileEventFile(sessionId, onBlockEvent = () => {}) {
-  const file = eventFileForSession(sessionId);
-  let stat;
-  try {
-    stat = fs.statSync(file);
-  } catch {
-    return;
-  }
-
-  let state = eventReadStates.get(sessionId) || { ino: stat.ino, offset: 0, remainder: '' };
-  if (state.ino !== stat.ino || stat.size < state.offset) {
-    state = { ino: stat.ino, offset: 0, remainder: '' };
-  }
-  if (stat.size === state.offset) {
-    eventReadStates.set(sessionId, state);
-    return;
-  }
-
-  let start = state.offset;
-  let discardPartialFirstLine = false;
-  if (start === 0 && stat.size > MAX_EVENT_READ_BYTES) {
-    start = stat.size - MAX_EVENT_READ_BYTES;
-    discardPartialFirstLine = true;
-  }
-
-  const length = stat.size - start;
-  const buffer = Buffer.alloc(length);
-  const fd = fs.openSync(file, 'r');
-  try {
-    fs.readSync(fd, buffer, 0, length, start);
-  } finally {
-    fs.closeSync(fd);
-  }
-  state.ino = stat.ino;
-  state.offset = stat.size;
-  let text = state.remainder + buffer.toString('utf8');
-  if (discardPartialFirstLine) {
-    const firstNewline = text.indexOf('\n');
-    text = firstNewline === -1 ? '' : text.slice(firstNewline + 1);
-  }
-  const lines = text.split('\n');
-  state.remainder = lines.pop() || '';
-  eventReadStates.set(sessionId, state);
-
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    const event = handleBlockMarker(sessionId, line.trim());
+function reconcileDatabaseEvents(sessionId, onBlockEvent = () => {}) {
+  const processedIds = [];
+  for (const row of storage.pendingEvents(sessionId)) {
+    const event = handleBlockMarker(sessionId, row.payload.trim());
     if (event?.block) onBlockEvent(event);
+    processedIds.push(row.id);
   }
+  storage.markEventsProcessed(processedIds);
+  if (processedIds.length) storage.pruneProcessedEvents(sessionId, 1000);
 }
 
 function createEventReader(sessionId, onBlockEvent) {
   return {
     poll() {
-      reconcileEventFile(sessionId, onBlockEvent);
+      reconcileDatabaseEvents(sessionId, onBlockEvent);
     },
   };
 }
@@ -1034,13 +976,11 @@ function createSession({ title, cwd } = {}) {
     if (fs.statSync(resolvedCwd).isDirectory()) safeCwd = resolvedCwd;
   } catch {}
   const sessionTitle = String(title || `Terminal ${index}`).trim().slice(0, 80) || `Terminal ${index}`;
-  const eventFile = path.join(EVENTS_DIR, `${id}.events`);
   let tmuxCreated = false;
   let metadataWritten = false;
 
   try {
-    fs.writeFileSync(eventFile, '', { mode: 0o600 });
-    runTmux(['new-session', '-d', '-s', id, '-c', safeCwd, warpishShellCommand(id, eventFile)]);
+    runTmux(['new-session', '-d', '-s', id, '-c', safeCwd, warpishShellCommand(id)]);
     tmuxCreated = true;
     runTmux(['set-option', '-t', id, 'status', 'off']);
     runTmux(['set-option', '-t', id, 'history-limit', '50000']);
@@ -1051,7 +991,9 @@ function createSession({ title, cwd } = {}) {
     runTmux(['set-environment', '-t', id, 'COLORTERM', 'truecolor']);
     runTmux(['set-environment', '-t', id, 'WARPISH_TERMINAL', '1']);
     runTmux(['set-environment', '-t', id, 'WARPISH_SESSION_ID', id]);
-    runTmux(['set-environment', '-t', id, 'WARPISH_EVENT_FILE', eventFile]);
+    runTmux(['set-environment', '-t', id, 'WARPISH_DATABASE_FILE', DATABASE_FILE]);
+    runTmux(['set-environment', '-t', id, 'WARPISH_EVENT_RECORDER', SHELL_EVENT_RECORDER]);
+    runTmux(['set-environment', '-t', id, 'WARPISH_PYTHON', PYTHON]);
     runTmux(['set-environment', '-t', id, 'WARPISH_BLOCK_INTEGRATION', '1']);
     runTmux(['set-environment', '-t', id, 'ZDOTDIR', ZDOTDIR]);
 
@@ -1062,7 +1004,6 @@ function createSession({ title, cwd } = {}) {
       cwd: safeCwd,
       createdAt: now.toISOString(),
       lastOpenedAt: now.toISOString(),
-      eventFile,
       blocks: [],
     };
     writeMetadata(meta);
@@ -1080,7 +1021,6 @@ function createSession({ title, cwd } = {}) {
       delete rollbackMeta.sessions?.[id];
       try { writeMetadata(rollbackMeta); } catch {}
     }
-    try { fs.unlinkSync(eventFile); } catch {}
     clearSessionTransientState(id);
     throw error;
   }
@@ -1107,7 +1047,6 @@ function clearSessionTransientState(id) {
   if (pending?.timer) clearTimeout(pending.timer);
   pendingBlockOutputs.delete(id);
   activeBlockIds.delete(id);
-  eventReadStates.delete(id);
 }
 
 function killSession(id) {
@@ -1141,9 +1080,7 @@ function purgeSession(id) {
   if (!record) return false;
   delete meta.sessions[id];
   writeMetadata(meta);
-  if (record.eventFile) {
-    try { fs.unlinkSync(record.eventFile); } catch {}
-  }
+  storage.deleteShellEvents(id);
   clearSessionTransientState(id);
   return true;
 }
@@ -1159,13 +1096,11 @@ function purgeStoppedSessions() {
   const active = activeResult.sessions;
   const purged = [];
 
-  for (const [id, record] of Object.entries(meta.sessions || {})) {
+  for (const id of Object.keys(meta.sessions || {})) {
     if (active.has(id)) continue;
     purged.push(id);
     delete meta.sessions[id];
-    if (record.eventFile) {
-      try { fs.unlinkSync(record.eventFile); } catch {}
-    }
+    storage.deleteShellEvents(id);
     clearSessionTransientState(id);
   }
 
@@ -1347,7 +1282,11 @@ function readinessReport() {
       return true;
     } catch { return false; }
   })(), DATA_DIR);
+  add('sqlite-database', (() => {
+    try { return storage.check(); } catch { return false; }
+  })(), DATABASE_FILE);
   add('pty-worker-present', fs.existsSync(path.join(__dirname, 'scripts/pty-worker.py')), 'scripts/pty-worker.py');
+  add('shell-event-recorder-present', fs.existsSync(SHELL_EVENT_RECORDER), 'scripts/record-shell-event.py');
   return { ok: checks.every((check) => check.ok), checks };
 }
 
@@ -1590,7 +1529,7 @@ function closeRuntimeSubscribers(runtime, message) {
 }
 
 function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
-  reconcileEventFile(session.id);
+  reconcileDatabaseEvents(session.id);
   try {
     // Existing tmux sessions may predate the create-time option below. Keep
     // attach idempotent so raw-mode TUIs can receive browser focus events too.

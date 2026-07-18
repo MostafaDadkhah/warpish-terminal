@@ -32,7 +32,7 @@ Never add these to git:
 If you touch `.gitignore`, verify ignored files with:
 
 ```bash
-git check-ignore -v .auth-token .server.pid .warpish/sessions.json node_modules/.package-lock.json scripts/__pycache__/x.pyc
+git check-ignore -v .auth-token .server.pid .warpish/warpish.sqlite3 node_modules/.package-lock.json scripts/__pycache__/x.pyc
 ```
 
 ## Core commands
@@ -92,6 +92,12 @@ bash -n start.sh stop.sh
   - tmux session creation/attach/resize/kill/capture.
   - Command block event parsing/storage.
 
+- `storage.js`
+  - Owns the standalone SQLite schema and transactional session/block/event persistence.
+
+- `scripts/record-shell-event.py`
+  - Journals zsh command start/end markers directly into SQLite.
+
 - `scripts/pty-worker.py`
   - Owns the PTY.
   - Runs `tmux attach-session`.
@@ -145,7 +151,7 @@ bash -n start.sh stop.sh
 - A browser reload or WebSocket close must detach only the current attach process.
 - It must not kill the tmux session.
 - The UI `Kill session` action is the intentional destructive path for live shells.
-- The UI `Clear stopped` action may purge stopped history metadata/event files, but it must not kill active `tmux` sessions.
+- The UI `Clear stopped` action may purge stopped-session rows and their related block/event rows, but it must not kill active `tmux` sessions.
 - Sidebar previews should come from actual tmux pane content, not fabricated state.
 
 ### Command blocks

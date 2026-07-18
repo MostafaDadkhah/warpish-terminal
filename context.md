@@ -18,7 +18,7 @@ Implemented capabilities:
   - attached count,
   - recent output preview,
   - click-to-reattach behavior,
-  - clear-stopped-history control that purges only stopped metadata/events and keeps live `tmux` sessions running.
+  - clear-stopped-history control that purges only stopped SQLite session/block/event rows and keeps live `tmux` sessions running.
 - Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
 - Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask keeps LTR shell prompts separate from compact Word-style RTL suffix segments while preserving English commands, paths, flags, and code as isolated LTR islands.
 - The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs. The readable surface owns wheel scrolling when enabled: it stops wheel events from becoming shell history/navigation input, refreshes tmux-captured history when xterm has no scrollback, preserves xterm focus for old-session reattaches, and uses direct tmux-pane input for readable-mode keystrokes when attach-session input is stale.
@@ -40,7 +40,9 @@ Implemented capabilities:
 
 Main files:
 
-- `server.js` — Express server, WebSocket endpoint, session API, tmux orchestration, command-block storage, auth, static assets.
+- `server.js` — Express server, WebSocket endpoint, session API, tmux orchestration, command-block coordination, auth, static assets.
+- `storage.js` — standalone SQLite schema and transactional persistence for sessions, command blocks, previews, and the shell-event journal.
+- `scripts/record-shell-event.py` — writes durable zsh start/end markers directly to SQLite so command history survives web-server restarts without sidecar files.
 - `scripts/pty-worker.py` — Python worker that owns the attach PTY and bridges PTY I/O to the Node process.
 - `scripts/warpish-shell-integration.zsh` — scoped zsh integration that emits command start/end events through `preexec`/`precmd`.
 - `public/index.html` — app shell markup.
@@ -72,7 +74,7 @@ Important behavior:
 - Attach session: backend starts `tmux attach-session` inside `scripts/pty-worker.py`.
 - Detach: browser/WS close stops the attach process only.
 - Kill: UI/API explicitly kills the backing tmux session.
-- Clear stopped history: UI/API removes only metadata/event files for sessions with no active `tmux` backing session.
+- Clear stopped history: UI/API removes only stopped-session rows and their related block/event rows from SQLite; it does not kill active `tmux` sessions.
 - Previews: backend uses `tmux capture-pane` for sidebar previews and smoke-test resume evidence.
 
 ### 2. Command blocks use scoped shell integration
@@ -84,7 +86,7 @@ Current pattern:
 - The backend launches new sessions with an isolated `ZDOTDIR` under runtime state.
 - That generated zsh config sources the user's normal zsh startup files, then sources `scripts/warpish-shell-integration.zsh`.
 - The integration uses `preexec` to mark command start and `precmd` to mark command end.
-- Start/end events are written to a per-session event file under runtime state.
+- Start/end events are journaled in SQLite by `scripts/record-shell-event.py`.
 - OSC markers are also emitted for terminal-stream compatibility, but they are not trusted as the only mechanism because tmux can filter or replay OSC/control sequences.
 
 ### 3. Command output is derived carefully
