@@ -95,11 +95,52 @@ __warpish_hermes_should_force_cli() {
   return 1
 }
 
+typeset -gr __WARPISH_HERMES_CHOICE_PROMPT_MARKER='[warpish-terminal:clarify-choices:v2]'
+typeset -gr __WARPISH_HERMES_CHOICE_PROMPT='[warpish-terminal:clarify-choices:v2] Warpish Terminal interaction contract: whenever you call the clarify tool, always provide 2 to 4 short, mutually exclusive, context-aware choices. Never omit choices or pass an empty choices array. Hermes automatically adds the Other free-text row, so do not add an Other choice yourself.'
+
+__warpish_hermes_ephemeral_prompt() {
+  emulate -L zsh
+  local existing="${HERMES_EPHEMERAL_SYSTEM_PROMPT:-}"
+
+  # Hermes appends this prompt at API-call time, including for sessions whose
+  # original stable system prompt is restored from the resume database.
+  # Preserve a caller-provided prompt and append the host contract once.
+  if [[ "$existing" == *"$__WARPISH_HERMES_CHOICE_PROMPT_MARKER"* ]]; then
+    command printf '%s' "$existing"
+  elif [[ -n "$existing" ]]; then
+    command printf '%s\n\n%s' "$existing" "$__WARPISH_HERMES_CHOICE_PROMPT"
+  else
+    command printf '%s' "$__WARPISH_HERMES_CHOICE_PROMPT"
+  fi
+}
+
+__warpish_hermes_should_apply_choice_prompt() {
+  emulate -L zsh
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == --safe-mode ]] && return 1
+  done
+  return 0
+}
+
 hermes() {
   emulate -L zsh
+  local choice_prompt=''
+  if __warpish_hermes_should_apply_choice_prompt "$@"; then
+    choice_prompt="$(__warpish_hermes_ephemeral_prompt)"
+  fi
+
   if __warpish_hermes_should_force_cli "$@"; then
-    command hermes --cli "$@"
+    if [[ -n "$choice_prompt" ]]; then
+      HERMES_EPHEMERAL_SYSTEM_PROMPT="$choice_prompt" command hermes --cli "$@"
+    else
+      command hermes --cli "$@"
+    fi
   else
-    command hermes "$@"
+    if [[ -n "$choice_prompt" ]]; then
+      HERMES_EPHEMERAL_SYSTEM_PROMPT="$choice_prompt" command hermes "$@"
+    else
+      command hermes "$@"
+    fi
   fi
 }
