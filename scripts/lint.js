@@ -13,6 +13,8 @@ function fail(message) {
 }
 
 const appJs = read('public/app.js');
+const indexHtml = read('public/index.html');
+const pasteSafetyJs = read('public/paste-safety.js');
 const serverJs = read('server.js');
 const stylesCss = read('public/styles.css');
 const smokeJs = read('scripts/smoke.js');
@@ -70,6 +72,23 @@ if (/\bspawnSync\b/.test(uiAgentJs)) {
 
 if (packageJson.scripts?.regression !== 'node scripts/ui-stability-agent.js') {
   fail('package.json regression must run the browser suite once through the UI stability validator.');
+}
+
+if (!/function\s+prepareTerminalPasteText\s*\(/.test(appJs)
+  || !/function\s+handleTerminalPaste\s*\(/.test(appJs)
+  || !indexHtml.includes('<script src="/paste-safety.js"></script>')
+  || !pasteSafetyJs.includes('withoutImplicitSubmit')
+  || !pasteSafetyJs.includes('withoutTerminalControls')
+  || !appJs.includes('event.stopImmediatePropagation()')
+  || /function\s+handleTerminalPaste\s*\([^)]*\)\s*\{\s*if\s*\(\s*!bidiReaderEnabled/.test(appJs)) {
+  fail('public/app.js must keep safe multiline paste interception and explicit-submit protection.');
+}
+
+if (/pending\.text\s*=/.test(serverJs)
+  || !/function\s+replaceBlockOutputFromPane\s*\(/.test(serverJs)
+  || !/block\.output\s*=\s*snapshot\.output/.test(serverJs)
+  || serverJs.includes('enrichFinishedBlockOutput')) {
+  fail('server.js must persist canonical tmux snapshots instead of appending raw PTY redraw chunks.');
 }
 
 if (failures.length) {

@@ -2,7 +2,6 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import WebSocket from 'ws';
@@ -11,18 +10,25 @@ const projectRoot = new URL('..', import.meta.url).pathname;
 const chromePath = process.env.CHROME_BIN || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const runtimeRoot = process.env.WARPISH_BROWSER_RUNTIME_ROOT
   ? path.resolve(process.env.WARPISH_BROWSER_RUNTIME_ROOT)
-  : fs.mkdtempSync(path.join(os.tmpdir(), 'warpish-browser-regressions-'));
+  : fs.mkdtempSync(path.join('/tmp', 'warpish-browser-regressions-'));
 fs.mkdirSync(runtimeRoot, { recursive: true });
 const dataDir = path.join(runtimeRoot, 'data');
 const tokenFile = path.join(runtimeRoot, 'token');
 const chromeProfile = path.join(runtimeRoot, 'chrome-profile');
+const tmuxTmpDir = path.join(runtimeRoot, 'tmux');
+fs.mkdirSync(tmuxTmpDir, { recursive: true, mode: 0o700 });
+const tmuxBin = process.env.TMUX_BIN
+  || ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find((candidate) => fs.existsSync(candidate))
+  || 'tmux';
 const sessionPrefix = (process.env.WARPISH_SESSION_PREFIX || `warpishreg-${process.pid.toString(36)}-`)
   .replace(/[^a-z0-9-]/gi, '')
   .toLowerCase() || `warpishreg-${process.pid.toString(36)}-`;
+const browserOnly = process.env.WARPISH_BROWSER_ONLY || '';
 const createdSessions = [];
 
 let server;
 let chrome;
+let browserPage;
 let tokenUrl;
 let token;
 let port;
@@ -30,6 +36,15 @@ let cdpPort;
 let chromeDiagnostics = { stdout: '', stderr: '', exit: null, error: null };
 
 function delay(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function isolatedTmuxEnvironment(extra = {}) {
+  const env = { ...process.env, ...extra, TMUX_TMPDIR: tmuxTmpDir };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  return env;
+}
+
+const tmuxEnvironment = isolatedTmuxEnvironment();
 
 function assert(condition, message, details = undefined) {
   if (!condition) {
@@ -131,15 +146,14 @@ async function startServer() {
   const stderrRef = { value: '' };
   server = spawn(process.execPath, ['server.js'], {
     cwd: projectRoot,
-    env: {
-      ...process.env,
+    env: isolatedTmuxEnvironment({
       HOST: '127.0.0.1',
       PORT: String(port),
       WARPISH_DATA_DIR: dataDir,
       WARPISH_TOKEN_FILE: tokenFile,
       WARPISH_SESSION_PREFIX: sessionPrefix,
       WARPISH_SKIP_USER_ZSHRC: '1',
-    },
+    }),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stdout.on('data', (chunk) => { stdoutRef.value += chunk.toString(); });
@@ -205,6 +219,11 @@ class CdpPage {
     this.nextId = 1;
     this.pending = new Map();
     this.events = [];
+    this.diagnostics = {
+      consoleErrors: [],
+      runtimeExceptions: [],
+      logEntries: [],
+    };
     this.ready = new Promise((resolve, reject) => {
       this.ws = new WebSocket(wsUrl);
       this.ws.on('open', resolve);
@@ -218,9 +237,59 @@ class CdpPage {
           else done(msg.result || {});
           return;
         }
+        this.recordDiagnostic(msg);
         this.events.push(msg);
       });
     });
+  }
+
+  recordDiagnostic(msg) {
+    if (msg.method === 'Runtime.consoleAPICalled' && ['error', 'assert'].includes(msg.params?.type)) {
+      this.diagnostics.consoleErrors.push({
+        type: msg.params.type,
+        timestamp: msg.params.timestamp,
+        args: (msg.params.args || []).map((arg) => arg.value ?? arg.unserializableValue ?? arg.description ?? arg.type),
+        stackTrace: msg.params.stackTrace,
+      });
+      return;
+    }
+    if (msg.method === 'Runtime.exceptionThrown') {
+      const details = msg.params?.exceptionDetails || {};
+      this.diagnostics.runtimeExceptions.push({
+        timestamp: msg.params?.timestamp,
+        text: details.text,
+        url: details.url,
+        lineNumber: details.lineNumber,
+        columnNumber: details.columnNumber,
+        exception: details.exception?.description || details.exception?.value,
+        stackTrace: details.stackTrace,
+      });
+      return;
+    }
+    if (msg.method === 'Log.entryAdded') {
+      const entry = msg.params?.entry;
+      if (entry && ['warning', 'error'].includes(entry.level)) {
+        this.diagnostics.logEntries.push(entry);
+        this.diagnostics.logEntries = this.diagnostics.logEntries.slice(-50);
+      }
+    }
+  }
+
+  diagnosticSnapshot() {
+    return {
+      consoleErrors: this.diagnostics.consoleErrors.slice(),
+      runtimeExceptions: this.diagnostics.runtimeExceptions.slice(),
+      recentLogEntries: this.diagnostics.logEntries.slice(),
+    };
+  }
+
+  assertNoUnhandledErrors(label = 'browser regression suite') {
+    const { consoleErrors, runtimeExceptions } = this.diagnostics;
+    assert(
+      consoleErrors.length === 0 && runtimeExceptions.length === 0,
+      `${label} emitted console errors or unhandled runtime exceptions`,
+      this.diagnosticSnapshot(),
+    );
   }
 
   async send(method, params = {}) {
@@ -243,6 +312,7 @@ class CdpPage {
   async init() {
     await this.send('Page.enable');
     await this.send('Runtime.enable');
+    await this.send('Log.enable');
   }
 
   async navigate(url) {
@@ -301,8 +371,11 @@ async function createSession(title, cwd = runtimeRoot) {
 }
 
 function respawnPane(sessionId, command) {
-  execFileSync('tmux', ['respawn-pane', '-k', '-t', sessionId, command], { stdio: 'pipe' });
+  execFileSync(tmuxBin, ['respawn-pane', '-k', '-t', sessionId, command], { stdio: 'pipe', env: tmuxEnvironment });
 }
+
+const HERMES_CONCEALED_SECRET = '__WARPISH_HERMES_CONCEALED_SECRET__';
+const HERMES_AFTER_CONCEAL = 'Hermes visible after conceal';
 
 function hermesPaletteDemoCommand() {
   const ESC = '\x1b';
@@ -311,21 +384,21 @@ function hermesPaletteDemoCommand() {
     + `${ESC}[38;2;255;248;220mWelcome to Hermes Agent! Type your message or /help for commands.${ESC}[0m\n`
     + `${ESC}[2;38;2;184;134;11m✦ Tip: BROWSER_CDP_URL connects browser tools to Chromium.${ESC}[0m\n`
     + `${ESC}[1;33m⚠ 57 commits behind${ESC}[0;2;33m — run ${ESC}[1mhermes update${ESC}[0;2;33m to update${ESC}[0m\n`
+    + `${ESC}[31mHermes themed base red${ESC}[0m\n`
     + `${ESC}[1;38;5;71m[██░░░░░░░░]${ESC}[0m${ESC}[38;5;136m${ESC}[48;5;234m 18% │ 7m │ ⏱ 3m 36s${ESC}[0m\n`
     + `${ESC}[38;5;173m────────────────────────────────────────${ESC}[0m\n`
+    + `${ESC}[38:2::205:127:50mHermes colon truecolor${ESC}[0m\n`
+    + `${ESC}[38:5:173mHermes colon 256${ESC}[0m\n`
+    + `${ESC}[7;38;2;10;20;30;48;2;240;230;220mHermes inverse pair${ESC}[0m\n`
+    + `${ESC}[8m${HERMES_CONCEALED_SECRET}${ESC}[28m${HERMES_AFTER_CONCEAL}${ESC}[0m\n`
     + `${ESC}[3;38;5;136m⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel${ESC}[0m\n`
     + `سلام Mostafa — خروجی فارسی/English باید خوانا بماند.\n`;
   const code = `import sys,time; sys.stdout.write(${JSON.stringify(screen)}); sys.stdout.flush(); time.sleep(90)`;
   return `python3 -c ${shellQuote(code)}`;
 }
 
-async function testHermesPaletteStyles(page) {
-  const session = await createSession('Hermes Palette Regression', path.join(runtimeRoot, 'hermes-palette-cwd'));
-  respawnPane(session.id, hermesPaletteDemoCommand());
-  await delay(800);
-  await page.navigate(`${tokenUrl}&case=hermes-palette`);
-  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Hermes Palette Regression')`, 15000, 'Hermes palette session selected');
-  const payload = await page.waitFor(`(() => {
+function hermesPaletteStateExpression() {
+  return `(() => {
     const lines = [...document.querySelectorAll('#bidiReaderLines .bidi-line')];
     if (!lines.some((line) => line.textContent.includes('Welcome to Hermes Agent'))) return false;
     const runs = [...document.querySelectorAll('#bidiReaderLines .bidi-style-run')].map((node) => ({
@@ -337,9 +410,24 @@ async function testHermesPaletteStyles(page) {
       opacity: getComputedStyle(node).opacity,
       style: node.getAttribute('style') || '',
     }));
-    return { text: lines.map((line) => line.textContent).join(String.fromCharCode(10)), runs };
-  })()`, 15000, 'styled Hermes palette reader output');
+    const xtermConceal = getReadableTerminalEntries().some((entry) =>
+      entry.segments?.some((segment) => segment.style?.invisible && segment.text.includes(${JSON.stringify(HERMES_CONCEALED_SECRET)})));
+    const captureConceal = capturedReaderHistoryState.entries.some((entry) =>
+      entry.segments?.some((segment) => segment.style?.invisible && segment.text.includes(${JSON.stringify(HERMES_CONCEALED_SECRET)})));
+    if (!xtermConceal || !captureConceal) return false;
+    return {
+      text: lines.map((line) => line.textContent).join(String.fromCharCode(10)),
+      logicalText: lines.map((line) => line.dataset.logicalText || '').join(String.fromCharCode(10)),
+      readerHtml: document.getElementById('bidiReaderLines')?.innerHTML || '',
+      xtermConceal,
+      captureConceal,
+      captureSuccessCount: bidiReaderCaptureSuccessCount,
+      runs,
+    };
+  })()`;
+}
 
+function assertHermesPalettePayload(payload) {
   const run = (needle) => payload.runs.find((item) => item.text.includes(needle));
   const border = run('Hermes border');
   const welcome = run('Welcome to Hermes Agent');
@@ -347,19 +435,342 @@ async function testHermesPaletteStyles(page) {
   const warning = run('57 commits behind');
   const progress = run('[██░░░░░░░░]');
   const progressMeta = run('18%');
+  const themedRed = run('Hermes themed base red');
+  const colonTruecolor = run('Hermes colon truecolor');
+  const colon256 = run('Hermes colon 256');
+  const inversePair = run('Hermes inverse pair');
   const promptHint = run('msg=interrupt');
 
   assert(border && /205\s*,\s*127\s*,\s*50/.test(border.color), 'Hermes border orange from captured SGR was not preserved', payload);
   assert(welcome && /255\s*,\s*248\s*,\s*220/.test(welcome.color), 'Hermes warm welcome foreground was not preserved', payload);
   assert(tip && /184\s*,\s*134\s*,\s*11/.test(tip.color) && Number(tip.opacity) < 1, 'Hermes dim gold tip styling was not preserved', payload);
-  assert(warning && /245\s*,\s*245\s*,\s*67/.test(warning.color) && Number.parseInt(warning.fontWeight, 10) >= 700, 'Hermes bold yellow warning styling was not preserved', payload);
+  assert(warning && /253\s*,\s*230\s*,\s*138/.test(warning.color) && Number.parseInt(warning.fontWeight, 10) >= 700, 'Hermes bold yellow warning styling did not match the xterm theme', payload);
   assert(progress && /95\s*,\s*175\s*,\s*95/.test(progress.color) && Number.parseInt(progress.fontWeight, 10) >= 700, 'Hermes green progress styling was not preserved', payload);
   assert(progressMeta && /175\s*,\s*135\s*,\s*0/.test(progressMeta.color) && /28\s*,\s*28\s*,\s*28/.test(progressMeta.backgroundColor), 'Hermes progress metadata foreground/background was not preserved', payload);
+  assert(themedRed && /251\s*,\s*113\s*,\s*133/.test(themedRed.color), 'base ANSI red did not match the raw xterm theme', payload);
+  assert(colonTruecolor && /205\s*,\s*127\s*,\s*50/.test(colonTruecolor.color), 'colon-form Hermes truecolor SGR was not preserved', payload);
+  assert(colon256 && /215\s*,\s*135\s*,\s*95/.test(colon256.color), 'colon-form Hermes 256-color SGR was not preserved', payload);
+  assert(inversePair && /240\s*,\s*230\s*,\s*220/.test(inversePair.color) && /10\s*,\s*20\s*,\s*30/.test(inversePair.backgroundColor), 'inverse ANSI foreground/background styling was not preserved', payload);
   assert(promptHint && /175\s*,\s*135\s*,\s*0/.test(promptHint.color) && promptHint.fontStyle === 'italic', 'Hermes prompt hint italic/gold styling was not preserved', payload);
+  assert(payload.text.includes(HERMES_AFTER_CONCEAL), 'SGR 28 did not restore visible terminal text', payload);
+  assert(!payload.text.includes(HERMES_CONCEALED_SECRET) && !payload.logicalText.includes(HERMES_CONCEALED_SECRET) && !payload.readerHtml.includes(HERMES_CONCEALED_SECRET), 'SGR 8 concealed text leaked into the readable DOM or copy surface', payload);
+  assert(payload.xtermConceal && payload.captureConceal, 'conceal styling was not preserved in both xterm and tmux capture paths', payload);
+}
+
+async function testHermesPaletteStyles(page) {
+  const session = await createSession('Hermes Palette Regression', path.join(runtimeRoot, 'hermes-palette-cwd'));
+  respawnPane(session.id, hermesPaletteDemoCommand());
+  await delay(800);
+  await page.navigate(`${tokenUrl}&case=hermes-palette`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Hermes Palette Regression')`, 15000, 'Hermes palette session selected');
+  const payload = await page.waitFor(hermesPaletteStateExpression(), 15000, 'styled Hermes palette reader output');
+  const samples = [payload];
+  for (let index = 0; index < 3; index += 1) {
+    await page.eval(`refreshBidiReaderFromCapture({ preferCapture: true })`);
+    await delay(750);
+    samples.push(await page.eval(hermesPaletteStateExpression()));
+  }
+  samples.forEach(assertHermesPalettePayload);
+  assert(samples.every((sample, index) => index === 0 || sample.captureSuccessCount >= samples[index - 1].captureSuccessCount), 'Hermes palette capture success counter regressed', samples);
+  assert(samples.at(-1).captureSuccessCount >= payload.captureSuccessCount + 3, 'Hermes palette refresh loop did not complete three successful tmux captures', samples.map((sample) => sample.captureSuccessCount));
 
   return {
     ok: true,
+    stableSamples: samples.length,
     styledRuns: payload.runs.filter((item) => item.style).map((item) => item.text),
+  };
+}
+
+async function testCapturedHistoryReducer(page) {
+  const payload = await page.eval(`(() => {
+    const entries = (prefix, count) => Array.from({ length: count }, (_, index) => ({ text: prefix + '_' + String(index).padStart(4, '0'), segments: [] }));
+    let state = reduceCapturedReaderHistory({}, entries('OLD', 200));
+    const initial = { count: state.entries.length, first: state.entries[0]?.text, last: state.entries.at(-1)?.text };
+    state = reduceCapturedReaderHistory(state, entries('SHORT', 20));
+    const firstShort = { count: state.entries.length, pending: Boolean(state.pendingReset), first: state.entries[0]?.text };
+    state = reduceCapturedReaderHistory(state, entries('NEW', 20));
+    const confirmedShort = { count: state.entries.length, pending: Boolean(state.pendingReset), first: state.entries[0]?.text };
+    state = reduceCapturedReaderHistory(state, entries('EQUAL_RESET', 20));
+    const equalReset = { count: state.entries.length, first: state.entries[0]?.text };
+    state = reduceCapturedReaderHistory(state, []);
+    const firstEmpty = { count: state.entries.length, pending: Boolean(state.pendingReset) };
+    state = reduceCapturedReaderHistory(state, []);
+    const confirmedEmpty = { count: state.entries.length, pending: Boolean(state.pendingReset), known: state.known };
+
+    let recovered = reduceCapturedReaderHistory({}, entries('RECOVER', 200));
+    recovered = reduceCapturedReaderHistory(recovered, entries('TRANSIENT', 10));
+    recovered = reduceCapturedReaderHistory(recovered, entries('RECOVERED', 201));
+    const recovery = { count: recovered.entries.length, pending: Boolean(recovered.pendingReset), first: recovered.entries[0]?.text };
+
+    const rolling = reduceCapturedReaderHistory({}, entries('ROLLING', 2500));
+
+    const savedCaptureState = {
+      mode: bidiReaderCaptureMode,
+      historyState: capturedReaderHistoryState,
+      historyRevision: capturedReaderHistoryRevision,
+      historyNeedsLiveScreen: capturedReaderHistoryNeedsLiveScreen,
+      screenKnown: capturedReaderScreenKnown,
+      screenEntries: capturedReaderScreenEntries,
+      screenRevision: capturedReaderScreenRevision,
+    };
+    capturedReaderHistoryState = { known: true, entries: entries('HISTORY_ONLY', 3), pendingReset: null, committed: true };
+    capturedReaderHistoryRevision = terminalOutputRevision;
+    capturedReaderHistoryNeedsLiveScreen = false;
+    capturedReaderScreenKnown = true;
+    capturedReaderScreenEntries = entries('SCREEN_ONLY', 2);
+    capturedReaderScreenRevision = terminalOutputRevision;
+    bidiReaderCaptureMode = 'screen';
+    const screenSelection = currentBidiReaderRenderState().entries.map((entry) => entry.text);
+    bidiReaderCaptureMode = 'history';
+    const historySelection = currentBidiReaderRenderState().entries.map((entry) => entry.text);
+    capturedReaderHistoryState = { known: true, entries: [], pendingReset: null, committed: true };
+    capturedReaderHistoryRevision = terminalOutputRevision;
+    const knownEmptySelection = currentBidiReaderRenderState().entries.map((entry) => entry.text);
+    bidiReaderCaptureMode = savedCaptureState.mode;
+    capturedReaderHistoryState = savedCaptureState.historyState;
+    capturedReaderHistoryRevision = savedCaptureState.historyRevision;
+    capturedReaderHistoryNeedsLiveScreen = savedCaptureState.historyNeedsLiveScreen;
+    capturedReaderScreenKnown = savedCaptureState.screenKnown;
+    capturedReaderScreenEntries = savedCaptureState.screenEntries;
+    capturedReaderScreenRevision = savedCaptureState.screenRevision;
+
+    const renderState = currentBidiReaderRenderState();
+    renderBidiReader(renderState.entries, { source: renderState.source });
+    const firstNode = document.getElementById('bidiReaderLines')?.firstElementChild;
+    renderBidiReader(renderState.entries, { force: true, source: renderState.source });
+    const identicalRenderPreserved = firstNode === document.getElementById('bidiReaderLines')?.firstElementChild;
+
+    const mixedPrefix = { text: '', segments: [] };
+    appendStyledSegmentsToEntry(mixedPrefix, 'plain-prefix ', []);
+    appendStyledSegmentsToEntry(mixedPrefix, 'colored-suffix', [{ text: 'colored-suffix', style: { fg: 'rgb(205, 127, 50)' } }]);
+    const mixedSuffix = { text: '', segments: [] };
+    appendStyledSegmentsToEntry(mixedSuffix, 'colored-prefix ', [{ text: 'colored-prefix ', style: { fg: 'rgb(205, 127, 50)' } }]);
+    appendStyledSegmentsToEntry(mixedSuffix, 'plain-suffix', []);
+    const mixedPrefixNode = document.createElement('div');
+    const mixedSuffixNode = document.createElement('div');
+    renderBidiLine(mixedPrefixNode, mixedPrefix);
+    renderBidiLine(mixedSuffixNode, mixedSuffix);
+    const mixedWrappedStyles = {
+      prefixText: mixedPrefixNode.textContent,
+      suffixText: mixedSuffixNode.textContent,
+      prefixCoverage: mixedPrefix.segments.map((segment) => segment.text).join(''),
+      suffixCoverage: mixedSuffix.segments.map((segment) => segment.text).join(''),
+    };
+    return {
+      initial,
+      firstShort,
+      confirmedShort,
+      equalReset,
+      firstEmpty,
+      confirmedEmpty,
+      recovery,
+      rolling: { count: rolling.entries.length, first: rolling.entries[0]?.text, last: rolling.entries.at(-1)?.text },
+      semanticCaches: { screenSelection, historySelection, knownEmptySelection },
+      identicalRenderPreserved,
+      mixedWrappedStyles,
+    };
+  })()`);
+
+  assert(payload.initial.count === 200 && payload.initial.first === 'OLD_0000', 'canonical history reducer did not accept its initial snapshot', payload);
+  assert(payload.firstShort.count === 200 && payload.firstShort.pending && payload.firstShort.first === 'OLD_0000', 'one transient short capture collapsed canonical history', payload);
+  assert(payload.confirmedShort.count === 20 && !payload.confirmedShort.pending && payload.confirmedShort.first === 'NEW_0000', 'confirmed history shrink was not committed', payload);
+  assert(payload.equalReset.count === 20 && payload.equalReset.first === 'EQUAL_RESET_0000', 'equal-length history discontinuity retained stale lines', payload);
+  assert(payload.firstEmpty.count === 20 && payload.firstEmpty.pending, 'first empty history snapshot was not held for confirmation', payload);
+  assert(payload.confirmedEmpty.known && payload.confirmedEmpty.count === 0 && !payload.confirmedEmpty.pending, 'confirmed empty history did not clear canonical scrollback', payload);
+  assert(payload.recovery.count === 201 && !payload.recovery.pending && payload.recovery.first === 'RECOVERED_0000', 'history recovery did not cancel a transient shrink', payload);
+  assert(payload.rolling.count === 2000 && payload.rolling.first === 'ROLLING_0500' && payload.rolling.last === 'ROLLING_2499', 'canonical history reducer did not enforce its 2000-line rolling window', payload);
+  assert(payload.semanticCaches.screenSelection.every((line) => line.startsWith('SCREEN_ONLY_')) && payload.semanticCaches.historySelection.every((line) => line.startsWith('HISTORY_ONLY_')), 'screen and history capture caches contaminated each other', payload);
+  assert(payload.semanticCaches.knownEmptySelection.length === 0, 'known-empty canonical history resurrected stale xterm scrollback', payload);
+  assert(payload.identicalRenderPreserved, 'identical reader content rebuilt the DOM despite the stable render key', payload);
+  assert(payload.mixedWrappedStyles.prefixText === 'plain-prefix colored-suffix' && payload.mixedWrappedStyles.prefixCoverage === payload.mixedWrappedStyles.prefixText, 'unstyled wrapped prefix disappeared before a colored continuation', payload);
+  assert(payload.mixedWrappedStyles.suffixText === 'colored-prefix plain-suffix' && payload.mixedWrappedStyles.suffixCoverage === payload.mixedWrappedStyles.suffixText, 'unstyled wrapped suffix disappeared after a colored prefix', payload);
+  return { ok: true, ...payload };
+}
+
+function hermesHistoryRedrawCommand({
+  topMarker,
+  bottomMarker,
+  readyMarker,
+  liveMarker,
+  tickMarker,
+  colorMarker,
+  triggerFile,
+  historyLines = 220,
+}) {
+  const script = [
+    'import os, sys, time',
+    `top = ${JSON.stringify(topMarker)}`,
+    `bottom = ${JSON.stringify(bottomMarker)}`,
+    `ready = ${JSON.stringify(readyMarker)}`,
+    `live = ${JSON.stringify(liveMarker)}`,
+    `tick_marker = ${JSON.stringify(tickMarker)}`,
+    `color = ${JSON.stringify(colorMarker)}`,
+    `trigger = ${JSON.stringify(triggerFile)}`,
+    `count = ${Number(historyLines)}`,
+    'ESC = "\\x1b"',
+    'for index in range(count):',
+    '    marker = top if index == 0 else (bottom if index == count - 1 else f"HISTORY_{index:03d}")',
+    '    sys.stdout.write(f"{ESC}[38;2;205;127;50m{color}{ESC}[0m ⚕ gpt-5.6-sol {marker} stable history line {index:03d}\\n")',
+    'sys.stdout.write(f"{ready}\\n")',
+    'sys.stdout.flush()',
+    'deadline = time.monotonic() + 45',
+    'while not os.path.exists(trigger) and time.monotonic() < deadline:',
+    '    time.sleep(0.02)',
+    'if not os.path.exists(trigger):',
+    '    raise SystemExit(42)',
+    'sys.stdout.write(f"{ESC}[?1049h")',
+    'sys.stdout.flush()',
+    'for tick in range(20):',
+    '    frame = [f"{ESC}[2J{ESC}[H", f"{ESC}[38;2;205;127;50m{live}{ESC}[0m Hermes live redraw\\n"]',
+    '    for row in range(1, 13):',
+    '        frame.append(f"alternate row {row:02d} tick {tick:02d}{ESC}[K\\n")',
+    '    frame.append(f"{ESC}[1;38;5;71m[██░░░░░░░░]{ESC}[0m {tick_marker} tick={tick:02d}{ESC}[K")',
+    '    sys.stdout.write("".join(frame))',
+    '    sys.stdout.flush()',
+    '    time.sleep(0.65)',
+    'time.sleep(30)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+async function testHermesReadableHistoryDoesNotOscillate(page) {
+  const suffix = Date.now().toString(36);
+  const topMarker = `H_TOP_${suffix}`;
+  const bottomMarker = `H_BOTTOM_${suffix}`;
+  const readyMarker = `H_READY_${suffix}`;
+  const liveMarker = `H_LIVE_${suffix}`;
+  const tickMarker = `H_TICK_${suffix}`;
+  const colorMarker = `H_BRICK_${suffix}`;
+  const triggerFile = path.join(runtimeRoot, `hermes-redraw-trigger-${suffix}`);
+  const session = await createSession('Hermes Readable Oscillation Regression', path.join(runtimeRoot, 'hermes-oscillation-cwd'));
+  await page.navigate(`${tokenUrl}&case=hermes-readable-oscillation`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Hermes Readable Oscillation Regression')`, 15000, 'Hermes oscillation session selected');
+  await page.waitFor(`terminalControlRole === 'controller'`, 15000, 'Hermes oscillation terminal controller');
+  await page.eval(`document.fonts?.ready || Promise.resolve()`);
+  const connectedRevision = await page.eval(`terminalOutputRevision`);
+
+  const stateExpression = `(() => {
+    const reader = document.getElementById('bidiReaderLines');
+    const lines = reader ? [...reader.querySelectorAll('.bidi-line:not(.empty-state)')] : [];
+    const logical = lines.map((line) => line.dataset.logicalText || line.textContent || '');
+    const colorRun = [...document.querySelectorAll('#bidiReaderLines .bidi-style-run')]
+      .find((node) => node.textContent.includes(${JSON.stringify(colorMarker)}));
+    const liveColorRun = [...document.querySelectorAll('#bidiReaderLines .bidi-style-run')]
+      .find((node) => node.textContent.includes(${JSON.stringify(liveMarker)}));
+    const tickLine = logical.find((line) => line.includes(${JSON.stringify(tickMarker)})) || '';
+    const tickMatch = tickLine.match(/tick=(\\d+)/);
+    return {
+      lineCount: lines.length,
+      scrollHeight: reader?.scrollHeight || 0,
+      maxScrollTop: reader ? Math.max(0, reader.scrollHeight - reader.clientHeight) : 0,
+      atBottom: reader ? Math.abs(reader.scrollHeight - reader.clientHeight - reader.scrollTop) <= 10 : false,
+      topCount: logical.filter((line) => line.includes(${JSON.stringify(topMarker)})).length,
+      bottomCount: logical.filter((line) => line.includes(${JSON.stringify(bottomMarker)})).length,
+      readyCount: logical.filter((line) => line.includes(${JSON.stringify(readyMarker)})).length,
+      liveCount: logical.filter((line) => line.includes(${JSON.stringify(liveMarker)})).length,
+      tick: tickMatch ? Number(tickMatch[1]) : -1,
+      revision: terminalOutputRevision,
+      captureAt: lastBidiReaderCaptureAt,
+      alternate: isTerminalAlternateBuffer(),
+      source: lastBidiReaderRenderSource,
+      captureMode: bidiReaderCaptureMode,
+      color: colorRun ? getComputedStyle(colorRun).color : '',
+      liveColor: liveColorRun ? getComputedStyle(liveColorRun).color : '',
+    };
+  })()`;
+
+  respawnPane(session.id, hermesHistoryRedrawCommand({
+    topMarker,
+    bottomMarker,
+    readyMarker,
+    liveMarker,
+    tickMarker,
+    colorMarker,
+    triggerFile,
+  }));
+  await page.waitFor(`(() => {
+    const state = ${stateExpression};
+    return state.topCount === 1 && state.bottomCount === 1 && state.readyCount === 1 && state.liveCount === 0
+      ? state
+      : false;
+  })()`, 20000, 'Hermes primary history before alternate transition');
+  await page.eval(`refreshBidiReaderFromCapture({ preferCapture: true, keepScroll: true })`);
+  const primary = await page.waitFor(`(() => {
+    const state = ${stateExpression};
+    return state.topCount === 1 && state.bottomCount === 1 && state.readyCount === 1 && state.liveCount === 0
+      && state.captureMode === 'history' && state.source === 'capture' && state.revision > ${Number(connectedRevision)}
+      ? state
+      : false;
+  })()`, 20000, 'canonical Hermes primary history capture');
+  const primaryCapture = await api(`/api/sessions/${session.id}/capture?lines=5000&ansi=1`);
+  assert(primaryCapture.usingAlternate === false && primaryCapture.alternateActive === false, 'primary Hermes history was misclassified as an alternate screen', primaryCapture);
+  assert(primaryCapture.text.includes(topMarker) && primaryCapture.text.includes(bottomMarker) && !primaryCapture.alternate.includes(liveMarker), 'primary Hermes history capture lost its stable markers', primaryCapture);
+
+  fs.writeFileSync(triggerFile, 'go');
+  const baseline = await page.waitFor(`(() => {
+    const state = ${stateExpression};
+    return state.topCount === 1 && state.bottomCount === 1 && state.liveCount === 1 && state.tick >= 2
+      && state.captureMode === 'history' && state.source === 'capture' && state.revision > ${Number(primary.revision)}
+      ? state
+      : false;
+  })()`, 20000, 'Hermes live primary-to-alternate transition');
+
+  let alternateCapture = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    alternateCapture = await api(`/api/sessions/${session.id}/capture?lines=5000&ansi=1`);
+    if (
+      alternateCapture.alternateActive === true
+      && alternateCapture.captureReason === 'normal-rich-history'
+      && alternateCapture.text.includes(topMarker)
+      && alternateCapture.text.includes(bottomMarker)
+      && alternateCapture.active.includes(liveMarker)
+      && alternateCapture.active.includes(tickMarker)
+    ) break;
+    await delay(100);
+  }
+  assert(alternateCapture?.captureReason === 'normal-rich-history' && alternateCapture?.usingAlternate === false, 'Hermes rich history was not preferred over its fixed alternate viewport', alternateCapture);
+  assert(alternateCapture?.alternateActive === true && alternateCapture?.active.includes(liveMarker) && alternateCapture?.active.includes(tickMarker), 'Hermes active alternate viewport was not captured while redraws were active', alternateCapture);
+
+  const samples = [];
+  for (let index = 0; index < 28; index += 1) {
+    samples.push(await page.eval(stateExpression));
+    await delay(250);
+  }
+
+  const measured = [baseline, ...samples];
+  const lineCounts = measured.map((sample) => sample.lineCount);
+  const scrollHeights = measured.map((sample) => sample.scrollHeight);
+  const ticks = measured.map((sample) => sample.tick);
+  const revisions = measured.map((sample) => sample.revision);
+  const captureTimes = measured.map((sample) => sample.captureAt);
+  const lineSpread = Math.max(...lineCounts) - Math.min(...lineCounts);
+  const scrollHeightSpread = Math.max(...scrollHeights) - Math.min(...scrollHeights);
+  assert(measured.every((sample) => sample.topCount === 1 && sample.bottomCount === 1), 'canonical Hermes history disappeared or duplicated during redraw', { baseline, samples });
+  assert(measured.every((sample) => sample.liveCount === 1), 'Hermes live tail disappeared or duplicated during redraw', { baseline, samples });
+  assert(measured.every((sample) => sample.captureMode === 'history' && sample.source === 'capture'), 'Readable ping-ponged between xterm and capture after history latch', { baseline, samples });
+  assert(lineSpread <= 2, 'Readable line count oscillated while Hermes only redrew its fixed live screen', { baseline, lineSpread, lineCounts, samples });
+  assert(scrollHeightSpread <= 60, 'Readable scroll range oscillated while Hermes only redrew its fixed live screen', { baseline, scrollHeightSpread, scrollHeights, samples });
+  assert(measured.every((sample) => /205\s*,\s*127\s*,\s*50/.test(sample.color)), 'Hermes brick color disappeared during live/capture refreshes', { baseline, samples });
+  assert(measured.every((sample) => /205\s*,\s*127\s*,\s*50/.test(sample.liveColor)), 'Hermes live redraw color was flattened instead of preserving its brick SGR', { baseline, samples });
+  assert(measured.every((sample) => sample.atBottom), 'Readable lost its pinned bottom during fixed Hermes redraws', { baseline, samples });
+  assert(measured.every((sample) => sample.tick >= 0) && ticks.every((tick, index) => index === 0 || tick >= ticks[index - 1]), 'Hermes frame ticks regressed or disappeared from the readable surface', { baseline, ticks, samples });
+  assert(new Set(ticks).size >= 4 && Math.max(...ticks) - Math.min(...ticks) >= 3, 'Hermes redraw fixture did not advance enough to rule out a frozen reader', { baseline, ticks, samples });
+  assert(revisions.every((revision, index) => index === 0 || revision >= revisions[index - 1]) && new Set(revisions).size >= 3 && revisions.at(-1) > revisions[0], 'terminal output revisions did not advance during Hermes redraw sampling', { baseline, revisions, samples });
+  assert(new Set(captureTimes).size >= 2 && captureTimes.at(-1) > captureTimes[0], 'settled tmux captures did not run while Hermes redraws were active', { baseline, captureTimes, samples });
+
+  return {
+    ok: true,
+    sampleCount: measured.length,
+    lineCount: baseline.lineCount,
+    lineSpread,
+    scrollHeightSpread,
+    tickRange: [Math.min(...ticks), Math.max(...ticks)],
+    revisionRange: [revisions[0], revisions.at(-1)],
+    captureRefreshes: new Set(captureTimes).size,
+    primaryCaptureReason: primaryCapture.captureReason,
+    alternateCaptureReason: alternateCapture.captureReason,
+    sources: [...new Set(samples.map((sample) => sample.source))],
+    captureModes: [...new Set(samples.map((sample) => sample.captureMode))],
   };
 }
 
@@ -482,9 +893,10 @@ function terminal56AlternateScrollCommand({ topMarker, bottomMarker, readyMarker
     `print(${JSON.stringify(`${topMarker} Welcome to Hermes Agent — Terminal 56 long readable answer`)})`,
     `for i in range(1, ${Number(lines) + 1}):`,
     `    print(f"Terminal 56 history line {i:04d}: فارسی + English scrollback should stay reachable while typing")`,
-    // This mirrors the tmux/Hermes failure mode: normal capture keeps the long history,
-    // while tmux alternate capture can expose only a short stale viewport. The reader must
-    // choose the richer normal capture so scrollback and typing do not jump/truncate.
+    // This mirrors the tmux/Hermes failure mode: the active capture keeps the long
+    // history plus the live alternate viewport, while `capture-pane -a` exposes the
+    // saved primary tail. The reader reconstructs canonical history from both
+    // and merges the active viewport only once.
     `sys.stdout.write('\\033[?1049h\\033[2J\\033[H')`,
     `print(${JSON.stringify('Terminal 56 alternate visible tail starts')})`,
     `print(${JSON.stringify(bottomMarker)})`,
@@ -509,6 +921,203 @@ function terminal56ScrollableInputCommand({ topMarker, bottomMarker, readyMarker
     'for line in sys.stdin:',
     `    print('INPUT_ECHO:' + line.strip())`,
     '    sys.stdout.flush()',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function alternateReconnectRelativeUpdateCommand({
+  primaryMarker,
+  oldMarker,
+  bottomMarker,
+  relativeMarker,
+  updateTrigger,
+  exitTrigger,
+}) {
+  const script = [
+    'import os, sys, time',
+    `primary = ${JSON.stringify(primaryMarker)}`,
+    `old = ${JSON.stringify(oldMarker)}`,
+    `bottom = ${JSON.stringify(bottomMarker)}`,
+    `relative = ${JSON.stringify(relativeMarker)}`,
+    `update_trigger = ${JSON.stringify(updateTrigger)}`,
+    `exit_trigger = ${JSON.stringify(exitTrigger)}`,
+    'ESC = "\\x1b"',
+    'sys.stdout.write(primary + "\\n")',
+    'sys.stdout.write(f"{ESC}[?1049h{ESC}[2J{ESC}[H")',
+    'sys.stdout.write(f"{ESC}[3;1H{old}{ESC}[20;1H{bottom}{ESC}[3;7H")',
+    'sys.stdout.flush()',
+    'deadline = time.monotonic() + 30',
+    'while not os.path.exists(update_trigger) and time.monotonic() < deadline:',
+    '    time.sleep(0.02)',
+    'if not os.path.exists(update_trigger):',
+    '    raise SystemExit(41)',
+    'sys.stdout.write(f"\\r{ESC}[2K{relative}")',
+    'sys.stdout.flush()',
+    'deadline = time.monotonic() + 30',
+    'while not os.path.exists(exit_trigger) and time.monotonic() < deadline:',
+    '    time.sleep(0.02)',
+    'if not os.path.exists(exit_trigger):',
+    '    raise SystemExit(42)',
+    'sys.stdout.write(f"{ESC}[?1049l")',
+    'sys.stdout.flush()',
+    'time.sleep(10)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function shortHistoryTypingCommand({ topMarker, bottomMarker, prompt }) {
+  const history = [
+    topMarker,
+    'Short history line 2: reader context must remain visible.',
+    'Short history line 3: typing may only update the active tail.',
+    'Short history line 4: capture refresh must not replace the reader.',
+    'Short history line 5: Backspace must restore the prompt tail.',
+    bottomMarker,
+  ];
+  const screen = `\x1b[2J\x1b[H${history.join('\n')}\n${prompt}`;
+  const script = [
+    'import os, sys, termios, tty',
+    `sys.stdout.write(${JSON.stringify(screen)})`,
+    'sys.stdout.flush()',
+    'fd = sys.stdin.fileno()',
+    'old = termios.tcgetattr(fd)',
+    'tty.setraw(fd)',
+    'current = []',
+    'try:',
+    '    while True:',
+    '        data = os.read(fd, 64)',
+    '        if not data:',
+    '            break',
+    '        for value in data:',
+    '            if value in (8, 127):',
+    '                if current:',
+    '                    current.pop()',
+    '                    os.write(sys.stdout.fileno(), b"\\b \\b")',
+    '            elif value in (10, 13):',
+    '                os.write(sys.stdout.fileno(), b"\\r\\n")',
+    `                os.write(sys.stdout.fileno(), ${JSON.stringify(prompt)}.encode())`,
+    '                current = []',
+    '            elif 32 <= value < 127:',
+    '                current.append(chr(value))',
+    '                os.write(sys.stdout.fileno(), bytes([value]))',
+    'finally:',
+    '    termios.tcsetattr(fd, termios.TCSADRAIN, old)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function clipboardShortcutInputLogCommand({ readyMarker, inputLog, stateFile }) {
+  const screen = `\x1b[?2004h\x1b[2J\x1b[HClipboard shortcut regression line 1\nClipboard shortcut regression line 2\nClipboard shortcut regression line 3\n${readyMarker}\nCLIPBOARD>`;
+  const script = [
+    'import json, os, sys, termios, tty',
+    `input_log = ${JSON.stringify(inputLog)}`,
+    `state_file = ${JSON.stringify(stateFile)}`,
+    'open(input_log, "wb").close()',
+    'draft = bytearray()',
+    'submissions = []',
+    'pending = bytearray()',
+    'bracketed = False',
+    'def write_state():',
+    '    temporary = state_file + ".tmp"',
+    '    with open(temporary, "w", encoding="utf-8") as handle:',
+    '        json.dump({"draft": draft.decode("utf-8", errors="replace"), "submissions": submissions, "bracketed": bracketed}, handle, ensure_ascii=False)',
+    '    os.replace(temporary, state_file)',
+    'def consume(data):',
+    '    global bracketed',
+    '    pending.extend(data)',
+    '    paste_start = b"\x1b[200~"',
+    '    paste_end = b"\x1b[201~"',
+    '    while pending:',
+    '        if pending.startswith(paste_start):',
+    '            del pending[:len(paste_start)]',
+    '            bracketed = True',
+    '            continue',
+    '        if pending.startswith(paste_end):',
+    '            del pending[:len(paste_end)]',
+    '            bracketed = False',
+    '            continue',
+    '        if pending[0] == 27 and (paste_start.startswith(bytes(pending)) or paste_end.startswith(bytes(pending))):',
+    '            break',
+    '        value = pending.pop(0)',
+    '        if value == 21 and not bracketed:',
+    '            draft.clear()',
+    '        elif value in (10, 13):',
+    '            if bracketed:',
+    '                draft.extend(b"\\n")',
+    '            else:',
+    '                submissions.append(draft.decode("utf-8", errors="replace"))',
+    '                draft.clear()',
+    '        else:',
+    '            draft.append(value)',
+    '    write_state()',
+    'write_state()',
+    `sys.stdout.write(${JSON.stringify(screen)})`,
+    'sys.stdout.flush()',
+    'fd = sys.stdin.fileno()',
+    'old = termios.tcgetattr(fd)',
+    'tty.setraw(fd)',
+    'try:',
+    '    while True:',
+    '        data = os.read(fd, 128)',
+    '        if not data:',
+    '            break',
+    '        with open(input_log, "ab") as handle:',
+    '            handle.write(data)',
+    '            handle.flush()',
+    '            os.fsync(handle.fileno())',
+    '        consume(data)',
+    '        os.write(sys.stdout.fileno(), data)',
+    'finally:',
+    '    termios.tcsetattr(fd, termios.TCSADRAIN, old)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function readerSelectionUpdateCommand({ selectionMarker, prompt, suggestion, triggerFile, liveMarker }) {
+  const history = [
+    'Reader selection regression line 1',
+    'Reader selection regression line 2',
+    selectionMarker,
+    'Reader selection regression line 4',
+  ].join('\n');
+  const screen = `\x1b[2J\x1b[H${history}\n${prompt}${suggestion}\x1b[${suggestion.length}D`;
+  const script = [
+    'import os, sys, time',
+    `trigger_file = ${JSON.stringify(triggerFile)}`,
+    `sys.stdout.write(${JSON.stringify(screen)})`,
+    'sys.stdout.flush()',
+    'deadline = time.time() + 30',
+    'while time.time() < deadline and not os.path.exists(trigger_file):',
+    '    time.sleep(0.02)',
+    'if os.path.exists(trigger_file):',
+    `    sys.stdout.write(${JSON.stringify(`\r\n${liveMarker}\n`)})`,
+    '    sys.stdout.flush()',
+    'time.sleep(90)',
+  ].join('\n');
+  return `python3 -c ${shellQuote(script)}`;
+}
+
+function controllerLeaseProbeCommand({ readyMarker, inputLog }) {
+  const script = [
+    'import os, sys, termios, tty',
+    `input_log = ${JSON.stringify(inputLog)}`,
+    'open(input_log, "wb").close()',
+    'fd = sys.stdin.fileno()',
+    `sys.stdout.write(${JSON.stringify(`\x1b[2J\x1b[H${readyMarker}\n`)})`,
+    'sys.stdout.flush()',
+    'old = termios.tcgetattr(fd)',
+    'tty.setraw(fd)',
+    'try:',
+    '    while True:',
+    '        data = os.read(fd, 1024)',
+    '        if not data:',
+    '            break',
+    '        with open(input_log, "ab") as handle:',
+    '            handle.write(data)',
+    '            handle.flush()',
+    '            os.fsync(handle.fileno())',
+    'finally:',
+    '    termios.tcsetattr(fd, termios.TCSADRAIN, old)',
   ].join('\n');
   return `python3 -c ${shellQuote(script)}`;
 }
@@ -728,6 +1337,156 @@ async function dispatchReadableKey(page, key) {
   })()`);
 }
 
+async function dispatchTrustedReadableKey(page, key, {
+  focusReader = false,
+  ctrlKey = false,
+  shiftKey = false,
+  altKey = false,
+  metaKey = false,
+} = {}) {
+  if (focusReader) {
+    await page.eval(`document.getElementById('bidiReaderLines')?.focus({ preventScroll: true })`);
+  }
+  const printable = typeof key === 'string' && key.length === 1;
+  const upper = printable ? key.toUpperCase() : '';
+  const keyCode = printable && /[A-Z]/.test(upper)
+    ? upper.charCodeAt(0)
+    : ({ Backspace: 8, Enter: 13, Tab: 9, Escape: 27 }[key] || 0);
+  const code = printable && /[A-Z]/.test(upper) ? `Key${upper}` : key;
+  const base = {
+    key,
+    code,
+    modifiers: (altKey ? 1 : 0) | (ctrlKey ? 2 : 0) | (metaKey ? 4 : 0) | (shiftKey ? 8 : 0),
+    windowsVirtualKeyCode: keyCode,
+    nativeVirtualKeyCode: keyCode,
+  };
+  const sendsText = printable && !ctrlKey && !altKey && !metaKey;
+  await page.send('Input.dispatchKeyEvent', {
+    ...base,
+    type: 'keyDown',
+    ...(sendsText ? { text: key, unmodifiedText: key } : {}),
+  });
+  await page.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+}
+
+function shortReaderStateExpression() {
+  return `(() => {
+    const nodes = [...document.querySelectorAll('#bidiReaderLines .bidi-line:not(.empty-state)')];
+    const lines = nodes.map((node) => node.dataset.logicalText || node.textContent || '');
+    return {
+      lineCount: lines.length,
+      lines,
+      tail: lines.at(-1) || '',
+      bodyClass: document.body.className,
+      activeClass: document.activeElement?.className || '',
+    };
+  })()`;
+}
+
+async function sampleShortReaderAtOffsets(page, offsets) {
+  const startedAt = Date.now();
+  const samples = [];
+  for (const offsetMs of offsets) {
+    const remaining = offsetMs - (Date.now() - startedAt);
+    if (remaining > 0) await delay(remaining);
+    samples.push({ offsetMs, ...(await page.eval(shortReaderStateExpression())) });
+  }
+  return samples;
+}
+
+async function waitForFileState(filePath, predicate, timeoutMs, label, { binary = false } = {}) {
+  const startedAt = Date.now();
+  let last = binary ? Buffer.alloc(0) : '';
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      last = fs.readFileSync(filePath, binary ? undefined : 'utf8');
+      if (predicate(last)) return last;
+    } catch {}
+    await delay(40);
+  }
+  const printable = Buffer.isBuffer(last) ? last.toString('hex') : last;
+  throw new Error(`timed out waiting for ${label}. last=${JSON.stringify(printable)}`);
+}
+
+function readTmuxPaneSize(sessionId) {
+  return execFileSync(tmuxBin, [
+    'display-message', '-p', '-t', sessionId, '#{pane_height}x#{pane_width}',
+  ], { encoding: 'utf8', env: tmuxEnvironment }).trim();
+}
+
+async function waitForTmuxPaneSize(sessionId, expected, timeoutMs, label) {
+  const startedAt = Date.now();
+  let last = '';
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      last = readTmuxPaneSize(sessionId);
+      if (last === expected) return last;
+    } catch {}
+    await delay(40);
+  }
+  throw new Error(`timed out waiting for ${label}. expected=${expected} last=${JSON.stringify(last)}`);
+}
+
+async function connectRuntimeTestClient(sessionId, { cols, rows, name }) {
+  const url = new URL('/ws', tokenUrl);
+  url.protocol = 'ws:';
+  url.searchParams.set('token', token);
+  url.searchParams.set('sessionId', sessionId);
+  url.searchParams.set('cols', String(cols));
+  url.searchParams.set('rows', String(rows));
+  const socket = new WebSocket(url);
+  const client = { name, socket, roles: [], controls: [], outputBytes: 0 };
+  socket.on('message', (raw, isBinary) => {
+    if (isBinary) {
+      client.outputBytes += Buffer.byteLength(raw);
+      return;
+    }
+    try {
+      const message = JSON.parse(String(raw));
+      client.controls.push(message);
+      if (message.type === 'role') client.roles.push(message.role);
+    } catch {}
+  });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${name} WebSocket open timed out`)), 5000);
+    socket.once('open', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  return client;
+}
+
+async function waitForRuntimeRole(client, role, timeoutMs = 5000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (client.roles.at(-1) === role) return client.roles.slice();
+    await delay(30);
+  }
+  throw new Error(`${client.name} did not become ${role}; roles=${JSON.stringify(client.roles)} controls=${JSON.stringify(client.controls)}`);
+}
+
+async function waitForRuntimeRoleCount(client, role, minimumCount, timeoutMs = 5000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (client.roles.length >= minimumCount && client.roles.at(-1) === role) return client.roles.slice();
+    await delay(30);
+  }
+  throw new Error(`${client.name} did not receive ${minimumCount} ${role} role updates; roles=${JSON.stringify(client.roles)} controls=${JSON.stringify(client.controls)}`);
+}
+
+async function closeRuntimeTestClient(client) {
+  if (!client?.socket || [WebSocket.CLOSED, WebSocket.CLOSING].includes(client.socket.readyState)) return;
+  const closed = new Promise((resolve) => client.socket.once('close', resolve));
+  client.socket.close(1000, 'test complete');
+  await Promise.race([closed, delay(1000)]);
+  if (client.socket.readyState !== WebSocket.CLOSED) client.socket.terminate();
+}
+
 async function testRichHistoryTypingDoesNotCollapseOrJump(page) {
   const topMarker = `__WARPISH_UI_STABILITY_TOP_${Date.now().toString(36)}__`;
   const bottomMarker = `__WARPISH_UI_STABILITY_BOTTOM_${Date.now().toString(36)}__`;
@@ -807,9 +1566,13 @@ async function testTerminal56ScrollAndTypingAreStable(page) {
   const typedMarker = `__WARPISH_TERMINAL56_TYPED_${Date.now().toString(36)}__`;
   const session = await createSession('Terminal 56 Scroll/Typing Regression', path.join(runtimeRoot, 'terminal56-cwd'));
   respawnPane(session.id, terminal56AlternateScrollCommand({ topMarker, bottomMarker, readyMarker, lines: 360 }));
-  await delay(800);
-
-  const capture = await api(`/api/sessions/${session.id}/capture?lines=5000&ansi=1`);
+  let capture = null;
+  const captureDeadline = Date.now() + 15000;
+  while (Date.now() < captureDeadline) {
+    capture = await api(`/api/sessions/${session.id}/capture?lines=5000&ansi=1`);
+    if ((capture.history || '').includes(topMarker) && (capture.active || '').includes(readyMarker)) break;
+    await delay(100);
+  }
   assert(!capture.usingAlternate && capture.captureReason === 'normal-rich-history', 'short alternate capture still wins over rich scrollback capture', {
     usingAlternate: capture.usingAlternate,
     captureReason: capture.captureReason,
@@ -868,6 +1631,21 @@ async function testTerminal56ScrollAndTypingAreStable(page) {
   const beforeType = await page.eval(visibleReaderStateExpression());
   assert(!beforeType.nearBottom && beforeType.scrollTop > 20, 'typing stability setup did not leave reader scrolled in history', beforeType);
 
+  await page.eval(`(() => {
+    window.__warpishTerminal56Data = [];
+    window.__warpishTerminal56Frames = [];
+    term.onData((data) => window.__warpishTerminal56Data.push(data));
+    const socket = ws;
+    const originalSend = socket.send.bind(socket);
+    socket.send = (data) => {
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.type === 'input') window.__warpishTerminal56Frames.push(parsed.data);
+      } catch {}
+      return originalSend(data);
+    };
+  })()`);
+
   for (const key of typedMarker.split('')) {
     await dispatchReadableKey(page, key);
     await delay(90);
@@ -875,12 +1653,36 @@ async function testTerminal56ScrollAndTypingAreStable(page) {
   await dispatchReadableKey(page, 'Enter');
   await delay(700);
   await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
-  const afterType = await page.waitFor(`(() => {
-    const lines = document.getElementById('bidiReaderLines');
-    const text = lines?.innerText || '';
-    if (!text.includes(${JSON.stringify(`INPUT_ECHO:${typedMarker}`)})) return false;
-    return ${visibleReaderStateExpression()};
-  })()`, 15000, 'typed marker echoed without reader jump');
+  let afterType;
+  try {
+    afterType = await page.waitFor(`(() => {
+      const lines = document.getElementById('bidiReaderLines');
+      const text = lines?.innerText || '';
+      if (!text.includes(${JSON.stringify(`INPUT_ECHO:${typedMarker}`)})) return false;
+      return ${visibleReaderStateExpression()};
+    })()`, 15000, 'typed marker echoed without reader jump');
+  } catch (error) {
+    const [clientState, paneCapture] = await Promise.all([
+      page.eval(`({
+        currentSessionId,
+        terminalControlRole,
+        controlClaimPending,
+        pendingChars: pendingInputChars(currentSessionId),
+        socketState: ws?.readyState ?? null,
+        status: document.getElementById('statusText')?.textContent || '',
+        detail: document.getElementById('sessionText')?.textContent || '',
+        terminalInputEventSerial,
+        terminalWriteDepth,
+        observedData: window.__warpishTerminal56Data,
+        sentFrames: window.__warpishTerminal56Frames,
+        activeElement: document.activeElement?.className || document.activeElement?.id || document.activeElement?.tagName || '',
+        readerTail: (document.getElementById('bidiReaderLines')?.innerText || '').slice(-1200),
+      })`),
+      api(`/api/sessions/${session.id}/capture?lines=120&ansi=0`),
+    ]);
+    error.message += `\nterminal56 diagnostics=${JSON.stringify({ clientState, paneTail: (paneCapture.text || '').slice(-1200) }, null, 2)}`;
+    throw error;
+  }
 
   const summarizeTerminal56State = (state) => ({
     scrollTop: state.scrollTop,
@@ -1056,11 +1858,613 @@ async function testSessionSwitchingSuppressesFocusReportsAndScrollBounce(page) {
   };
 }
 
+async function testShortHistoryTypingAndBackspaceStayStable(page) {
+  const suffix = Date.now().toString(36);
+  const topMarker = `__WARPISH_SHORT_HISTORY_TOP_${suffix}__`;
+  const bottomMarker = `__WARPISH_SHORT_HISTORY_BOTTOM_${suffix}__`;
+  const prompt = `__WARPISH_SHORT_PROMPT_${suffix}__>`;
+  const typedKey = 'x';
+  const typedTail = `${prompt}${typedKey}`;
+  const sampleOffsets = [60, 300, 1000];
+  const session = await createSession('Short History Typing Flicker Regression', path.join(runtimeRoot, 'short-history-typing-cwd'));
+  respawnPane(session.id, shortHistoryTypingCommand({ topMarker, bottomMarker, prompt }));
+  await delay(600);
+
+  await page.navigate(`${tokenUrl}&case=short-history-typing-flicker`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Short History Typing Flicker Regression')`, 15000, 'short-history typing session selected');
+  await page.waitFor(`document.querySelector('#statusText')?.textContent.includes('connected')`, 15000, 'short-history typing terminal connected');
+  await page.eval(`refreshBidiReaderFromCapture({ keepScroll: true, preferCapture: true })`);
+  const baseline = await page.waitFor(`(() => {
+    const state = ${shortReaderStateExpression()};
+    return state.lines.includes(${JSON.stringify(topMarker)})
+      && state.lines.includes(${JSON.stringify(bottomMarker)})
+      && state.tail.endsWith(${JSON.stringify(prompt)})
+      ? state
+      : false;
+  })()`, 15000, 'short-history baseline and prompt');
+  assert(baseline.lineCount >= 5, 'short-history fixture did not establish a multi-line reader baseline', baseline);
+
+  await dispatchTrustedReadableKey(page, typedKey, { focusReader: true });
+  const typedSamples = await sampleShortReaderAtOffsets(page, sampleOffsets);
+  await dispatchTrustedReadableKey(page, 'Backspace');
+  const restoredSamples = await sampleShortReaderAtOffsets(page, sampleOffsets);
+  const allSamples = typedSamples.concat(restoredSamples);
+
+  const collapsed = allSamples.filter((sample) => sample.lineCount <= 1);
+  assert(!collapsed.length, 'short terminal history collapsed to a one-line reader while typing or deleting', {
+    baseline,
+    collapsed,
+    typedSamples,
+    restoredSamples,
+  });
+  const lostHistory = allSamples.filter((sample) => !sample.lines.includes(topMarker) || !sample.lines.includes(bottomMarker));
+  assert(!lostHistory.length, 'short terminal history disappeared while the prompt tail was updating', {
+    baseline,
+    lostHistory,
+    typedSamples,
+    restoredSamples,
+  });
+
+  assert(
+    [prompt, typedTail].some((expected) => typedSamples[0].tail.endsWith(expected)),
+    'short-history tail was corrupted during the first typing render window',
+    { baseline, typedSamples },
+  );
+  for (const sample of typedSamples.slice(1)) {
+    assert(sample.tail.endsWith(typedTail), 'typed character did not remain in the short-history prompt tail', {
+      baseline,
+      typedTail,
+      typedSamples,
+    });
+  }
+  assert(
+    [prompt, typedTail].some((expected) => restoredSamples[0].tail.endsWith(expected)),
+    'short-history tail was corrupted during the first Backspace render window',
+    { baseline, restoredSamples },
+  );
+  for (const sample of restoredSamples.slice(1)) {
+    assert(sample.tail.endsWith(prompt) && !sample.tail.endsWith(typedTail), 'Backspace did not restore the short-history prompt tail', {
+      baseline,
+      prompt,
+      typedTail,
+      restoredSamples,
+    });
+  }
+
+  return {
+    baseline: { lineCount: baseline.lineCount, tail: baseline.tail },
+    typedKey,
+    typedSamples: typedSamples.map(({ offsetMs, lineCount, tail }) => ({ offsetMs, lineCount, tail })),
+    restoredSamples: restoredSamples.map(({ offsetMs, lineCount, tail }) => ({ offsetMs, lineCount, tail })),
+  };
+}
+
+async function testReadableClipboardShortcutsDoNotSendControlBytes(page) {
+  const suffix = Date.now().toString(36);
+  const readyMarker = `__WARPISH_CLIPBOARD_SHORTCUT_READY_${suffix}__`;
+  const inputLog = path.join(runtimeRoot, `clipboard-shortcut-${suffix}.bin`);
+  const stateFile = path.join(runtimeRoot, `clipboard-shortcut-${suffix}.json`);
+  const session = await createSession('Readable Clipboard Shortcut Regression', path.join(runtimeRoot, 'clipboard-shortcut-cwd'));
+  respawnPane(session.id, clipboardShortcutInputLogCommand({ readyMarker, inputLog, stateFile }));
+  await waitForFileState(inputLog, () => true, 5000, 'clipboard shortcut input log', { binary: true });
+  await waitForFileState(stateFile, (text) => {
+    try { return JSON.parse(text).draft === ''; } catch { return false; }
+  }, 5000, 'clipboard semantic input state');
+
+  await page.navigate(`${tokenUrl}&case=clipboard-shortcuts`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Readable Clipboard Shortcut Regression')`, 15000, 'clipboard shortcut session selected');
+  await page.waitFor(`document.querySelector('.terminal-card')?.dataset.controlRole === 'controller'`, 15000, 'clipboard shortcut tab controller role');
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(readyMarker)})`, 15000, 'clipboard shortcut reader ready');
+  const naturalReconnectMode = await page.eval(`Boolean(term.modes?.bracketedPasteMode)`);
+  await page.eval(`new Promise((resolve) => term.write('\\x1b[?2004l', resolve))`);
+  const reconnectMode = await page.eval(`Boolean(term.modes?.bracketedPasteMode)`);
+  assert(reconnectMode === false, 'clipboard fixture could not establish the deterministic lost-mode reconnect branch', {
+    naturalReconnectMode,
+    reconnectMode,
+  });
+  fs.writeFileSync(inputLog, Buffer.alloc(0));
+
+  async function waitForSemanticState(predicate, label) {
+    const text = await waitForFileState(stateFile, (value) => {
+      try { return predicate(JSON.parse(value)); } catch { return false; }
+    }, 5000, label);
+    return JSON.parse(text);
+  }
+
+  async function resetSemanticDraft(expectedSubmissionCount = 0) {
+    await page.eval(`term.input('\\x15', true)`);
+    return waitForSemanticState(
+      (state) => state.draft === '' && state.submissions.length === expectedSubmissionCount,
+      'semantic draft reset',
+    );
+  }
+
+  const selection = await page.eval(`(() => {
+    const line = [...document.querySelectorAll('#bidiReaderLines .bidi-line')]
+      .find((node) => (node.dataset.logicalText || node.textContent || '').includes('Clipboard shortcut regression line 2'));
+    if (!line) return { selected: false };
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    const selected = window.getSelection();
+    selected.removeAllRanges();
+    selected.addRange(range);
+    document.getElementById('bidiReaderLines')?.focus({ preventScroll: true });
+    return { selected: !selected.isCollapsed, text: selected.toString() };
+  })()`);
+  assert(selection.selected, 'clipboard shortcut regression could not establish a readable selection', selection);
+
+  await dispatchTrustedReadableKey(page, 'c', { ctrlKey: true, shiftKey: true });
+  await dispatchTrustedReadableKey(page, 'v', { ctrlKey: true, shiftKey: true });
+  await delay(350);
+  const received = fs.readFileSync(inputLog);
+  assert(!received.includes(0x03) && !received.includes(0x16), 'Ctrl+Shift+C/V leaked Ctrl-C or Ctrl-V bytes into tmux', {
+    selection,
+    receivedHex: received.toString('hex'),
+  });
+  assert(received.length === 0, 'readable clipboard shortcuts unexpectedly sent terminal input', {
+    selection,
+    receivedHex: received.toString('hex'),
+  });
+
+  await page.eval(`window.getSelection()?.removeAllRanges()`);
+  const multilinePaste = 'این  متن می‌خواهد فاصله‌  دقیق و ۱۲۳ را حفظ کند\nخط دوم Hermes است\n';
+  const safeSingleLinePaste = multilinePaste.replace(/\n+$/u, '').replace(/\n/gu, ' ');
+
+  async function dispatchPasteTo(selector, payload) {
+    fs.writeFileSync(inputLog, Buffer.alloc(0));
+    const dispatch = await page.eval(`(() => {
+      const target = document.querySelector(${JSON.stringify(selector)});
+      if (!target) return { dispatched: false, reason: 'target missing' };
+      target.focus?.({ preventScroll: true });
+      const transfer = new DataTransfer();
+      transfer.setData('text/plain', ${JSON.stringify(payload)});
+      const event = new ClipboardEvent('paste', {
+        clipboardData: transfer,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      });
+      const result = target.dispatchEvent(event);
+      return { dispatched: true, defaultPrevented: !result || event.defaultPrevented };
+    })()`);
+    assert(dispatch.dispatched && dispatch.defaultPrevented, 'safe terminal paste handler did not intercept the clipboard event', {
+      selector,
+      dispatch,
+    });
+    const expected = Buffer.from(safeSingleLinePaste, 'utf8');
+    const actual = await waitForFileState(inputLog, (value) => value.length >= expected.length, 5000, `safe paste input for ${selector}`, { binary: true });
+    assert(actual.equals(expected), 'safe multiline paste changed Unicode/spacing, duplicated input, or submitted a line', {
+      selector,
+      expectedText: safeSingleLinePaste,
+      actualText: actual.toString('utf8'),
+      expectedHex: expected.toString('hex'),
+      actualHex: actual.toString('hex'),
+    });
+    assert(!actual.includes(0x0a) && !actual.includes(0x0d), 'safe multiline paste leaked Enter before explicit user confirmation', {
+      selector,
+      actualHex: actual.toString('hex'),
+    });
+    return actual;
+  }
+
+  const readerPaste = await dispatchPasteTo('#bidiReaderLines', multilinePaste);
+  const readerSemanticState = await waitForSemanticState(
+    (state) => state.draft === safeSingleLinePaste && state.submissions.length === 0,
+    'reader paste semantic draft',
+  );
+  await page.waitFor(`(() => {
+    const logical = [...document.querySelectorAll('#bidiReaderLines .bidi-line')]
+      .map((node) => node.dataset.logicalText || node.textContent || '')
+      .join('');
+    return logical.includes(${JSON.stringify(safeSingleLinePaste)});
+  })()`, 5000, 'safe Persian paste rendered with logical spacing');
+  const renderedPaste = await page.eval(`(() => {
+    const logical = [...document.querySelectorAll('#bidiReaderLines .bidi-line')]
+      .map((node) => node.dataset.logicalText || node.textContent || '')
+      .join('');
+    return {
+      logical,
+      occurrences: logical.split(${JSON.stringify(safeSingleLinePaste)}).length - 1,
+    };
+  })()`);
+  assert(renderedPaste.occurrences === 1, 'safe Persian paste was duplicated or changed in the readable DOM', renderedPaste);
+  const renderedPasteSamples = [renderedPaste];
+  for (let refreshIndex = 0; refreshIndex < 2; refreshIndex += 1) {
+    await page.eval(`refreshBidiReaderFromCapture({ preferCapture: true, keepScroll: true })`);
+    await delay(120);
+    const sample = await page.eval(`(() => {
+      const logical = [...document.querySelectorAll('#bidiReaderLines .bidi-line')]
+        .map((node) => node.dataset.logicalText || node.textContent || '')
+        .join('');
+      return {
+        logical,
+        occurrences: logical.split(${JSON.stringify(safeSingleLinePaste)}).length - 1,
+      };
+    })()`);
+    assert(sample.occurrences === 1, 'safe Persian paste changed or duplicated after capture reconciliation', {
+      refreshIndex,
+      sample,
+    });
+    renderedPasteSamples.push(sample);
+  }
+  await resetSemanticDraft(0);
+  const helperPaste = await dispatchPasteTo('.xterm-helper-textarea', multilinePaste);
+  const helperSemanticState = await waitForSemanticState(
+    (state) => state.draft === safeSingleLinePaste && state.submissions.length === 0,
+    'xterm helper paste semantic draft',
+  );
+  await resetSemanticDraft(0);
+
+  await page.eval(`(() => { bidiReaderEnabled = false; applyBidiMode(); })()`);
+  const rawModePaste = await dispatchPasteTo('.xterm-helper-textarea', multilinePaste);
+  const rawSemanticState = await waitForSemanticState(
+    (state) => state.draft === safeSingleLinePaste && state.submissions.length === 0,
+    'raw-mode paste semantic draft',
+  );
+  await page.eval(`(() => { bidiReaderEnabled = true; applyBidiMode(); })()`);
+
+  fs.writeFileSync(inputLog, Buffer.alloc(0));
+  await dispatchTrustedReadableKey(page, 'Enter', { focusReader: true });
+  const explicitSubmit = await waitForFileState(inputLog, (value) => value.length >= 1, 5000, 'explicit Enter after safe paste', { binary: true });
+  assert(explicitSubmit.equals(Buffer.from('\r')), 'explicit Enter did not remain the only submit byte', {
+    actualHex: explicitSubmit.toString('hex'),
+  });
+  const explicitSubmitState = await waitForSemanticState(
+    (state) => state.draft === '' && state.submissions.length === 1 && state.submissions[0] === safeSingleLinePaste,
+    'explicit Enter semantic submission',
+  );
+
+  fs.writeFileSync(inputLog, Buffer.alloc(0));
+  await page.eval(`new Promise((resolve) => term.write('\\x1b[?2004h', resolve))`);
+  const bracketedDispatch = await page.eval(`(() => {
+    const target = document.querySelector('#bidiReaderLines');
+    const transfer = new DataTransfer();
+    transfer.setData('text/plain', ${JSON.stringify(multilinePaste)});
+    const event = new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true, composed: true });
+    target?.dispatchEvent(event);
+    return { targetFound: Boolean(target), defaultPrevented: event.defaultPrevented };
+  })()`);
+  assert(bracketedDispatch.targetFound && bracketedDispatch.defaultPrevented, 'bracketed safe paste was not intercepted', bracketedDispatch);
+  const bracketedExpected = Buffer.from(`\x1b[200~${multilinePaste.replace(/\n+$/u, '').replace(/\n/gu, '\r')}\x1b[201~`, 'utf8');
+  const bracketedPaste = await waitForFileState(inputLog, (value) => value.length >= bracketedExpected.length, 5000, 'bracketed safe paste input', { binary: true });
+  assert(bracketedPaste.equals(bracketedExpected), 'bracketed paste did not preserve internal lines or removed the final-submit guard', {
+    expectedHex: bracketedExpected.toString('hex'),
+    actualHex: bracketedPaste.toString('hex'),
+  });
+  const bracketedDraftText = multilinePaste.replace(/\n+$/u, '');
+  const bracketedSemanticState = await waitForSemanticState(
+    (state) => state.draft === bracketedDraftText && state.submissions.length === 1 && state.bracketed === false,
+    'bracketed multiline semantic draft',
+  );
+  await resetSemanticDraft(1);
+
+  const bracketEscapePayload = 'safe\x1b[201~\ncommand-must-stay-draft\n';
+  fs.writeFileSync(inputLog, Buffer.alloc(0));
+  await page.eval(`(() => {
+    const target = document.querySelector('.xterm-helper-textarea');
+    const transfer = new DataTransfer();
+    transfer.setData('text/plain', ${JSON.stringify(bracketEscapePayload)});
+    target?.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true, composed: true }));
+  })()`);
+  const bracketEscapeExpected = Buffer.from('\x1b[200~safe[201~\rcommand-must-stay-draft\x1b[201~', 'utf8');
+  const bracketEscapePaste = await waitForFileState(inputLog, (value) => value.length >= bracketEscapeExpected.length, 5000, 'bracket terminator injection paste', { binary: true });
+  assert(bracketEscapePaste.equals(bracketEscapeExpected), 'clipboard content escaped bracketed paste and exposed an implicit submit', {
+    expectedHex: bracketEscapeExpected.toString('hex'),
+    actualHex: bracketEscapePaste.toString('hex'),
+  });
+  const bracketEscapeSemanticState = await waitForSemanticState(
+    (state) => state.draft === 'safe[201~\ncommand-must-stay-draft' && state.submissions.length === 1 && state.bracketed === false,
+    'bracket terminator semantic draft',
+  );
+  await resetSemanticDraft(1);
+  await page.eval(`new Promise((resolve) => term.write('\\x1b[?2004l', resolve))`);
+
+  return {
+    selectionText: selection.text,
+    receivedHex: received.toString('hex'),
+    controller: true,
+    safePaste: {
+      surfaces: 3,
+      submittedBeforeEnter: [readerSemanticState, helperSemanticState, rawSemanticState]
+        .reduce((count, state) => count + state.submissions.length, 0),
+      submittedAfterEnter: explicitSubmitState.submissions.length,
+      persianSpacingPreserved: readerPaste.equals(Buffer.from(safeSingleLinePaste))
+        && helperPaste.equals(Buffer.from(safeSingleLinePaste))
+        && rawModePaste.equals(Buffer.from(safeSingleLinePaste))
+        && renderedPasteSamples.every((sample) => sample.occurrences === 1),
+      readerHex: readerPaste.toString('hex'),
+      helperHex: helperPaste.toString('hex'),
+      rawModeHex: rawModePaste.toString('hex'),
+      renderedOccurrences: renderedPaste.occurrences,
+      stableRenderedSamples: renderedPasteSamples.length,
+      naturalReconnectMode,
+      reconnectModeDesyncCovered: reconnectMode === false,
+      bracketedInternalLinesPreserved: bracketedPaste.equals(bracketedExpected),
+      bracketTerminatorNeutralized: bracketEscapePaste.equals(bracketEscapeExpected),
+      semanticDraftsVerified: [readerSemanticState, helperSemanticState, rawSemanticState]
+        .every((state) => state.draft === safeSingleLinePaste && state.submissions.length === 0)
+        && explicitSubmitState.submissions[0] === safeSingleLinePaste
+        && bracketedSemanticState.draft === bracketedDraftText
+        && bracketEscapeSemanticState.draft === 'safe[201~\ncommand-must-stay-draft',
+    },
+  };
+}
+
+async function testReaderSelectionSurvivesLiveOutput(page) {
+  const suffix = Date.now().toString(36);
+  const selectionMarker = `__WARPISH_SELECTION_TARGET_${suffix}__`;
+  const prompt = `__WARPISH_SELECTION_PROMPT_${suffix}__>`;
+  const suggestion = 'ghost-suggestion';
+  const liveMarker = `__WARPISH_SELECTION_LIVE_UPDATE_${suffix}__`;
+  const triggerFile = path.join(runtimeRoot, `selection-trigger-${suffix}`);
+  try { fs.unlinkSync(triggerFile); } catch {}
+  const session = await createSession('Reader Selection Live Update Regression', path.join(runtimeRoot, 'selection-live-cwd'));
+  respawnPane(session.id, readerSelectionUpdateCommand({ selectionMarker, prompt, suggestion, triggerFile, liveMarker }));
+  await delay(500);
+
+  await page.navigate(`${tokenUrl}&case=reader-selection-live-update`);
+  await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Reader Selection Live Update Regression')`, 15000, 'reader selection session selected');
+  await page.waitFor(`document.querySelector('.terminal-card')?.dataset.controlRole === 'controller'`, 15000, 'reader selection tab controller role');
+  await page.waitFor(`(document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(selectionMarker)})`, 15000, 'reader selection fixture visible');
+  await page.eval(`renderBidiReader(getReadableTerminalEntries(), { force: true, source: 'xterm' })`);
+  await page.waitFor(`Boolean(document.querySelector('#bidiReaderLines .bidi-inline-cursor'))`, 5000, 'reader inline cursor fixture');
+
+  const before = await page.eval(`(async () => {
+    const lines = [...document.querySelectorAll('#bidiReaderLines .bidi-line')];
+    const start = lines.find((node) => (node.dataset.logicalText || node.textContent || '').includes(${JSON.stringify(selectionMarker)}));
+    const end = lines.find((node) => (node.dataset.logicalText || node.textContent || '').includes(${JSON.stringify(prompt)}));
+    if (!start || !end) return { selected: false, reason: 'selection endpoints missing' };
+    const range = document.createRange();
+    range.setStart(start, 0);
+    range.setEnd(end, end.childNodes.length);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const raw = selection.toString();
+    const sanitized = selectedReadableText();
+    let copied = null;
+    const clipboard = navigator.clipboard;
+    const ownDescriptor = clipboard ? Object.getOwnPropertyDescriptor(clipboard, 'writeText') : null;
+    try {
+      if (clipboard) {
+        Object.defineProperty(clipboard, 'writeText', {
+          configurable: true,
+          value: async (text) => { copied = text; },
+        });
+        await copyTerminalSelection();
+      }
+    } finally {
+      if (clipboard) {
+        if (ownDescriptor) Object.defineProperty(clipboard, 'writeText', ownDescriptor);
+        else delete clipboard.writeText;
+      }
+    }
+    return {
+      selected: !selection.isCollapsed,
+      raw,
+      sanitized,
+      copied,
+      cursorCount: end.querySelectorAll('.bidi-inline-cursor').length,
+    };
+  })()`);
+  assert(before.selected && before.cursorCount === 1, 'reader selection fixture did not include the visible inline cursor', before);
+  assert(before.raw.includes('▌'), 'raw reader selection did not include the visible cursor fixture', before);
+  assert(!before.sanitized.includes('▌'), 'selectedReadableText leaked the visual cursor glyph', before);
+  assert(before.copied === before.sanitized && !before.copied.includes('▌'), 'Copy action included the visual cursor glyph', before);
+
+  fs.writeFileSync(triggerFile, 'release');
+  await waitForFileState(triggerFile, (text) => text === 'release', 1000, 'selection live-update trigger');
+  let captureAfterUpdate = null;
+  const updateDeadline = Date.now() + 10000;
+  while (Date.now() < updateDeadline) {
+    captureAfterUpdate = await api(`/api/sessions/${session.id}/capture?lines=100&ansi=0`);
+    if ((captureAfterUpdate.text || '').includes(liveMarker)) break;
+    await delay(80);
+  }
+  assert((captureAfterUpdate?.text || '').includes(liveMarker), 'selection fixture did not emit its live output update', captureAfterUpdate);
+  await delay(500);
+
+  const during = await page.eval(`(() => {
+    const selection = window.getSelection();
+    return {
+      selected: Boolean(selection && !selection.isCollapsed),
+      raw: selection?.toString() || '',
+      sanitized: selectedReadableText(),
+      liveVisible: (document.querySelector('#bidiReaderLines')?.innerText || '').includes(${JSON.stringify(liveMarker)}),
+    };
+  })()`);
+  assert(during.selected && during.raw === before.raw, 'active reader selection changed or collapsed during live output', { before, during });
+  assert(during.sanitized === before.sanitized && !during.sanitized.includes('▌'), 'copiable reader selection changed during live output', { before, during });
+  assert(!during.liveVisible, 'reader rerendered underneath an active selection', { before, during });
+
+  await page.eval(`window.getSelection()?.removeAllRanges()`);
+  const after = await page.waitFor(`(() => {
+    const text = document.querySelector('#bidiReaderLines')?.innerText || '';
+    return text.includes(${JSON.stringify(liveMarker)}) ? { liveVisible: true, text } : false;
+  })()`, 10000, 'reader catches up after selection clears');
+  return {
+    selectionText: before.sanitized,
+    rawContainedCursor: before.raw.includes('▌'),
+    copiedContainedCursor: before.copied.includes('▌'),
+    selectionPreservedDuringUpdate: during.selected,
+    liveVisibleAfterClear: after.liveVisible,
+  };
+}
+
+async function testSecondClientAlternateSnapshotRestoresState(page) {
+  const suffix = Date.now().toString(36);
+  const primaryMarker = `__WARPISH_SNAPSHOT_PRIMARY_${suffix}__`;
+  const oldMarker = `__WARPISH_SNAPSHOT_OLD_${suffix}__`;
+  const bottomMarker = `__WARPISH_SNAPSHOT_BOTTOM_${suffix}__`;
+  const relativeMarker = `__WARPISH_SNAPSHOT_RELATIVE_${suffix}__`;
+  const updateTrigger = path.join(runtimeRoot, `snapshot-update-${suffix}`);
+  const exitTrigger = path.join(runtimeRoot, `snapshot-exit-${suffix}`);
+  const session = await createSession('Alternate Reconnect Snapshot Regression', path.join(runtimeRoot, 'alternate-snapshot-cwd'));
+  let controller;
+  try {
+    controller = await connectRuntimeTestClient(session.id, { cols: 90, rows: 24, name: 'snapshot client A' });
+    await waitForRuntimeRole(controller, 'controller');
+    await waitForTmuxPaneSize(session.id, '24x90', 5000, 'snapshot controller size');
+    respawnPane(session.id, alternateReconnectRelativeUpdateCommand({
+      primaryMarker,
+      oldMarker,
+      bottomMarker,
+      relativeMarker,
+      updateTrigger,
+      exitTrigger,
+    }));
+
+    let capture = null;
+    const captureDeadline = Date.now() + 15000;
+    while (Date.now() < captureDeadline) {
+      capture = await api(`/api/sessions/${session.id}/capture?lines=5000&ansi=1`);
+      if (capture.alternateActive && capture.active.includes(oldMarker) && capture.active.includes(bottomMarker)) break;
+      await delay(80);
+    }
+    assert(capture?.alternateActive && capture.active.includes(oldMarker) && capture.active.includes(bottomMarker), 'alternate snapshot fixture did not become ready', capture);
+
+    await page.navigate(`${tokenUrl}&case=alternate-runtime-snapshot`);
+    await page.waitFor(`document.querySelector('#sessionTitle')?.textContent.includes('Alternate Reconnect Snapshot Regression')`, 15000, 'alternate snapshot session selected');
+    const before = await page.waitFor(`(() => {
+      const rows = Array.from({ length: term.rows }, (_, index) =>
+        term.buffer.active.getLine(term.buffer.active.viewportY + index)?.translateToString(true) || '');
+      const state = {
+        alternate: isTerminalAlternateBuffer(),
+        cursorX: term.buffer.active.cursorX,
+        cursorY: term.buffer.active.cursorY,
+        role: terminalControlRole,
+        rows,
+      };
+      return state.role === 'spectator' && state.alternate && state.cursorX === 6 && state.cursorY === 2
+        && state.rows[2]?.includes(${JSON.stringify(oldMarker)})
+        && state.rows[19]?.includes(${JSON.stringify(bottomMarker)})
+        ? state
+        : false;
+    })()`, 15000, 'second client alternate snapshot state');
+
+    fs.writeFileSync(updateTrigger, 'update');
+    const afterRelative = await page.waitFor(`(() => {
+      const rows = Array.from({ length: term.rows }, (_, index) =>
+        term.buffer.active.getLine(term.buffer.active.viewportY + index)?.translateToString(true) || '');
+      const relativeRows = rows.map((text, index) => ({ text, index })).filter((item) => item.text.includes(${JSON.stringify(relativeMarker)}));
+      return isTerminalAlternateBuffer()
+        && relativeRows.length === 1
+        && relativeRows[0].index === 2
+        && rows[19]?.includes(${JSON.stringify(bottomMarker)})
+        ? { alternate: true, relativeRows, bottom: rows[19], cursorX: term.buffer.active.cursorX, cursorY: term.buffer.active.cursorY }
+        : false;
+    })()`, 10000, 'relative update after alternate snapshot');
+
+    fs.writeFileSync(exitTrigger, 'exit');
+    const afterExit = await page.waitFor(`(() => {
+      const rows = Array.from({ length: term.rows }, (_, index) =>
+        term.buffer.active.getLine(term.buffer.active.viewportY + index)?.translateToString(true) || '');
+      const joined = rows.join(String.fromCharCode(10));
+      return joined.includes(${JSON.stringify(primaryMarker)})
+        && !joined.includes(${JSON.stringify(relativeMarker)})
+        ? { outerBuffer: term.buffer.active.type, primaryVisible: true, relativeLeaked: false }
+        : false;
+    })()`, 10000, 'primary screen restored after alternate exit');
+
+    return {
+      role: before.role,
+      initialCursor: { x: before.cursorX, y: before.cursorY },
+      relativeRow: afterRelative.relativeRows[0].index,
+      bottomPreserved: afterRelative.bottom.includes(bottomMarker),
+      primaryRestored: afterExit.primaryVisible,
+      outerBufferAfterPaneExit: afterExit.outerBuffer,
+      relativeLeakedToPrimary: afterExit.relativeLeaked,
+    };
+  } finally {
+    await closeRuntimeTestClient(controller);
+  }
+}
+
+async function testControllerSpectatorLease() {
+  const suffix = Date.now().toString(36);
+  const readyMarker = `__WARPISH_CONTROLLER_LEASE_READY_${suffix}__`;
+  const inputLog = path.join(runtimeRoot, `controller-lease-input-${suffix}.bin`);
+  const session = await createSession('Controller Spectator Lease Regression', path.join(runtimeRoot, 'controller-lease-cwd'));
+  respawnPane(session.id, controllerLeaseProbeCommand({ readyMarker, inputLog }));
+  await waitForFileState(inputLog, () => true, 5000, 'controller lease input log', { binary: true });
+
+  let controller;
+  let spectator;
+  try {
+    controller = await connectRuntimeTestClient(session.id, { cols: 90, rows: 24, name: 'client A' });
+    await waitForRuntimeRole(controller, 'controller');
+    spectator = await connectRuntimeTestClient(session.id, { cols: 140, rows: 45, name: 'client B' });
+    await waitForRuntimeRole(controller, 'controller');
+    await waitForRuntimeRole(spectator, 'spectator');
+    await waitForTmuxPaneSize(session.id, '24x90', 5000, 'initial controller size');
+    fs.writeFileSync(inputLog, Buffer.alloc(0));
+
+    const ignoredInput = `SPECTATOR_IGNORED_${suffix}`;
+    const ignoredBarrier = `SPECTATOR_BARRIER_${suffix}`;
+    const spectatorRoleCount = spectator.roles.length;
+    spectator.socket.send(JSON.stringify({ type: 'input', data: ignoredInput }));
+    spectator.socket.send(JSON.stringify({ type: 'resize', cols: 177, rows: 55 }));
+    spectator.socket.send(JSON.stringify({ type: 'input', data: ignoredBarrier }));
+    await waitForRuntimeRoleCount(spectator, 'spectator', spectatorRoleCount + 2);
+    const ignoredBytes = fs.readFileSync(inputLog);
+    const ignoredSize = readTmuxPaneSize(session.id);
+    assert(!ignoredBytes.includes(Buffer.from(ignoredInput)) && !ignoredBytes.includes(Buffer.from(ignoredBarrier)), 'spectator input reached the PTY before take-control', {
+      inputHex: ignoredBytes.toString('hex'),
+      roles: { controller: controller.roles, spectator: spectator.roles },
+    });
+    assert(ignoredSize === '24x90', 'spectator resize reached the PTY before take-control', { ignoredSize });
+
+    const controllerInput = `CONTROLLER_ACCEPTED_${suffix}`;
+    controller.socket.send(JSON.stringify({ type: 'input', data: controllerInput }));
+    controller.socket.send(JSON.stringify({ type: 'resize', cols: 101, rows: 31 }));
+    await waitForFileState(inputLog, (bytes) => bytes.includes(Buffer.from(controllerInput)), 5000, 'controller input accepted', { binary: true });
+    await waitForTmuxPaneSize(session.id, '31x101', 5000, 'controller resize accepted');
+
+    spectator.socket.send(JSON.stringify({ type: 'take-control', cols: 133, rows: 41 }));
+    await waitForRuntimeRole(spectator, 'controller');
+    await waitForRuntimeRole(controller, 'spectator');
+    await waitForTmuxPaneSize(session.id, '41x133', 5000, 'take-control resize accepted');
+    fs.writeFileSync(inputLog, Buffer.alloc(0));
+
+    const oldControllerInput = `OLD_CONTROLLER_IGNORED_${suffix}`;
+    const oldControllerBarrier = `OLD_CONTROLLER_BARRIER_${suffix}`;
+    const newControllerInput = `NEW_CONTROLLER_ACCEPTED_${suffix}`;
+    const previousControllerRoleCount = controller.roles.length;
+    controller.socket.send(JSON.stringify({ type: 'input', data: oldControllerInput }));
+    controller.socket.send(JSON.stringify({ type: 'resize', cols: 166, rows: 52 }));
+    controller.socket.send(JSON.stringify({ type: 'input', data: oldControllerBarrier }));
+    spectator.socket.send(JSON.stringify({ type: 'input', data: newControllerInput }));
+    spectator.socket.send(JSON.stringify({ type: 'resize', cols: 144, rows: 44 }));
+    await waitForFileState(inputLog, (bytes) => bytes.includes(Buffer.from(newControllerInput)), 5000, 'new controller input accepted', { binary: true });
+    await waitForTmuxPaneSize(session.id, '44x144', 5000, 'new controller resize accepted');
+    await waitForRuntimeRoleCount(controller, 'spectator', previousControllerRoleCount + 2);
+    const finalInput = fs.readFileSync(inputLog);
+    const finalSize = readTmuxPaneSize(session.id);
+    assert(!finalInput.includes(Buffer.from(oldControllerInput)) && !finalInput.includes(Buffer.from(oldControllerBarrier)), 'previous controller input reached the PTY after lease transfer', {
+      inputText: finalInput.toString('utf8'),
+      roles: { previousController: controller.roles, newController: spectator.roles },
+    });
+    assert(finalSize === '44x144', 'previous controller resize reached the PTY after lease transfer', { finalSize });
+
+    return {
+      initialRoles: { clientA: 'controller', clientB: 'spectator' },
+      spectatorIgnoredBeforeTakeControl: true,
+      controllerAcceptedBeforeTransfer: true,
+      finalRoles: { clientA: controller.roles.at(-1), clientB: spectator.roles.at(-1) },
+      previousControllerIgnoredAfterTransfer: true,
+      finalSize,
+    };
+  } finally {
+    await closeRuntimeTestClient(spectator);
+    await closeRuntimeTestClient(controller);
+  }
+}
+
 async function testTypingDoesNotRevertToStaleCapture(page) {
   const appJs = await httpText('/app.js');
-  assert(!appJs.includes('isSparseReadableEntries(entries) || lastCapturedReaderEntries.length > 0'), 'old captured-reader fast-path regression returned');
-  assert(appJs.includes('const shouldUseCapture = (isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse))'), 'xterm-first reader fast-path guard is missing');
-  assert(appJs.includes('isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length'), 'history-scroll capture guard is missing');
+  assert(!appJs.includes('lastCapturedReaderEntries') && !appJs.includes('const shouldUseCapture ='), 'old captured-reader source feedback loop returned');
+  assert(appJs.includes("bidiReaderCaptureMode === 'history' && capturedReaderHistoryState.known"), 'canonical capture-history render mode is missing');
+  assert(appJs.includes('terminalOutputRevision > capturedReaderHistoryRevision') && appJs.includes('getReadableTerminalScreenEntries'), 'revision-gated live screen tail is missing');
 
   const session = await createSession('Typing Flicker Regression', path.join(runtimeRoot, 'typing-cwd'));
   await delay(800);
@@ -1218,25 +2622,104 @@ async function terminateProcess(childProcess, timeoutMs = 3000) {
   await Promise.race([exited, delay(1000)]);
 }
 
+async function startChromeWithRetry() {
+  let firstError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await startChrome();
+    } catch (error) {
+      if (!firstError) firstError = error;
+      await terminateProcess(chrome);
+      chrome = null;
+      try { fs.rmSync(chromeProfile, { recursive: true, force: true }); } catch {}
+      fs.mkdirSync(chromeProfile, { recursive: true });
+      if (attempt === 0) await delay(1500);
+      else {
+        error.message += `\nfirst Chrome launch error=${firstError.message}`;
+        throw error;
+      }
+    }
+  }
+  throw firstError || new Error('Chrome failed to start');
+}
+
 async function main() {
   assert(fs.existsSync(chromePath), `Chrome binary not found at ${chromePath}`);
+  const inheritedTmuxProbe = isolatedTmuxEnvironment({ TMUX: '/tmp/parent,1,0', TMUX_PANE: '%99' });
+  assert(!('TMUX' in inheritedTmuxProbe) && !('TMUX_PANE' in inheritedTmuxProbe) && inheritedTmuxProbe.TMUX_TMPDIR === tmuxTmpDir, 'browser regressions did not isolate an inherited tmux client environment', inheritedTmuxProbe);
   await startServer();
-  const page = await startChrome();
+  const page = await startChromeWithRetry();
+  browserPage = page;
   await page.init();
   await page.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
   const health = await api('/healthz');
 
+  if (browserOnly) {
+    const requestedCases = browserOnly === 'high-value'
+      ? ['clipboard-shortcuts', 'reader-selection', 'controller-lease', 'runtime-snapshot', 'hermes-oscillation', 'hermes-palette']
+      : [browserOnly];
+    const knownCases = new Set(['short-history-typing', 'terminal56-scroll', 'clipboard-shortcuts', 'reader-selection', 'controller-lease', 'runtime-snapshot', 'hermes-oscillation', 'hermes-palette']);
+    assert(requestedCases.every((name) => knownCases.has(name)), `unknown WARPISH_BROWSER_ONLY case: ${browserOnly}`);
+    const regressions = {};
+    if (requestedCases.includes('short-history-typing')) {
+      regressions.shortHistoryTypingFlicker = await testShortHistoryTypingAndBackspaceStayStable(page);
+    }
+    if (requestedCases.includes('terminal56-scroll')) {
+      regressions.terminal56ScrollTyping = await testTerminal56ScrollAndTypingAreStable(page);
+    }
+    if (requestedCases.includes('clipboard-shortcuts')) {
+      regressions.readableClipboardShortcuts = await testReadableClipboardShortcutsDoNotSendControlBytes(page);
+    }
+    if (requestedCases.includes('reader-selection')) {
+      regressions.readerSelectionStability = await testReaderSelectionSurvivesLiveOutput(page);
+    }
+    if (requestedCases.includes('controller-lease')) {
+      regressions.controllerSpectatorLease = await testControllerSpectatorLease();
+    }
+    if (requestedCases.includes('runtime-snapshot')) {
+      regressions.alternateRuntimeSnapshot = await testSecondClientAlternateSnapshotRestoresState(page);
+    }
+    if (requestedCases.includes('hermes-palette')) {
+      regressions.hermesPaletteStyles = await testHermesPaletteStyles(page);
+      regressions.capturedHistoryReducer = await testCapturedHistoryReducer(page);
+    }
+    if (requestedCases.includes('hermes-oscillation')) {
+      regressions.hermesReadableHistoryStability = await testHermesReadableHistoryDoesNotOscillate(page);
+    }
+    await delay(150);
+    page.assertNoUnhandledErrors(`${browserOnly} browser regression`);
+    console.log(JSON.stringify({
+      ok: true,
+      health,
+      browser: { chrome: chromeVersionLabel(), cdpPort },
+      isolatedRuntime: { dataDir, sessionPrefix },
+      diagnostics: page.diagnosticSnapshot(),
+      regressions,
+    }, null, 2));
+    page.close();
+    return;
+  }
+
   const hermesPaletteStyles = await testHermesPaletteStyles(page);
+  const capturedHistoryReducer = await testCapturedHistoryReducer(page);
+  const hermesReadableHistoryStability = await testHermesReadableHistoryDoesNotOscillate(page);
   const readableLinks = await testReadableLinksOpenNewTabs(page);
   const emptyReaderGuard = await testEmptyReaderDoesNotBlankTerminal(page);
   const longHermesScrollback = await testLongHermesScrollbackIsReadable(page);
   const richHistoryTypingStability = await testRichHistoryTypingDoesNotCollapseOrJump(page);
   const terminal56ScrollTyping = await testTerminal56ScrollAndTypingAreStable(page);
   const sessionSwitchingStability = await testSessionSwitchingSuppressesFocusReportsAndScrollBounce(page);
+  const alternateRuntimeSnapshot = await testSecondClientAlternateSnapshotRestoresState(page);
+  const controllerSpectatorLease = await testControllerSpectatorLease();
+  const readableClipboardShortcuts = await testReadableClipboardShortcutsDoNotSendControlBytes(page);
+  const readerSelectionStability = await testReaderSelectionSurvivesLiveOutput(page);
+  const shortHistoryTypingFlicker = await testShortHistoryTypingAndBackspaceStayStable(page);
   const typingNoFlicker = await testTypingDoesNotRevertToStaleCapture(page);
   const sessionMetadataXssGuard = await testSessionMetadataXssGuard(page);
   const apiPlainTextErrorHandling = await testApiPlainTextErrorHandling(page);
   const mouseModeAndMobileLayout = await testMouseModeAndMobileLayout(page);
+  await delay(150);
+  page.assertNoUnhandledErrors();
 
   console.log(JSON.stringify({
     ok: true,
@@ -1249,8 +2732,11 @@ async function main() {
       dataDir,
       sessionPrefix,
     },
+    diagnostics: page.diagnosticSnapshot(),
     regressions: {
       hermesPaletteStyles,
+      capturedHistoryReducer,
+      hermesReadableHistoryStability,
       readableLinks,
       emptyReaderGuard,
       longHermesScrollback: {
@@ -1268,6 +2754,11 @@ async function main() {
         afterSecondWheel: terminal56ScrollTyping.afterSecondWheel,
       },
       sessionSwitchingStability,
+      alternateRuntimeSnapshot,
+      controllerSpectatorLease,
+      readableClipboardShortcuts,
+      readerSelectionStability,
+      shortHistoryTypingFlicker,
       typingNoFlicker: {
         marker: typingNoFlicker.marker,
         firstWithMarker: typingNoFlicker.firstWithMarker,
@@ -1288,6 +2779,12 @@ async function main() {
 
 try {
   await main();
+} catch (error) {
+  const diagnostics = browserPage?.diagnosticSnapshot?.();
+  if (diagnostics && (diagnostics.consoleErrors.length || diagnostics.runtimeExceptions.length || diagnostics.recentLogEntries.length)) {
+    error.message = `${error.message}\nBrowser diagnostics:\n${JSON.stringify(diagnostics, null, 2)}`;
+  }
+  throw error;
 } finally {
   if (token) {
     for (const sessionId of createdSessions.reverse()) {
@@ -1295,11 +2792,11 @@ try {
     }
   }
   try {
-    execFileSync('tmux', ['list-sessions', '-F', '#S'], { encoding: 'utf8' })
+    execFileSync(tmuxBin, ['list-sessions', '-F', '#S'], { encoding: 'utf8', env: tmuxEnvironment })
       .split('\n')
       .filter((name) => name.startsWith(sessionPrefix))
       .forEach((name) => {
-        try { execFileSync('tmux', ['kill-session', '-t', name]); } catch {}
+        try { execFileSync(tmuxBin, ['kill-session', '-t', name], { env: tmuxEnvironment }); } catch {}
       });
   } catch {}
   await terminateProcess(chrome);

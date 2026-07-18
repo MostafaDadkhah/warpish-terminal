@@ -2,31 +2,43 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import WebSocket from 'ws';
 
 const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
 const projectRoot = new URL('..', import.meta.url).pathname;
-const smokeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'warpish-smoke-'));
+const smokeRoot = fs.mkdtempSync(path.join('/tmp', 'warpish-smoke-'));
 const smokeDataDir = path.join(smokeRoot, 'data');
 const smokeTokenFile = path.join(smokeRoot, 'token');
+const smokeTmuxDir = path.join(smokeRoot, 'tmux');
+fs.mkdirSync(smokeTmuxDir, { recursive: true, mode: 0o700 });
 const smokePrefix = `warpishsmoke-${process.pid.toString(36)}-`;
 const tmuxBin = process.env.TMUX_BIN
   || ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find((candidate) => fs.existsSync(candidate))
   || 'tmux';
+
+function isolatedTmuxEnvironment(extra = {}) {
+  const env = { ...process.env, ...extra, TMUX_TMPDIR: smokeTmuxDir };
+  delete env.TMUX;
+  delete env.TMUX_PANE;
+  return env;
+}
+
 const child = spawn(process.execPath, ['server.js'], {
   cwd: projectRoot,
-  env: {
-    ...process.env,
+  env: isolatedTmuxEnvironment({
     PORT: String(port),
     HOST: '127.0.0.1',
     WARPISH_DATA_DIR: smokeDataDir,
     WARPISH_TOKEN_FILE: smokeTokenFile,
     WARPISH_SESSION_PREFIX: smokePrefix,
     WARPISH_SKIP_USER_ZSHRC: '1',
-  },
+    TMUX_TMPDIR: smokeTmuxDir,
+    TERM: 'dumb',
+    NO_COLOR: '1',
+    COLORTERM: '',
+  }),
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 
@@ -123,6 +135,19 @@ function assert(condition, message, details = undefined) {
   throw new Error(`${message}${suffix}`);
 }
 
+function escapeForRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function countOccurrences(text, needle) {
+  if (!needle) return 0;
+  return String(text || '').split(needle).length - 1;
+}
+
 async function websocketHandshakeStatus({ token, origin }) {
   const wsUrl = new URL('/ws', tokenUrl);
   wsUrl.protocol = 'ws:';
@@ -207,15 +232,14 @@ function verifyNonLoopbackBindRefusal() {
   fs.mkdirSync(probeRoot, { recursive: true });
   const result = spawnSync(process.execPath, ['server.js'], {
     cwd: projectRoot,
-    env: {
-      ...process.env,
+    env: isolatedTmuxEnvironment({
       HOST: '0.0.0.0',
       PORT: '0',
       WARPISH_ALLOW_REMOTE: '0',
       WARPISH_DATA_DIR: path.join(probeRoot, 'data'),
       WARPISH_TOKEN_FILE: path.join(probeRoot, 'token'),
       WARPISH_SESSION_PREFIX: `${smokePrefix}remote-`,
-    },
+    }),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 5000,
@@ -234,12 +258,72 @@ function verifyNonLoopbackBindRefusal() {
   return { status: result.status, diagnosticVerified: true };
 }
 
+async function verifyExclusiveDataDirOwnership(token) {
+  const contenderPort = await freePort();
+  const contender = spawn(process.execPath, ['server.js'], {
+    cwd: projectRoot,
+    env: isolatedTmuxEnvironment({
+      PORT: String(contenderPort),
+      HOST: '127.0.0.1',
+      WARPISH_DATA_DIR: smokeDataDir,
+      WARPISH_TOKEN_FILE: smokeTokenFile,
+      WARPISH_SESSION_PREFIX: smokePrefix,
+      WARPISH_SKIP_USER_ZSHRC: '1',
+    }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let contenderStdout = '';
+  let contenderStderr = '';
+  contender.stdout.on('data', (chunk) => { contenderStdout += chunk.toString(); });
+  contender.stderr.on('data', (chunk) => { contenderStderr += chunk.toString(); });
+  const startedAt = Date.now();
+
+  try {
+    const exit = await Promise.race([
+      new Promise((resolve) => contender.once('close', (code, signal) => resolve({ code, signal }))),
+      delay(5000).then(() => null),
+    ]);
+    assert(exit, 'second server sharing WARPISH_DATA_DIR did not fail fast', {
+      contenderPort,
+      stdout: contenderStdout,
+      stderr: contenderStderr,
+    });
+    assert(Number.isInteger(exit.code) && exit.code !== 0, 'second server sharing WARPISH_DATA_DIR did not exit with a nonzero status', {
+      contenderPort,
+      exit,
+      stdout: contenderStdout,
+      stderr: contenderStderr,
+    });
+    const diagnostic = `${contenderStdout}\n${contenderStderr}`;
+    assert(/already owned/i.test(diagnostic), 'shared WARPISH_DATA_DIR refusal diagnostic is missing "already owned"', {
+      contenderPort,
+      exit,
+      stdout: contenderStdout,
+      stderr: contenderStderr,
+    });
+
+    const primaryReadiness = await httpJson('/readyz', { token });
+    assert(primaryReadiness.ok === true, 'primary server became unhealthy after rejecting a shared DATA_DIR contender', primaryReadiness);
+    return {
+      contenderPort,
+      contenderStatus: exit.code,
+      rejectedWithinMs: Date.now() - startedAt,
+      diagnosticVerified: true,
+      primaryStayedReady: true,
+    };
+  } finally {
+    await terminateChild(contender);
+  }
+}
+
 function cleanupTmuxSessions(prefix) {
+  const tmuxEnv = isolatedTmuxEnvironment();
   let output = '';
   try {
     output = execFileSync(tmuxBin, ['list-sessions', '-F', '#S'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: tmuxEnv,
     });
   } catch {
     return [];
@@ -247,7 +331,7 @@ function cleanupTmuxSessions(prefix) {
   const cleaned = [];
   for (const name of output.split('\n').filter((value) => value.startsWith(prefix))) {
     try {
-      execFileSync(tmuxBin, ['kill-session', '-t', name], { stdio: 'ignore' });
+      execFileSync(tmuxBin, ['kill-session', '-t', name], { stdio: 'ignore', env: tmuxEnv });
       cleaned.push(name);
     } catch {}
   }
@@ -287,6 +371,8 @@ async function wsUntilMarker({
     const ws = new WebSocket(wsUrl);
     let output = '';
     let inputSent = false;
+    let controller = false;
+    let preludeSent = false;
     let readyFallbackTimer = null;
     let settled = false;
     const answeredTerminalQueries = new Set();
@@ -301,8 +387,22 @@ async function wsUntilMarker({
         try { ws.terminate(); } catch {}
         reject(error);
       } else {
-        try { ws.close(); } catch {}
-        resolve(value);
+        if (ws.readyState === WebSocket.CLOSED) {
+          resolve(value);
+          return;
+        }
+        const closeFallback = setTimeout(() => {
+          try { ws.terminate(); } catch {}
+          resolve(value);
+        }, 1000);
+        ws.once('close', () => {
+          clearTimeout(closeFallback);
+          resolve(value);
+        });
+        try { ws.close(1000, 'marker received'); } catch {
+          clearTimeout(closeFallback);
+          resolve(value);
+        }
       }
     };
 
@@ -317,26 +417,33 @@ async function wsUntilMarker({
         ['window-pixel-size', '\x1b[14t', '\x1b[4;900;1280t'],
       ];
       for (const [name, query, response] of probes) {
-        if (answeredTerminalQueries.has(name) || !output.includes(query) || ws.readyState !== WebSocket.OPEN) continue;
+        if (answeredTerminalQueries.has(name) || !controller || !output.includes(query) || ws.readyState !== WebSocket.OPEN) continue;
         answeredTerminalQueries.add(name);
         ws.send(JSON.stringify({ type: 'input', data: response, directTmux: false }));
       }
     };
 
     const maybeSendCommand = (force = false) => {
-      if (!sendCommand || inputSent || ws.readyState !== WebSocket.OPEN) return;
+      if (!sendCommand || inputSent || !controller || ws.readyState !== WebSocket.OPEN) return;
       const promptReady = /(?:^|\r|\n)[^\r\n]{0,180}(?:[%$#❯›➜>]\s*)$/u.test(output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''));
       if (!force && !promptReady) return;
       inputSent = true;
       ws.send(JSON.stringify({ type: 'input', data: sendCommand, directTmux }));
     };
 
-    ws.on('open', () => {
+    const sendControllerPrelude = () => {
+      if (preludeSent || !controller || ws.readyState !== WebSocket.OPEN) return;
+      preludeSent = true;
       for (const message of preludeMessages) ws.send(JSON.stringify(message));
       for (const message of preludeRawMessages) ws.send(message);
-      if (sendCommand) {
-        readyFallbackTimer = setTimeout(() => maybeSendCommand(true), 3000);
-      }
+      answerTerminalQueries();
+      maybeSendCommand(false);
+      if (sendCommand && !inputSent) readyFallbackTimer = setTimeout(() => maybeSendCommand(true), 3000);
+    };
+
+    ws.on('open', () => {
+      // Input is deliberately held until the server grants this socket the
+      // controller lease. This keeps consecutive smoke connections deterministic.
     });
 
     ws.on('message', (raw, isBinary) => {
@@ -354,6 +461,14 @@ async function wsUntilMarker({
       try {
         msg = JSON.parse(String(raw));
       } catch {
+        return;
+      }
+      if (msg.type === 'role') {
+        controller = msg.role === 'controller';
+        if (controller) sendControllerPrelude();
+        else if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'take-control', cols: 100, rows: 30 }));
+        }
         return;
       }
       if (msg.type === 'server-error') finish(new Error(msg.message));
@@ -375,19 +490,50 @@ async function waitForBlock({ token, sessionId, commandNeedle, outputNeedle }) {
     await delay(250);
   }
   const payload = await httpJson(`/api/sessions/${sessionId}/blocks`, { token });
-  throw new Error(`block not found/complete. blocks=${JSON.stringify(payload.blocks || [])}`);
+  const capture = await httpJson(`/api/sessions/${sessionId}/capture?lines=5000&ansi=1`, { token });
+  throw new Error(`block not found/complete. blocks=${JSON.stringify(payload.blocks || [])} capture=${JSON.stringify({
+    alternateActive: capture.alternateActive,
+    captureReason: capture.captureReason,
+    usingAlternate: capture.usingAlternate,
+    text: String(capture.text || '').slice(-4000),
+    active: String(capture.active || '').slice(-4000),
+    history: String(capture.history || '').slice(-4000),
+  })}`);
+}
+
+async function waitForRunningBlock({ token, sessionId, commandNeedle, outputNeedle }) {
+  for (let i = 0; i < 80; i += 1) {
+    const payload = await httpJson(`/api/sessions/${sessionId}/blocks`, { token });
+    const block = (payload.blocks || []).find((candidate) => candidate.command?.includes(commandNeedle));
+    if (block?.status === 'running' && (!outputNeedle || block.output?.includes(outputNeedle))) return block;
+    await delay(100);
+  }
+  const payload = await httpJson(`/api/sessions/${sessionId}/blocks`, { token });
+  const capture = await httpJson(`/api/sessions/${sessionId}/capture?lines=5000&ansi=1`, { token });
+  throw new Error(`running block not found. blocks=${JSON.stringify(payload.blocks || [])} capture=${JSON.stringify({
+    alternateActive: capture.alternateActive,
+    captureReason: capture.captureReason,
+    usingAlternate: capture.usingAlternate,
+    text: String(capture.text || '').slice(-4000),
+    active: String(capture.active || '').slice(-4000),
+    savedPrimary: String(capture.savedPrimary || '').slice(-4000),
+  })}`);
 }
 
 try {
+  const inheritedTmuxProbe = isolatedTmuxEnvironment({ TMUX: '/tmp/parent,1,0', TMUX_PANE: '%99' });
+  assert(!('TMUX' in inheritedTmuxProbe) && !('TMUX_PANE' in inheritedTmuxProbe) && inheritedTmuxProbe.TMUX_TMPDIR === smokeTmuxDir, 'smoke test did not isolate an inherited tmux client environment', inheritedTmuxProbe);
   await waitForServer();
   const parsed = new URL(tokenUrl);
   const token = parsed.searchParams.get('token');
   const nonLoopbackBindRefusal = verifyNonLoopbackBindRefusal();
+  const exclusiveDataDirOwnership = await verifyExclusiveDataDirOwnership(token);
   const security = await verifyHttpAndWebSocketSecurity(token);
   const health = await httpJson('/healthz');
   const readiness = await httpJson('/readyz', { token });
   const indexHtml = await httpText('/', { token });
   const appJs = await httpText('/app.js', { token });
+  const pasteSafetyJs = await httpText('/paste-safety.js', { token });
   const stylesCss = await httpText('/styles.css', { token });
   const serverJs = fs.readFileSync(path.join(projectRoot, 'server.js'), 'utf8');
   const sourceChecks = [
@@ -401,24 +547,29 @@ try {
     ['readable selection and mouse-mode helpers exist', /function\s+selectedReadableText\s*\(/.test(appJs) && /function\s+applyReaderMouseMode\s*\(/.test(appJs)],
     ['readable links are sanitized and open safely', appJs.includes('TERMINAL_LINK_RE') && appJs.includes('\\x00-\\x1f\\x7f') && appJs.includes("link.target = '_blank'") && appJs.includes("link.rel = 'noopener noreferrer'")],
     ['reader history capture remains deep and ANSI-aware', appJs.includes('const BIDI_READER_MAX_LINES = 2000') && appJs.includes('capture?lines=5000&ansi=1') && serverJs.includes("args.push('-e')")],
-    ['terminal output waits for xterm write completion', appJs.includes('term.write(new Uint8Array(event.data), handleTerminalWriteComplete)')],
+    ['terminal output waits for xterm write completion', /function\s+writeTerminalOutput\s*\([^)]*\)[\s\S]*?term\.write\(data,[\s\S]*?handleTerminalWriteComplete\(\)/.test(appJs) && appJs.includes('writeTerminalOutput(new Uint8Array(event.data))')],
     ['wheel handling can request tmux history in both directions', appJs.includes('const needsTmuxHistory = event.deltaY !== 0') && !appJs.includes('event.deltaY < 0 && (term.buffer?.active?.baseY ?? 0) === 0')],
     ['ANSI palette and 256-color modes remain supported', appJs.includes('XTERM_COLOR_MODE_PALETTE') && appJs.includes('XTERM_COLOR_MODE_P256') && !appJs.includes('mode === XTERM_COLOR_MODE_RGB || mode === 0x2000000')],
-    ['captured ANSI parsing and styling helpers exist', /function\s+parseAnsiCaptureEntries\s*\(/.test(appJs) && /function\s+applyAnsiSgr\s*\(/.test(appJs) && /function\s+applyTextStyle\s*\(/.test(appJs)],
+    ['captured ANSI parsing, styling, and conceal helpers exist', /function\s+parseAnsiCaptureEntries\s*\(/.test(appJs) && /function\s+applyAnsiSgr\s*\(/.test(appJs) && /function\s+applyTextStyle\s*\(/.test(appJs) && appJs.includes('cell.isInvisible?.()') && appJs.includes('maskInvisibleStyledText')],
+    ['interactive shell removes inherited NO_COLOR before user startup', serverJs.includes("'/usr/bin/env'") && serverJs.includes("'NO_COLOR'") && serverJs.includes("'COLORTERM=truecolor'")],
     ['direct tmux input and escape-key support exist', /function\s+writeTmuxInput\s*\(/.test(serverJs) && serverJs.includes("['\\x1b[A', 'Up']")],
     ['legacy automatic composer code is absent', ['warpish_composer_open', 'shouldAutoOpenRtlComposer', 'openComposerCapture', 'commandInputDirection'].every((needle) => !appJs.includes(needle))],
     ['terminal focus and readable wheel helpers exist', /function\s+focusTerminalReliably\s*\(/.test(appJs) && /function\s+handleBidiReaderWheel\s*\(/.test(appJs)],
     ['reader render and capture throttles exist', appJs.includes('BIDI_READER_RENDER_INTERVAL_MS') && appJs.includes('BIDI_CAPTURE_REFRESH_INTERVAL_MS')],
-    ['alternate-buffer reader selection is xterm-first', appJs.includes('const shouldUseCapture = (isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse))') && !appJs.includes('isSparseReadableEntries(entries) || lastCapturedReaderEntries.length > 0')],
-    ['reader history capture guard is present', appJs.includes('isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length') && !appJs.includes('renderBidiReader(entries.length ? entries : fallbackEntries')],
+    ['canonical reader history prevents xterm/capture ping-pong', appJs.includes("bidiReaderCaptureMode === 'history' && capturedReaderHistoryState.known") && appJs.includes('reduceCapturedReaderHistory') && appJs.includes('currentBidiReaderRenderState') && !appJs.includes('lastCapturedReaderEntries')],
+    ['reader history live-tail and confirmed-reset guards are present', appJs.includes('terminalOutputRevision > capturedReaderHistoryRevision') && appJs.includes('getReadableTerminalScreenEntries') && appJs.includes('capturedReaderHistoryState.pendingReset')],
+    ['alternate-screen mode captures the active tmux buffer and reconnect restores outer-buffer/cursor state', serverJs.includes("reason: 'alternate-empty'") && serverJs.includes("return { text: active, usingAlternate: true, reason: 'alternate-active' }") && /function\s+sendRuntimeSnapshot\s*\([^)]*\)[\s\S]*?capturePaneText\(sessionId,\s*\{\s*escape:\s*true,\s*history:\s*false\s*\}\)[\s\S]*?paneCursorState\(sessionId\)[\s\S]*?\\x1b\[\?1049h[\s\S]*?cursorState/.test(serverJs)],
     ['mixed-direction prompt helpers preserve logical text', /function\s+splitPromptRtlSuffix\s*\(/.test(appJs) && /function\s+appendBidiRunWithBoundarySpace\s*\(/.test(appJs) && appJs.includes('row.dataset.logicalText')],
     ['readable overlay styles and raw mouse passthrough exist', ['.bidi-segment.rtl', '.bidi-ghost', '.bidi-inline-cursor', '.bidi-style-run', 'body.reader-mouse-raw .bidi-reader'].every((needle) => stylesCss.includes(needle))],
     ['readable links have visible interaction styles', stylesCss.includes('.bidi-link') && stylesCss.includes('cursor: pointer') && stylesCss.includes('text-decoration: underline')],
     ['empty reader cannot hide xterm', stylesCss.includes('body.bidi-mode:not(.bidi-reader-has-content) .bidi-reader') && stylesCss.includes('body.bidi-mode.bidi-reader-has-content #terminal .xterm-screen')],
     ['RTL reader lines retain explicit direction and plaintext bidi', stylesCss.includes('.bidi-line.rtl') && stylesCss.includes('direction: rtl') && stylesCss.includes('unicode-bidi: plaintext')],
     ['shell stays configurable and launches login-interactive', serverJs.includes("const SHELL = process.env.WARPISH_SHELL || '/bin/zsh'") && /shellQuote\(SHELL\),\s*['"]-l['"],\s*['"]-i['"]/.test(serverJs)],
+    ['metadata writes use per-process randomized temporary files', !serverJs.includes('`${METADATA_FILE}.tmp`') && /temporaryFile\s*=\s*`\$\{METADATA_FILE\}[^`]*\$\{process\.pid\}[^`]*\$\{crypto\.randomBytes\(/.test(serverJs)],
     ['WebSocket input strips focus reports in JSON and raw modes', /function\s+stripTerminalFocusReports\s*\(/.test(serverJs) && serverJs.includes('stripTerminalFocusReports(String(raw))') && serverJs.includes('stripTerminalFocusReports(msg.data)')],
     ['WebSocket resize values remain bounded', /cols:\s*clampNumber\(msg\.cols,\s*120,\s*20,\s*300\)/.test(serverJs) && /rows:\s*clampNumber\(msg\.rows,\s*36,\s*5,\s*120\)/.test(serverJs)],
+    ['terminal paste removes implicit submits and control injection on every input surface', indexHtml.includes('/paste-safety.js') && /function\s+prepareTerminalPasteText\s*\(/.test(appJs) && /function\s+handleTerminalPaste\s*\(/.test(appJs) && pasteSafetyJs.includes('withoutImplicitSubmit') && pasteSafetyJs.includes('withoutTerminalControls') && appJs.includes('event.stopImmediatePropagation()') && !/function\s+handleTerminalPaste\s*\([^)]*\)[\s\S]{0,180}(?:!bidiReaderEnabled|isXtermHelperTarget\(event\.target\)\) return)/.test(appJs)],
+    ['block output is replaced from canonical tmux state and wrapped commands remain matchable', /function\s+replaceBlockOutputFromPane\s*\(/.test(serverJs) && /function\s+wrappedCommandEndLine\s*\(/.test(serverJs) && /block\.output\s*=\s*snapshot\.output/.test(serverJs) && !/pending\.text\s*=/.test(serverJs)],
     ['removed alternate-buffer heuristic stays absent', !appJs.includes('isAlternateBufferActive')],
   ];
   const failedSourceChecks = sourceChecks.filter(([, ok]) => !ok).map(([label]) => label);
@@ -440,6 +591,27 @@ try {
     sendCommand: 'echo __WARPISH_SMOKE__:$USER:$PWD\r',
     markerRegex,
     directTmux: true,
+  });
+  const colorEnvironmentMarker = '__WARPISH_COLOR_ENV_OK__';
+  const colorEnvironmentPrefix = `\x1b[38;2;205;127;50m${colorEnvironmentMarker}`;
+  const colorEnvironmentOutput = await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `if [[ -z "\${NO_COLOR+x}" && "\${COLORTERM:-}" == truecolor && "\${TERM:-}" != dumb ]]; then printf '\\033[38;2;205;127;50m${colorEnvironmentMarker}\\033[0m\\n'; else printf '__WARPISH_COLOR_ENV_BAD__:%s:%s:%s\\n' "\${NO_COLOR-unset}" "\${COLORTERM-unset}" "\${TERM-unset}"; fi\r`,
+    markerRegex: new RegExp(escapeForRegex(colorEnvironmentPrefix)),
+    directTmux: true,
+  });
+  assert(colorEnvironmentOutput.includes(colorEnvironmentPrefix), 'inherited NO_COLOR suppressed truecolor terminal output', colorEnvironmentOutput.slice(-1200));
+  let colorCapture = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    colorCapture = await httpJson(`/api/sessions/${smokeSessionId}/capture?lines=80&ansi=1`, { token });
+    if (String(colorCapture.text || '').includes(colorEnvironmentPrefix)) break;
+    await delay(100);
+  }
+  const colorEnvironmentVerified = String(colorCapture?.text || '').includes(colorEnvironmentPrefix);
+  assert(colorEnvironmentVerified, 'ANSI truecolor was lost between the shell, tmux capture, and readable transport', {
+    captureReason: colorCapture?.captureReason,
+    tail: String(colorCapture?.text || '').slice(-1200),
   });
   const focusFilteredText = '__WARPISH_FOCUS_FILTERED_INPUT__';
   await wsUntilMarker({
@@ -488,7 +660,6 @@ try {
     outputNeedle: '__WARPISH_SMOKE__',
   });
 
-  const escapeForRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const bidiText = 'سلام Mostafa، command: git status و path: /Users/test خواناست';
   const bidiCommand = `echo ${JSON.stringify(bidiText)}`;
   const bidiRegex = new RegExp(escapeForRegex(bidiText));
@@ -505,6 +676,183 @@ try {
     commandNeedle: 'echo',
     outputNeedle: bidiText,
   });
+
+  const redrawFixtureFile = path.join(smokeRoot, 'redraw-block-fixture.py');
+  const redrawReleaseFile = path.join(smokeRoot, 'redraw-block-release');
+  const redrawStartFile = path.join(smokeRoot, 'redraw-block-start');
+  const redrawReadyMarker = '__WARPISH_REDRAW_READY__';
+  const redrawRunningMarker = '__WARPISH_RUNNING_CANONICAL__';
+  const redrawHeadMarker = '__WARPISH_REDRAW_HEAD__';
+  const redrawProgressMarker = '__WARPISH_PRIMARY_PROGRESS_FINAL__ 100%';
+  const redrawFinalMarker = '__WARPISH_REDRAW_FINAL__';
+  const redrawPersianMarker = 'این پیام نهایی Hermes است';
+  const redrawLeakedDigits = '9876543210123456789';
+  fs.writeFileSync(redrawFixtureFile, [
+    'import os, sys, time',
+    'release_file = sys.argv[1]',
+    'start_file = sys.argv[2]',
+    'fd = sys.stdout.fileno()',
+    'def emit(data, pause=0.01):',
+    '    os.write(fd, data.encode("utf-8"))',
+    '    time.sleep(pause)',
+    `emit(${JSON.stringify(`${redrawHeadMarker}\r\n`)})`,
+    'emit("\\x1b[?1049h")',
+    `emit(${JSON.stringify(`\x1b[2J\x1b[H${redrawReadyMarker}\r\n`)})`,
+    'while not os.path.exists(start_file):',
+    '    time.sleep(0.02)',
+    'for frame in range(12):',
+    '    emit("\\x1b[2J\\x1b[H", 0.002)',
+    '    emit(f"__WARPISH_TRANSIENT_FRAME_{frame:02d}__\\r\\n", 0.002)',
+    '    emit("Hermes redraw transient Persian\\r\\n", 0.002)',
+    '    os.write(fd, b"\\x1b[")',
+    '    time.sleep(0.03)',
+    '    os.write(fd, b"38;5;173m")',
+    '    time.sleep(0.03)',
+    '    emit(f"{frame:09d}\\x1b[0m", 0.14)',
+    'os.write(fd, b"\\r\\x1b[")',
+    'time.sleep(0.03)',
+    `os.write(fd, ${JSON.stringify(redrawLeakedDigits)}.encode("ascii"))`,
+    'time.sleep(0.03)',
+    'os.write(fd, b"D")',
+    `emit(${JSON.stringify(`\x1b[2J\x1b[H${redrawRunningMarker}\r\n${redrawPersianMarker}\r\n`)})`,
+    'while not os.path.exists(release_file):',
+    '    time.sleep(0.02)',
+    'emit("\\x1b[?1049l")',
+    'for step in range(20):',
+    '    emit(f"\\r\\x1b[2K__WARPISH_PRIMARY_TRANSIENT_{step:02d}__ {step * 5}%", 0.002)',
+    `emit(${JSON.stringify(`\r\x1b[2K${redrawProgressMarker}\r\n${redrawFinalMarker}\r\n`)})`,
+  ].join('\n'));
+  const redrawCommand = `python3 ${shellQuote(redrawFixtureFile)} ${shellQuote(redrawReleaseFile)} ${shellQuote(redrawStartFile)}`;
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `${redrawCommand}\r`,
+    markerRegex: new RegExp(redrawReadyMarker),
+    directTmux: true,
+  });
+  await waitForRunningBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: 'redraw-block-fixture.py',
+    outputNeedle: redrawReadyMarker,
+  });
+  fs.writeFileSync(redrawStartFile, 'start');
+  const liveRedrawSamples = [];
+  const liveFrameIds = new Set();
+  for (let sampleIndex = 0; sampleIndex < 20; sampleIndex += 1) {
+    const payload = await httpJson(`/api/sessions/${smokeSessionId}/blocks`, { token });
+    const sample = payload.blocks?.find((candidate) => candidate.command?.includes('redraw-block-fixture.py'));
+    assert(sample?.status === 'running', 'redraw fixture stopped before live-frame sampling completed', { sampleIndex, sample });
+    const frameMatches = [...String(sample.output || '').matchAll(/__WARPISH_TRANSIENT_FRAME_(\d{2})__/gu)];
+    const digitMatches = [...String(sample.output || '').matchAll(/\b\d{9}\b/gu)];
+    assert(frameMatches.length <= 1 && digitMatches.length <= 1, 'live redraw snapshot accumulated multiple terminal frames', {
+      sampleIndex,
+      output: sample.output,
+    });
+    assert(!sample.output.includes('[38;5;173m') && !sample.output.includes(redrawLeakedDigits), 'live redraw snapshot exposed a partial ANSI/cursor fragment', {
+      sampleIndex,
+      output: sample.output,
+    });
+    assert(sample.output.length < 4000, 'live redraw snapshot grew like an append-only frame log', {
+      sampleIndex,
+      length: sample.output.length,
+      output: sample.output,
+    });
+    if (frameMatches[0]) liveFrameIds.add(frameMatches[0][1]);
+    liveRedrawSamples.push({
+      sampleIndex,
+      frameId: frameMatches[0]?.[1] || null,
+      digitFrame: digitMatches[0]?.[0] || null,
+      length: sample.output.length,
+    });
+    await delay(90);
+  }
+  assert(liveFrameIds.size >= 3, 'redraw regression did not sample enough advancing live frames', {
+    frameIds: [...liveFrameIds],
+    samples: liveRedrawSamples,
+  });
+  const runningRedrawBlock = await waitForRunningBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: 'redraw-block-fixture.py',
+    outputNeedle: redrawRunningMarker,
+  });
+  assert(countOccurrences(runningRedrawBlock.output, redrawRunningMarker) === 1, 'running redraw snapshot duplicated its canonical frame', runningRedrawBlock);
+  assert(countOccurrences(runningRedrawBlock.output, redrawPersianMarker) === 1, 'running redraw snapshot duplicated Persian content', runningRedrawBlock);
+  assert(!runningRedrawBlock.output.includes('__WARPISH_TRANSIENT_FRAME_'), 'running redraw snapshot retained an obsolete alternate-screen frame', runningRedrawBlock);
+  assert(!runningRedrawBlock.output.includes('[38;5;173m'), 'running redraw snapshot leaked a split ANSI fragment', runningRedrawBlock);
+  assert(!runningRedrawBlock.output.includes(redrawLeakedDigits), 'running redraw snapshot leaked a split numeric cursor parameter', runningRedrawBlock);
+  for (let frame = 0; frame < 12; frame += 1) {
+    assert(!runningRedrawBlock.output.includes(String(frame).padStart(9, '0')), 'running redraw snapshot retained a transient numeric frame', {
+      frame,
+      output: runningRedrawBlock.output,
+    });
+  }
+  assert(runningRedrawBlock.output.length < 4000, 'running redraw snapshot grew like an append-only frame log', {
+    length: runningRedrawBlock.output.length,
+    output: runningRedrawBlock.output,
+  });
+
+  fs.writeFileSync(redrawReleaseFile, 'release');
+  const finishedRedrawBlock = await waitForBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: 'redraw-block-fixture.py',
+    outputNeedle: redrawFinalMarker,
+  });
+  for (const markerText of [redrawHeadMarker, redrawProgressMarker, redrawFinalMarker]) {
+    assert(countOccurrences(finishedRedrawBlock.output, markerText) === 1, 'finished redraw snapshot lost or duplicated canonical output', {
+      marker: markerText,
+      block: finishedRedrawBlock,
+    });
+  }
+  assert(!finishedRedrawBlock.output.includes('__WARPISH_TRANSIENT_FRAME_'), 'finished redraw output retained alternate-screen history', finishedRedrawBlock);
+  assert(!finishedRedrawBlock.output.includes('__WARPISH_PRIMARY_TRANSIENT_'), 'finished redraw output retained carriage-return progress frames', finishedRedrawBlock);
+  assert(!finishedRedrawBlock.output.includes('[38;5;173m'), 'finished redraw output leaked a split ANSI fragment', finishedRedrawBlock);
+  assert(!finishedRedrawBlock.output.includes(redrawLeakedDigits), 'finished redraw output leaked a split numeric cursor parameter', finishedRedrawBlock);
+  for (let frame = 0; frame < 12; frame += 1) {
+    assert(!finishedRedrawBlock.output.includes(String(frame).padStart(9, '0')), 'finished redraw output retained a transient numeric frame', {
+      frame,
+      output: finishedRedrawBlock.output,
+    });
+  }
+  for (const priorOutput of ['__WARPISH_SMOKE__', colorEnvironmentMarker, focusFilteredText, directTmuxText, bidiText]) {
+    assert(!finishedRedrawBlock.output.includes(priorOutput), 'finished redraw block was contaminated by earlier session history', {
+      priorOutput,
+      output: finishedRedrawBlock.output,
+    });
+  }
+  assert(finishedRedrawBlock.output.length < 5000, 'finished redraw output exceeded the canonical transcript bound', {
+    length: finishedRedrawBlock.output.length,
+    output: finishedRedrawBlock.output,
+  });
+  const redrawBlockPersistenceVerified = true;
+
+  const postRedrawMarker = '__WARPISH_AFTER_REDRAW__';
+  await wsUntilMarker({
+    token,
+    sessionId: smokeSessionId,
+    sendCommand: `echo ${postRedrawMarker}\r`,
+    markerRegex: new RegExp(postRedrawMarker),
+    directTmux: true,
+  });
+  await waitForBlock({
+    token,
+    sessionId: smokeSessionId,
+    commandNeedle: postRedrawMarker,
+    outputNeedle: postRedrawMarker,
+  });
+  const metadataAfterRedraw = JSON.parse(fs.readFileSync(path.join(smokeDataDir, 'sessions.json'), 'utf8'));
+  const redrawEventFile = metadataAfterRedraw.sessions?.[smokeSessionId]?.eventFile;
+  assert(redrawEventFile, 'redraw replay regression could not locate the session event file', metadataAfterRedraw.sessions?.[smokeSessionId]);
+  fs.appendFileSync(redrawEventFile, `End;id=${finishedRedrawBlock.id};ended=${Date.now() / 1000};status=0\n`);
+  const replayedBlocks = await httpJson(`/api/sessions/${smokeSessionId}/blocks`, { token });
+  const redrawAfterDuplicateEnd = replayedBlocks.blocks?.find((candidate) => candidate.id === finishedRedrawBlock.id);
+  assert(JSON.stringify(redrawAfterDuplicateEnd) === JSON.stringify(finishedRedrawBlock), 'duplicate/replayed End mutated historical block output or metadata', {
+    before: finishedRedrawBlock,
+    after: redrawAfterDuplicateEnd,
+  });
+  const duplicateEndReplayVerified = true;
 
   const stoppedCreated = await httpJson('/api/sessions', {
     method: 'POST',
@@ -537,10 +885,12 @@ try {
     readinessOk: readiness.ok,
     security,
     nonLoopbackBindRefusal,
+    exclusiveDataDirOwnership,
     createdSession: smokeSessionId,
     resumeVerified: Boolean(listedSession?.alive),
     sidebarPreviewHasMarker: Boolean(listedSession?.preview?.includes('__WARPISH_SMOKE__')),
     terminalNativeUiVerified,
+    colorEnvironmentVerified,
     directTmuxInputVerified: true,
     focusFilteredInputVerified,
     rawWireFocusMessagesAccepted: true,
@@ -550,6 +900,16 @@ try {
     blockStatus: block.status,
     bidiBlockVerified: bidiBlock.status === 'success' && bidiBlock.output.includes(bidiText),
     bidiBlockOutput: bidiBlock.output,
+    redrawBlockPersistenceVerified,
+    duplicateEndReplayVerified,
+    redrawBlockDiagnostics: {
+      runningLength: runningRedrawBlock.output.length,
+      finishedLength: finishedRedrawBlock.output.length,
+      liveSampleCount: liveRedrawSamples.length,
+      distinctLiveFrames: liveFrameIds.size,
+      canonicalRunningFrames: countOccurrences(runningRedrawBlock.output, redrawRunningMarker),
+      canonicalFinalFrames: countOccurrences(finishedRedrawBlock.output, redrawFinalMarker),
+    },
     stoppedCleanupVerified,
     stoppedCleanupPurged: cleanupPayload.purged,
     isolatedRuntime: {

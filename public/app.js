@@ -29,6 +29,17 @@ const FitAddonCtor = window.FitAddon?.FitAddon;
 const WebLinksAddonCtor = window.WebLinksAddon?.WebLinksAddon;
 const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
+const TERMINAL_THEME = Object.freeze({
+  background: '#070711',
+  foreground: '#f4f1ff',
+  cursor: '#22d3ee',
+  selectionBackground: '#5b4a9f66',
+  black: '#11111b', red: '#fb7185', green: '#34d399', yellow: '#fbbf24',
+  blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#f3f4f6',
+  brightBlack: '#6b7280', brightRed: '#fda4af', brightGreen: '#86efac', brightYellow: '#fde68a',
+  brightBlue: '#93c5fd', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#ffffff',
+});
+
 const term = new TerminalCtor({
   cursorBlink: !prefersReducedMotion,
   cursorStyle: 'bar',
@@ -40,16 +51,7 @@ const term = new TerminalCtor({
   letterSpacing: 0,
   scrollback: 50000,
   allowTransparency: true,
-  theme: {
-    background: '#070711',
-    foreground: '#f4f1ff',
-    cursor: '#22d3ee',
-    selectionBackground: '#5b4a9f66',
-    black: '#11111b', red: '#fb7185', green: '#34d399', yellow: '#fbbf24',
-    blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#f3f4f6',
-    brightBlack: '#6b7280', brightRed: '#fda4af', brightGreen: '#86efac', brightYellow: '#fde68a',
-    brightBlue: '#93c5fd', brightMagenta: '#d8b4fe', brightCyan: '#67e8f9', brightWhite: '#ffffff',
-  },
+  theme: TERMINAL_THEME,
 });
 
 const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
@@ -73,8 +75,17 @@ let blocks = [];
 let currentSessionId = null;
 let ws = null;
 let connectionSerial = 0;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let terminalControlRole = 'controller';
+let terminalWriteDepth = 0;
+let controlClaimPending = false;
 let sessionGeneration = 0;
 let blocksRequestSerial = 0;
+let sessionsRequestSerial = 0;
+let sessionsRefreshPending = false;
+let sessionsRefreshQueued = null;
+let sessionsMutationDepth = 0;
 let pendingTerminalInputs = [];
 const intentionallyClosedSockets = new WeakSet();
 let refreshTimer = null;
@@ -91,8 +102,8 @@ const BIDI_TOKEN_RE = /(\s+|\S+)/gu;
 const TERMINAL_LINK_RE = /(https?:\/\/[^\s<>"'`\x00-\x1f\x7f]+|www\.[^\s<>"'`\x00-\x1f\x7f]+)/giu;
 const LINK_TRAILING_PUNCT_RE = /[.,;:!?،؛؟…]+$/u;
 const BIDI_READER_MAX_LINES = 2000;
-const BIDI_READER_RENDER_INTERVAL_MS = 70;
-const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 600;
+const BIDI_READER_RENDER_INTERVAL_MS = 100;
+const BIDI_CAPTURE_REFRESH_INTERVAL_MS = 2000;
 const BIDI_CAPTURE_SETTLE_DELAY_MS = 450;
 const BIDI_READER_BOTTOM_EPSILON = 10;
 const TERMINAL_FOCUS_REPORT_SUPPRESS_MS = 1200;
@@ -100,8 +111,10 @@ const XTERM_COLOR_MODE_PALETTE = 0x1000000;
 const XTERM_COLOR_MODE_P256 = 0x2000000;
 const XTERM_COLOR_MODE_RGB = 0x3000000;
 const ANSI_PALETTE = [
-  '#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
-  '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#ffffff',
+  TERMINAL_THEME.black, TERMINAL_THEME.red, TERMINAL_THEME.green, TERMINAL_THEME.yellow,
+  TERMINAL_THEME.blue, TERMINAL_THEME.magenta, TERMINAL_THEME.cyan, TERMINAL_THEME.white,
+  TERMINAL_THEME.brightBlack, TERMINAL_THEME.brightRed, TERMINAL_THEME.brightGreen, TERMINAL_THEME.brightYellow,
+  TERMINAL_THEME.brightBlue, TERMINAL_THEME.brightMagenta, TERMINAL_THEME.brightCyan, TERMINAL_THEME.brightWhite,
 ];
 const BLOCK_RENDER_LIMIT = 60;
 const BLOCK_OUTPUT_PREVIEW_CHARS = 3200;
@@ -118,9 +131,16 @@ let bidiReaderCaptureRefreshPending = false;
 let bidiReaderCaptureRefreshQueued = null;
 let bidiReaderCaptureSettleTimer = null;
 let lastBidiReaderCaptureAt = 0;
-let lastCapturedReaderEntries = [];
+let bidiReaderCaptureSuccessCount = 0;
+let bidiReaderCaptureMode = 'xterm';
+let capturedReaderHistoryState = { known: false, entries: [], pendingReset: null };
+let capturedReaderHistoryRevision = -1;
+let capturedReaderHistoryNeedsLiveScreen = false;
+let capturedReaderScreenKnown = false;
+let capturedReaderScreenEntries = [];
+let capturedReaderScreenRevision = -1;
+let terminalOutputRevision = 0;
 let bidiReaderHistoryModeUntil = 0;
-let stalePromptRecoverySent = false;
 let terminalFocusTimer = null;
 let terminalFocusSerial = 0;
 let terminalInputEventSerial = 0;
@@ -345,35 +365,39 @@ function cellTextStyle(cell) {
   const bold = Boolean(cell.isBold?.());
   const dim = Boolean(cell.isDim?.());
   const inverse = Boolean(cell.isInverse?.());
-  let fg = xtermColor(cell.getFgColorMode?.(), cell.getFgColor?.(), { bold });
-  let bg = xtermColor(cell.getBgColorMode?.(), cell.getBgColor?.());
-  if (inverse) [fg, bg] = [bg || 'var(--reader-fg)', fg || 'rgba(238, 234, 255, 0.16)'];
   const style = {
-    fg,
-    bg,
+    fg: xtermColor(cell.getFgColorMode?.(), cell.getFgColor?.(), { bold }),
+    bg: xtermColor(cell.getBgColorMode?.(), cell.getBgColor?.()),
     bold,
     dim,
     italic: Boolean(cell.isItalic?.()),
     underline: Boolean(cell.isUnderline?.()),
     inverse,
+    invisible: Boolean(cell.isInvisible?.()),
   };
   return style;
 }
 
 function textStyleKey(style = {}) {
   if (!style) return '';
-  return [style.fg || '', style.bg || '', style.bold ? 'b' : '', style.dim ? 'd' : '', style.italic ? 'i' : '', style.underline ? 'u' : '', style.inverse ? 'r' : ''].join('|');
+  return [style.fg || '', style.bg || '', style.bold ? 'b' : '', style.dim ? 'd' : '', style.italic ? 'i' : '', style.underline ? 'u' : '', style.inverse ? 'r' : '', style.invisible ? 'h' : ''].join('|');
 }
 
 function hasVisibleTextStyle(style = {}) {
-  return Boolean(style?.fg || style?.bg || style?.bold || style?.dim || style?.italic || style?.underline || style?.inverse);
+  return Boolean(style?.fg || style?.bg || style?.bold || style?.dim || style?.italic || style?.underline || style?.inverse || style?.invisible);
 }
 
 function applyTextStyle(element, style = {}) {
   if (!element || !hasVisibleTextStyle(style)) return;
   element.classList.add('bidi-style-run');
-  if (style.fg) element.style.color = style.fg;
-  if (style.bg) element.style.backgroundColor = style.bg;
+  const foreground = style.inverse
+    ? (style.bg || 'var(--reader-bg, #020617)')
+    : style.fg;
+  const background = style.inverse
+    ? (style.fg || 'var(--reader-fg, #eeeaff)')
+    : style.bg;
+  if (foreground) element.style.color = foreground;
+  if (background) element.style.backgroundColor = background;
   if (style.bold) element.style.fontWeight = '700';
   if (style.dim) element.style.opacity = '0.62';
   if (style.italic) element.style.fontStyle = 'italic';
@@ -389,6 +413,9 @@ function cloneTextStyle(style = {}) {
     italic: Boolean(style.italic),
     underline: Boolean(style.underline),
     inverse: Boolean(style.inverse),
+    invisible: Boolean(style.invisible),
+    fgPalette: Number.isFinite(style.fgPalette) ? style.fgPalette : null,
+    bgPalette: Number.isFinite(style.bgPalette) ? style.bgPalette : null,
   };
 }
 
@@ -401,10 +428,15 @@ function resetTextStyle(style, scope = 'all') {
     style.italic = false;
     style.underline = false;
     style.inverse = false;
+    style.invisible = false;
+    style.fgPalette = null;
+    style.bgPalette = null;
   } else if (scope === 'fg') {
     style.fg = '';
+    style.fgPalette = null;
   } else if (scope === 'bg') {
     style.bg = '';
+    style.bgPalette = null;
   }
   return style;
 }
@@ -414,37 +446,87 @@ function ansiRgb(r, g, b) {
   return `rgb(${clamp(r)}, ${clamp(g)}, ${clamp(b)})`;
 }
 
+function normalizedAnsiSgrCodes(rawCodes = '') {
+  if (rawCodes === '') return [0];
+  const codes = [];
+  for (const parameter of String(rawCodes).split(';')) {
+    if (!parameter.includes(':')) {
+      codes.push(parameter === '' ? 0 : Number(parameter));
+      continue;
+    }
+    const parts = parameter.split(':');
+    const code = Number(parts[0]);
+    const mode = Number(parts[1]);
+    if ((code === 38 || code === 48) && mode === 5) {
+      const index = parts.slice(2).find((part) => part !== '');
+      codes.push(code, 5, Number(index));
+      continue;
+    }
+    if ((code === 38 || code === 48) && mode === 2) {
+      const components = parts.slice(2).filter((part) => part !== '').slice(-3);
+      if (components.length === 3) {
+        codes.push(code, 2, ...components.map(Number));
+        continue;
+      }
+    }
+    codes.push(Number.isFinite(code) ? code : 0);
+  }
+  return codes.length ? codes : [0];
+}
+
 function applyAnsiSgr(style, rawCodes = '') {
-  const codes = rawCodes === ''
-    ? [0]
-    : rawCodes.split(';').filter((part) => part.length).map((part) => Number(part));
-  if (!codes.length) codes.push(0);
+  const codes = normalizedAnsiSgrCodes(rawCodes);
   for (let index = 0; index < codes.length; index += 1) {
     const code = Number.isFinite(codes[index]) ? codes[index] : 0;
     if (code === 0) resetTextStyle(style);
-    else if (code === 1) style.bold = true;
+    else if (code === 1) {
+      style.bold = true;
+      if (Number.isFinite(style.fgPalette) && style.fgPalette < 8) {
+        style.fg = xtermPaletteColor(style.fgPalette, true);
+      }
+    }
     else if (code === 2) style.dim = true;
     else if (code === 3) style.italic = true;
     else if (code === 4) style.underline = true;
     else if (code === 7) style.inverse = true;
-    else if (code === 22) { style.bold = false; style.dim = false; }
+    else if (code === 8) style.invisible = true;
+    else if (code === 22) {
+      style.bold = false;
+      style.dim = false;
+      if (Number.isFinite(style.fgPalette) && style.fgPalette < 8) {
+        style.fg = xtermPaletteColor(style.fgPalette, false);
+      }
+    }
     else if (code === 23) style.italic = false;
     else if (code === 24) style.underline = false;
     else if (code === 27) style.inverse = false;
+    else if (code === 28) style.invisible = false;
     else if (code === 39) resetTextStyle(style, 'fg');
     else if (code === 49) resetTextStyle(style, 'bg');
-    else if (code >= 30 && code <= 37) style.fg = xtermPaletteColor(code - 30, style.bold);
-    else if (code >= 90 && code <= 97) style.fg = xtermPaletteColor(code - 90 + 8, style.bold);
-    else if (code >= 40 && code <= 47) style.bg = xtermPaletteColor(code - 40);
-    else if (code >= 100 && code <= 107) style.bg = xtermPaletteColor(code - 100 + 8);
+    else if (code >= 30 && code <= 37) {
+      style.fgPalette = code - 30;
+      style.fg = xtermPaletteColor(style.fgPalette, style.bold);
+    } else if (code >= 90 && code <= 97) {
+      style.fgPalette = code - 90 + 8;
+      style.fg = xtermPaletteColor(style.fgPalette, style.bold);
+    } else if (code >= 40 && code <= 47) {
+      style.bgPalette = code - 40;
+      style.bg = xtermPaletteColor(style.bgPalette);
+    } else if (code >= 100 && code <= 107) {
+      style.bgPalette = code - 100 + 8;
+      style.bg = xtermPaletteColor(style.bgPalette);
+    }
     else if (code === 38 || code === 48) {
       const target = code === 38 ? 'fg' : 'bg';
+      const paletteTarget = code === 38 ? 'fgPalette' : 'bgPalette';
       const mode = codes[index + 1];
       if (mode === 2 && codes.length >= index + 5) {
         style[target] = ansiRgb(codes[index + 2], codes[index + 3], codes[index + 4]);
+        style[paletteTarget] = null;
         index += 4;
       } else if (mode === 5 && codes.length >= index + 3) {
-        style[target] = xtermPaletteColor(codes[index + 2], style.bold);
+        style[paletteTarget] = codes[index + 2];
+        style[target] = xtermPaletteColor(codes[index + 2], code === 38 && style.bold);
         index += 2;
       }
     }
@@ -482,7 +564,7 @@ function parseAnsiCaptureEntries(text = '') {
       mergeStyledSegment(entry.segments, part, cloneTextStyle(style));
     });
   };
-  const sgrPattern = /\x1b\[([0-9;]*)m/g;
+  const sgrPattern = /\x1b\[([0-9;:]*)m/g;
   let cursor = 0;
   let match;
   while ((match = sgrPattern.exec(String(text))) !== null) {
@@ -548,25 +630,44 @@ function appendStyledBidiContent(element, text, segments = []) {
   for (const segment of segments) {
     const wrapper = document.createElement('span');
     applyTextStyle(wrapper, segment.style);
-    renderBidiRuns(wrapper, segment.text || ' ');
+    const displayText = segment.style?.invisible
+      ? ' '.repeat(Math.max(1, String(segment.text || '').length))
+      : (segment.text || ' ');
+    renderBidiRuns(wrapper, displayText);
     element.appendChild(wrapper);
   }
 }
 
+function maskInvisibleStyledText(text = '', segments = []) {
+  if (!segments?.some((segment) => segment.style?.invisible)) return String(text || '');
+  return segments.map((segment) => (
+    segment.style?.invisible
+      ? ' '.repeat(String(segment.text || '').length)
+      : String(segment.text || '')
+  )).join('');
+}
+
 function appendStyledSegmentsToEntry(entry, text, segments = []) {
   const offset = entry.text.length;
+  if (segments?.length && !entry.segments.length && offset > 0) {
+    mergeStyledSegment(entry.segments, entry.text, null);
+  }
   entry.text += text;
   if (segments?.length) {
     for (const segment of segments) mergeStyledSegment(entry.segments, segment.text, segment.style);
+  } else if (entry.segments.length && text) {
+    mergeStyledSegment(entry.segments, text, null);
   }
   return offset;
 }
 
-function getReadableTerminalEntries(limit = BIDI_READER_MAX_LINES) {
+function getReadableTerminalEntries(limit = BIDI_READER_MAX_LINES, { activeScreenOnly = false } = {}) {
   const buffer = term.buffer?.active;
   if (!buffer) return [];
   const end = Math.min(buffer.length, buffer.baseY + term.rows);
-  const start = Math.max(0, end - limit * 2);
+  const start = activeScreenOnly
+    ? Math.max(0, buffer.baseY)
+    : Math.max(0, end - limit * 2);
   const activeLineIndex = buffer.baseY + buffer.cursorY;
   const entries = [];
 
@@ -594,26 +695,16 @@ function getReadableTerminalEntries(limit = BIDI_READER_MAX_LINES) {
   return entries.slice(-limit);
 }
 
+function getReadableTerminalScreenEntries() {
+  return getReadableTerminalEntries(Math.max(1, Math.min(term?.rows || 36, BIDI_READER_MAX_LINES)), { activeScreenOnly: true });
+}
+
 function getReadableTerminalLines(limit = BIDI_READER_MAX_LINES) {
   return getReadableTerminalEntries(limit).map((entry) => entry.text);
 }
 
 function isTerminalAlternateBuffer() {
   return term?.buffer?.active?.type === 'alternate';
-}
-
-function isSparseReadableEntries(entries = []) {
-  const visible = entries.map((entry) => String(entry?.text || '').trim()).filter(Boolean);
-  if (!visible.length) return true;
-  return visible.length <= 2 && visible.every((line) => /^(?:<[^>]+>|~|[│╭╰╮╯─\s]|\[[A-Z]+\])+$/u.test(line));
-}
-
-function entriesHaveVisibleText(entries = []) {
-  return entries.some((entry) => String(entry?.text || '').trim().length > 0);
-}
-
-function entriesHaveVisibleStyle(entries = []) {
-  return entries.some((entry) => Array.isArray(entry?.segments) && entry.segments.some((segment) => hasVisibleTextStyle(segment.style)));
 }
 
 function isBidiReaderNearBottom() {
@@ -624,10 +715,11 @@ function isBidiReaderNearBottom() {
 function renderBidiLine(row, entry) {
   const text = entry.text || ' ';
   const segments = Array.isArray(entry.segments) ? entry.segments : [];
+  const logicalText = maskInvisibleStyledText(text, segments);
   const ghostStart = Number.isFinite(entry.ghostStart) ? Math.max(0, Math.min(entry.ghostStart, text.length)) : null;
-  row.className = `bidi-line ${bidiDirection(text)}`;
+  row.className = `bidi-line ${bidiDirection(logicalText)}`;
   row.classList.toggle('active-cursor-line', Boolean(entry.isActiveLine));
-  row.dataset.logicalText = text;
+  row.dataset.logicalText = logicalText;
   if (ghostStart == null || ghostStart >= text.length) {
     appendStyledBidiContent(row, text, segments);
     return;
@@ -646,7 +738,7 @@ function renderBidiLine(row, entry) {
   if (ghostText) {
     const ghost = document.createElement('span');
     ghost.className = 'bidi-ghost';
-    ghost.dataset.ghostText = ghostText;
+    ghost.dataset.ghostText = maskInvisibleStyledText(ghostText, ghostSegments);
     appendStyledBidiContent(ghost, ghostText, ghostSegments);
     row.appendChild(ghost);
   }
@@ -670,10 +762,26 @@ function readableEntryComparableText(entry) {
   return String(entry?.text || '').replace(/[\s\u00a0]+$/gu, '');
 }
 
+function readableLinesShareUpdatingPrefix(left = '', right = '') {
+  const a = String(left || '').replace(/[\s\u00a0]+$/gu, '');
+  const b = String(right || '').replace(/[\s\u00a0]+$/gu, '');
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  const shorterLength = Math.min(a.length, b.length);
+  let commonPrefixLength = 0;
+  while (commonPrefixLength < shorterLength && a[commonPrefixLength] === b[commonPrefixLength]) {
+    commonPrefixLength += 1;
+  }
+
+  const requiredPrefixLength = Math.min(24, Math.max(8, Math.floor(shorterLength * 0.7)));
+  return commonPrefixLength >= requiredPrefixLength
+    && (a.startsWith(b) || b.startsWith(a) || commonPrefixLength >= Math.floor(shorterLength * 0.85));
+}
+
 function mergeCapturedReaderEntriesWithLiveTail(capturedEntries = [], liveEntries = []) {
   if (!capturedEntries.length) return liveEntries;
   if (!liveEntries.length) return capturedEntries;
-  if (capturedEntries.length <= liveEntries.length) return liveEntries;
 
   const capturedTexts = capturedEntries.map(readableEntryComparableText);
   const liveTexts = liveEntries.map(readableEntryComparableText);
@@ -697,8 +805,51 @@ function mergeCapturedReaderEntriesWithLiveTail(capturedEntries = [], liveEntrie
     return capturedEntries.slice(0, bestIndex).concat(liveEntries);
   }
 
+  // Interactive shells frequently redraw only the active prompt line. During that
+  // short redraw window xterm can expose a one-line buffer even though tmux still
+  // owns the preceding history. Treat a strongly matching prefix as an in-place
+  // update of the captured tail instead of replacing the whole readable surface.
+  const liveFirstText = liveTexts[0] || '';
+  const capturedTailIndex = capturedTexts.length - 1;
+  if (readableLinesShareUpdatingPrefix(capturedTexts[capturedTailIndex], liveFirstText)) {
+    return capturedEntries.slice(0, capturedTailIndex).concat(liveEntries);
+  }
+
   const tailLength = Math.min(liveEntries.length, Math.max(12, Math.min(term?.rows || 36, 80)));
   return capturedEntries.concat(liveEntries.slice(-tailLength));
+}
+
+function reduceCapturedReaderHistory(previousState = {}, nextInput = []) {
+  const previousEntries = normalizeReadableEntries(previousState.entries || []);
+  const nextEntries = normalizeReadableEntries(nextInput);
+  const normalizedNext = nextEntries.slice(-BIDI_READER_MAX_LINES);
+  if (!previousState.known || normalizedNext.length >= previousEntries.length) {
+    return { known: true, entries: normalizedNext, pendingReset: null, committed: true };
+  }
+
+  // A single short tmux snapshot can occur while a CLI redraws. Keep the last
+  // complete canonical history for that one sample, but accept a second
+  // consecutive short/empty snapshot so clear-history and real resets work.
+  if (!previousState.pendingReset) {
+    return {
+      known: true,
+      entries: previousEntries.slice(-BIDI_READER_MAX_LINES),
+      pendingReset: { entries: normalizedNext },
+      committed: false,
+    };
+  }
+
+  return { known: true, entries: normalizedNext, pendingReset: null, committed: true };
+}
+
+function resetCapturedReaderState() {
+  bidiReaderCaptureMode = 'xterm';
+  capturedReaderHistoryState = { known: false, entries: [], pendingReset: null };
+  capturedReaderHistoryRevision = -1;
+  capturedReaderHistoryNeedsLiveScreen = false;
+  capturedReaderScreenKnown = false;
+  capturedReaderScreenEntries = [];
+  capturedReaderScreenRevision = -1;
 }
 
 function captureBidiReaderAnchor() {
@@ -721,7 +872,10 @@ function restoreBidiReaderAnchor(anchor) {
   if (!anchor || !bidiReaderLines) return false;
   const lines = [...bidiReaderLines.querySelectorAll('.bidi-line')];
   if (!lines.length) return false;
-  const exact = lines.find((line) => (line.dataset.logicalText || line.textContent || '') === anchor.text);
+  const exact = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => (line.dataset.logicalText || line.textContent || '') === anchor.text)
+    .sort((left, right) => Math.abs(left.index - anchor.index) - Math.abs(right.index - anchor.index))[0]?.line;
   const fallback = lines[Math.min(anchor.index, lines.length - 1)];
   const node = exact || fallback;
   if (!node) return false;
@@ -731,12 +885,26 @@ function restoreBidiReaderAnchor(anchor) {
   return true;
 }
 
+function readerSelectionIsActive() {
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed || !bidiReaderLines) return false;
+  const withinReader = (node) => {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    return Boolean(element && bidiReaderLines.contains(element));
+  };
+  return withinReader(selection.anchorNode) || withinReader(selection.focusNode);
+}
+
 function renderBidiReader(input = getReadableTerminalEntries(), { force = false, keepScroll = false, source = 'xterm', preserveAwayFromBottom = false } = {}) {
   if (!bidiReaderLines) return;
   const entries = normalizeReadableEntries(input);
   const hasContent = entries.length > 0;
   const key = `${hasContent ? 'content' : 'empty'}\n${readableEntriesKey(entries)}`;
-  if (!force && key === lastBidiReaderRenderKey) return;
+  if (key === lastBidiReaderRenderKey) {
+    lastBidiReaderRenderSource = source;
+    return;
+  }
+  if (readerSelectionIsActive()) return;
   const previousNearBottom = isBidiReaderNearBottom();
   const wasPinned = !preserveAwayFromBottom && (previousNearBottom || (!keepScroll && bidiReaderPinnedToBottom));
   const previousScrollTop = bidiReaderLines.scrollTop;
@@ -776,32 +944,42 @@ function preferBidiReaderHistoryForScroll() {
   bidiReaderHistoryModeUntil = performance.now() + 3000;
 }
 
+function currentBidiReaderRenderState() {
+  if (bidiReaderCaptureMode === 'history' && capturedReaderHistoryState.known) {
+    const historyEntries = capturedReaderHistoryState.entries;
+    const shouldMergeLiveScreen = capturedReaderHistoryNeedsLiveScreen
+      || terminalOutputRevision > capturedReaderHistoryRevision;
+    const liveEntries = shouldMergeLiveScreen
+      ? normalizeReadableEntries(getReadableTerminalScreenEntries())
+      : [];
+    return {
+      entries: liveEntries.length
+        ? mergeCapturedReaderEntriesWithLiveTail(historyEntries, liveEntries)
+        : historyEntries,
+      source: 'capture',
+    };
+  }
+
+  if (bidiReaderCaptureMode === 'screen') {
+    const captureIsCurrent = capturedReaderScreenKnown
+      && capturedReaderScreenRevision === terminalOutputRevision
+      && terminalWriteDepth === 0;
+    return captureIsCurrent
+      ? { entries: capturedReaderScreenEntries, source: 'capture' }
+      : { entries: normalizeReadableEntries(getReadableTerminalScreenEntries()), source: 'xterm' };
+  }
+
+  return { entries: normalizeReadableEntries(getReadableTerminalEntries()), source: 'xterm' };
+}
+
 function flushBidiReaderUpdate() {
   bidiReaderUpdatePending = false;
   bidiReaderUpdateTimer = null;
   lastBidiReaderRenderAt = performance.now();
-  const entries = getReadableTerminalEntries();
-  const xtermHasText = entriesHaveVisibleText(entries);
-  const xtermIsSparse = isSparseReadableEntries(entries);
-  const readerIsScrolledInCaptureHistory = !bidiReaderPinnedToBottom && lastBidiReaderRenderSource === 'capture' && lastCapturedReaderEntries.length > 0;
-  const readerHasRicherCapture = lastCapturedReaderEntries.length >= entries.length + 80 && entriesHaveVisibleText(lastCapturedReaderEntries);
-  const shouldUseCapture = (isTerminalAlternateBuffer() && (!xtermHasText || xtermIsSparse))
-    || readerIsScrolledInCaptureHistory
-    || (isBidiReaderHistoryMode() && lastCapturedReaderEntries.length > entries.length)
-    || readerHasRicherCapture;
-  if (shouldUseCapture) {
-    if (lastCapturedReaderEntries.length) {
-      const renderEntries = xtermHasText
-        ? mergeCapturedReaderEntriesWithLiveTail(lastCapturedReaderEntries, entries)
-        : lastCapturedReaderEntries;
-      renderBidiReader(renderEntries, { keepScroll: readerIsScrolledInCaptureHistory || isBidiReaderHistoryMode() || !bidiReaderPinnedToBottom, source: 'capture' });
-    }
-    if (performance.now() - lastBidiReaderCaptureAt > BIDI_CAPTURE_REFRESH_INTERVAL_MS) {
-      refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom }).catch(() => renderBidiReader(entries, { force: true, source: 'xterm' }));
-    }
-    return;
-  }
-  renderBidiReader(entries, { source: 'xterm' });
+  const renderState = currentBidiReaderRenderState();
+  const keepScroll = bidiReaderCaptureMode === 'history'
+    && (!bidiReaderPinnedToBottom || isBidiReaderHistoryMode());
+  renderBidiReader(renderState.entries, { keepScroll, source: renderState.source });
 }
 
 function scheduleBidiReaderUpdate({ immediate = false } = {}) {
@@ -815,14 +993,16 @@ function scheduleBidiReaderUpdate({ immediate = false } = {}) {
 function scheduleBidiReaderCaptureAfterOutput() {
   if (!bidiReaderEnabled || !currentSessionId) return;
   if (bidiReaderCaptureSettleTimer) window.clearTimeout(bidiReaderCaptureSettleTimer);
+  const sinceLastCapture = performance.now() - lastBidiReaderCaptureAt;
+  const delay = Math.max(BIDI_CAPTURE_SETTLE_DELAY_MS, BIDI_CAPTURE_REFRESH_INTERVAL_MS - sinceLastCapture);
   bidiReaderCaptureSettleTimer = window.setTimeout(() => {
     bidiReaderCaptureSettleTimer = null;
-    refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom, preferCapture: true }).catch(() => {});
-  }, BIDI_CAPTURE_SETTLE_DELAY_MS);
+    refreshBidiReaderFromCapture({ keepScroll: !bidiReaderPinnedToBottom }).catch(() => {});
+  }, delay);
 }
 
 function handleTerminalWriteComplete() {
-  if (!bidiReaderPinnedToBottom && lastCapturedReaderEntries.length) {
+  if (!bidiReaderPinnedToBottom && capturedReaderHistoryState.known) {
     scheduleBidiReaderCaptureAfterOutput();
     return;
   }
@@ -847,41 +1027,43 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
   }
   const requestSessionId = currentSessionId;
   const requestGeneration = sessionGeneration;
+  const requestOutputRevision = terminalOutputRevision;
   const requestIsCurrent = () => requestSessionId === currentSessionId && requestGeneration === sessionGeneration;
   bidiReaderCaptureRefreshPending = true;
   lastBidiReaderCaptureAt = performance.now();
   try {
     const payload = await api(`/api/sessions/${encodeURIComponent(requestSessionId)}/capture?lines=5000&ansi=1`);
     if (!requestIsCurrent()) return;
-    const captureEntries = parseAnsiCaptureEntries(payload.text || '')
+    bidiReaderCaptureSuccessCount += 1;
+    const capturedSnapshot = parseAnsiCaptureEntries(payload.text || '')
       .slice(-BIDI_READER_MAX_LINES);
-    if (captureEntries.length) lastCapturedReaderEntries = captureEntries;
+    const captureIsHistory = !payload.usingAlternate || payload.captureReason === 'normal-rich-history';
+    if (captureIsHistory) {
+      capturedReaderHistoryState = reduceCapturedReaderHistory(capturedReaderHistoryState, capturedSnapshot);
+      capturedReaderHistoryNeedsLiveScreen = payload.captureReason === 'normal-rich-history'
+        && payload.alternateActive === true;
+      bidiReaderCaptureMode = 'history';
+      if (capturedReaderHistoryState.committed) capturedReaderHistoryRevision = requestOutputRevision;
+      if (capturedReaderHistoryState.pendingReset) {
+        bidiReaderCaptureRefreshQueued = {
+          keepScroll: true,
+          preferCapture: true,
+          preserveAwayFromBottom,
+        };
+      }
+    } else {
+      capturedReaderScreenKnown = true;
+      capturedReaderScreenEntries = capturedSnapshot;
+      capturedReaderScreenRevision = requestOutputRevision;
+      bidiReaderCaptureMode = 'screen';
+    }
 
-    const xtermEntries = getReadableTerminalEntries();
-    const xtermHasText = entriesHaveVisibleText(xtermEntries);
-    const xtermIsSparse = isSparseReadableEntries(xtermEntries);
-    const shouldUseCapture = Boolean(
-      captureEntries.length && (
-        preferCapture
-        || !xtermHasText
-        || (isTerminalAlternateBuffer() && xtermIsSparse)
-      )
-    );
-
-    const captureIsRicherHistory = captureEntries.length >= xtermEntries.length + 80;
-    const renderEntries = captureIsRicherHistory && xtermHasText
-      ? mergeCapturedReaderEntriesWithLiveTail(captureEntries, xtermEntries)
-      : (shouldUseCapture ? captureEntries : (xtermHasText ? xtermEntries : captureEntries));
-    const renderSource = (captureIsRicherHistory || shouldUseCapture || !xtermHasText) ? 'capture' : 'xterm';
-    renderBidiReader(renderEntries, { force: true, keepScroll, source: renderSource, preserveAwayFromBottom });
+    const renderState = currentBidiReaderRenderState();
+    renderBidiReader(renderState.entries, { keepScroll, source: renderState.source, preserveAwayFromBottom });
   } catch {
     if (!requestIsCurrent()) return;
-    const xtermEntries = getReadableTerminalEntries();
-    const useCaptureFallback = lastCapturedReaderEntries.length && (preferCapture || isTerminalAlternateBuffer() && isSparseReadableEntries(xtermEntries));
-    const fallbackEntries = useCaptureFallback
-      ? lastCapturedReaderEntries
-      : xtermEntries;
-    renderBidiReader(fallbackEntries, { force: true, keepScroll, source: useCaptureFallback ? 'capture' : 'xterm', preserveAwayFromBottom });
+    const renderState = currentBidiReaderRenderState();
+    renderBidiReader(renderState.entries, { keepScroll, source: renderState.source, preserveAwayFromBottom });
   } finally {
     bidiReaderCaptureRefreshPending = false;
     if (bidiReaderCaptureRefreshQueued) {
@@ -893,12 +1075,11 @@ async function refreshBidiReaderFromCapture({ keepScroll = false, preferCapture 
 }
 
 function sendResizeIfChanged(cols = term.cols || 120, rows = term.rows || 36) {
+  if (terminalControlRole !== 'controller' || ws?.readyState !== WebSocket.OPEN) return;
   const key = `${cols}x${rows}`;
   if (key === lastSentTerminalSize) return;
   lastSentTerminalSize = key;
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-  }
+  ws.send(JSON.stringify({ type: 'resize', cols, rows }));
 }
 
 function refitTerminal() {
@@ -1042,17 +1223,24 @@ function focusTerminalReliably() {
   clearTerminalFocusFollowups();
   focusTerminalOnceWithoutScroll();
   requestAnimationFrame(() => {
-    if (serial === terminalFocusSerial) focusTerminalOnceWithoutScroll();
+    if (serial === terminalFocusSerial && !hasCompetingUserFocus()) focusTerminalOnceWithoutScroll();
   });
   for (const delayMs of [80, 240]) {
     const timer = setTimeout(() => {
       terminalFocusFollowupTimers = terminalFocusFollowupTimers.filter((item) => item !== timer);
-      if (serial !== terminalFocusSerial) return;
+      if (serial !== terminalFocusSerial || hasCompetingUserFocus()) return;
       suppressTerminalFocusReports();
       focusTerminalOnceWithoutScroll();
     }, delayMs);
     terminalFocusFollowupTimers.push(timer);
   }
+}
+
+function hasCompetingUserFocus() {
+  const active = document.activeElement;
+  if (!active || active === document.body || active === document.documentElement) return false;
+  if (active === terminalHelperTextarea() || terminalEl?.contains(active)) return false;
+  return true;
 }
 
 function shouldPreserveControlFocus(event) {
@@ -1069,16 +1257,16 @@ function clearAutoRawInput() {
 }
 
 function handleTerminalInput(data) {
-  terminalInputEventSerial += 1;
+  // Focus tracking can emit ESC[I / ESC[O merely because the reader hands
+  // focus to xterm. Those protocol replies are not evidence that xterm
+  // handled the user's key; counting them would suppress the key fallback.
+  if (!isTerminalFocusReport(data)) terminalInputEventSerial += 1;
+  if (terminalWriteDepth > 0 && terminalControlRole !== 'controller') return;
   if (shouldSuppressTerminalInput(data)) return;
   const filtered = stripTerminalFocusReports(data);
   if (!filtered) return;
-  const sessionId = currentSessionId;
-  if (maybeRecoverStalePromptBeforeInput(filtered)) {
-    setTimeout(() => sendRaw(filtered, { sessionId }), 80);
-  } else {
-    sendRaw(filtered, { sessionId });
-  }
+  if (isTerminalFocusReport(filtered) && terminalControlRole !== 'controller') return;
+  sendRaw(filtered, { sessionId: currentSessionId });
 }
 
 const initialParams = new URLSearchParams(window.location.search);
@@ -1117,12 +1305,31 @@ async function parseApiResponse(response) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    credentials: 'same-origin',
-    headers: authHeaders(options),
-  });
-  return parseApiResponse(response);
+  const { timeoutMs = 15_000, signal: externalSignal, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const abortFromExternalSignal = () => controller.abort(externalSignal?.reason);
+  if (externalSignal) {
+    if (externalSignal.aborted) abortFromExternalSignal();
+    else externalSignal.addEventListener('abort', abortFromExternalSignal, { once: true });
+  }
+  const timeout = window.setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeoutMs);
+  try {
+    const response = await fetch(path, {
+      ...fetchOptions,
+      credentials: 'same-origin',
+      headers: authHeaders(fetchOptions),
+      signal: controller.signal,
+    });
+    return await parseApiResponse(response);
+  } catch (error) {
+    if (controller.signal.aborted && !externalSignal?.aborted) {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    externalSignal?.removeEventListener?.('abort', abortFromExternalSignal);
+  }
 }
 
 function setStatus(kind, text, detail) {
@@ -1427,26 +1634,90 @@ async function loadBlocks(sessionId = currentSessionId, { force = false } = {}) 
   renderBlocks();
 }
 
-async function refreshSessions({ selectId, createIfEmpty = false } = {}) {
-  const payload = await api('/api/sessions');
-  sessions = payload.sessions || [];
-  const liveSessions = sessions.filter((session) => session.alive);
+function queueSessionsRefresh({ selectId, createIfEmpty = false } = {}) {
+  sessionsRefreshQueued = {
+    selectId: selectId || sessionsRefreshQueued?.selectId,
+    createIfEmpty: Boolean(createIfEmpty || sessionsRefreshQueued?.createIfEmpty),
+  };
+}
 
-  if (createIfEmpty && liveSessions.length === 0) {
-    const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({}) });
-    sessions = created.sessions || [created.session];
-    selectId = created.session.id;
+function runQueuedSessionsRefresh() {
+  if (!sessionsRefreshQueued || sessionsRefreshPending || sessionsMutationDepth > 0) return;
+  const queued = sessionsRefreshQueued;
+  sessionsRefreshQueued = null;
+  window.setTimeout(() => refreshSessions(queued).catch(() => {}), 0);
+}
+
+function beginSessionsMutation() {
+  sessionsMutationDepth += 1;
+  sessionsRequestSerial += 1;
+}
+
+function endSessionsMutation() {
+  sessionsMutationDepth = Math.max(0, sessionsMutationDepth - 1);
+  sessionsRequestSerial += 1;
+  runQueuedSessionsRefresh();
+}
+
+function resetTerminalSurface() {
+  blocks = [];
+  resetCapturedReaderState();
+  lastBidiReaderCaptureAt = 0;
+  bidiReaderCaptureSuccessCount = 0;
+  terminalOutputRevision = 0;
+  lastBidiReaderRenderSource = 'xterm';
+  renderBlocks();
+  term.reset();
+  lastBidiReaderRenderKey = '';
+  bidiReaderPinnedToBottom = true;
+  scheduleBidiReaderUpdate({ immediate: true });
+}
+
+async function refreshSessions(options = {}) {
+  let { selectId, createIfEmpty = false } = options;
+  if (sessionsRefreshPending || sessionsMutationDepth > 0) {
+    queueSessionsRefresh({ selectId, createIfEmpty });
+    return;
   }
 
-  renderSessions();
+  const requestSerial = ++sessionsRequestSerial;
+  sessionsRefreshPending = true;
+  try {
+    const payload = await api('/api/sessions', { timeoutMs: 10_000 });
+    if (requestSerial !== sessionsRequestSerial || sessionsMutationDepth > 0) return;
+    sessions = payload.sessions || [];
+    const liveSessions = sessions.filter((session) => session.alive);
 
-  const targetId = selectId
-    || (currentSessionId && sessions.some((session) => session.id === currentSessionId && session.alive) ? currentSessionId : null)
-    || sessions.find((session) => session.alive)?.id;
+    if (createIfEmpty && liveSessions.length === 0) {
+      const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({}), timeoutMs: 20_000 });
+      if (requestSerial !== sessionsRequestSerial || sessionsMutationDepth > 0) return;
+      sessions = created.sessions || [created.session];
+      selectId = created.session.id;
+    }
 
-  if (targetId && targetId !== currentSessionId) connectToSession(targetId);
-  else if (targetId && blocksOpen) loadBlocks(targetId, { force: true }).catch(() => {});
-  if (!targetId) updateHeader();
+    renderSessions();
+
+    const targetId = selectId
+      || (currentSessionId && sessions.some((session) => session.id === currentSessionId && session.alive) ? currentSessionId : null)
+      || sessions.find((session) => session.alive)?.id;
+
+    if (targetId && targetId !== currentSessionId) connectToSession(targetId);
+    else if (targetId && blocksOpen) loadBlocks(targetId, { force: true }).catch(() => {});
+    if (!targetId) {
+      clearReconnectTimer();
+      if (currentSessionId) {
+        disconnectCurrent({ quiet: true });
+        currentSessionId = null;
+        sessionGeneration += 1;
+        blocksRequestSerial += 1;
+        resetTerminalSurface();
+      }
+      updateHeader();
+    }
+  } finally {
+    sessionsRefreshPending = false;
+    runQueuedSessionsRefresh();
+  }
 }
 
 async function clearStoppedSessions() {
@@ -1454,13 +1725,16 @@ async function clearStoppedSessions() {
   if (!stoppedCount) return;
   if (!window.confirm(`Clear ${stoppedCount} stopped session${stoppedCount === 1 ? '' : 's'} from history? Live tmux sessions stay running.`)) return;
   clearStoppedSessionsButton.disabled = true;
+  beginSessionsMutation();
   try {
-    const payload = await api('/api/sessions?stopped=1', { method: 'DELETE' });
+    const payload = await api('/api/sessions?stopped=1', { method: 'DELETE', timeoutMs: 20_000 });
     sessions = payload.sessions || [];
     if (currentSessionId && !sessions.some((session) => session.id === currentSessionId && session.alive)) {
+      disconnectCurrent({ quiet: true });
       currentSessionId = null;
       sessionGeneration += 1;
       blocksRequestSerial += 1;
+      resetTerminalSurface();
     }
     renderSessions();
     setStatus('ok', 'history cleaned', `${payload.purged?.length || stoppedCount} stopped removed`);
@@ -1469,6 +1743,7 @@ async function clearStoppedSessions() {
   } catch (error) {
     setStatus('bad', 'clear failed', error.message);
   } finally {
+    endSessionsMutation();
     updateSessionHistoryActions();
   }
 }
@@ -1493,6 +1768,26 @@ function disconnectCurrent({ quiet = false } = {}) {
     try { socket.close(); } catch {}
   }
   if (ws === socket) ws = null;
+}
+
+function clearReconnectTimer({ resetAttempts = true } = {}) {
+  if (reconnectTimer) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  if (resetAttempts) reconnectAttempts = 0;
+}
+
+function scheduleReconnect(sessionId) {
+  if (!sessionId || sessionId !== currentSessionId || reconnectTimer) return;
+  const delay = Math.min(8000, 500 * (2 ** Math.min(reconnectAttempts, 4)));
+  reconnectAttempts += 1;
+  setStatus('warn', 'reconnecting…', `retrying in ${Math.max(1, Math.ceil(delay / 1000))}s`);
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    if (sessionId !== currentSessionId) return;
+    const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (session?.alive) connectToSession(sessionId, { reconnecting: true });
+    else refreshSessions({ selectId: sessionId }).catch(() => scheduleReconnect(sessionId));
+  }, delay);
 }
 
 function pendingInputChars(sessionId) {
@@ -1524,7 +1819,7 @@ function queueTerminalInput({ data, directTmux, sessionId }) {
 }
 
 function sendTerminalInputOverSocket(socket, item) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+  if (!socket || socket.readyState !== WebSocket.OPEN || terminalControlRole !== 'controller') return false;
   const allowFocusReports = readerMouseMode === 'raw' && performance.now() > suppressTerminalFocusReportsUntil;
   try {
     socket.send(JSON.stringify({ type: 'input', data: item.data, directTmux: item.directTmux, allowFocusReports }));
@@ -1535,6 +1830,7 @@ function sendTerminalInputOverSocket(socket, item) {
 }
 
 function flushPendingTerminalInputs(socket, sessionId) {
+  if (terminalControlRole !== 'controller') return;
   const remaining = [];
   for (const item of pendingTerminalInputs) {
     if (item.sessionId !== sessionId) {
@@ -1548,6 +1844,52 @@ function flushPendingTerminalInputs(socket, sessionId) {
   pendingTerminalInputs = remaining;
 }
 
+function claimTerminalControl() {
+  if (terminalControlRole === 'controller') {
+    flushPendingTerminalInputs(ws, currentSessionId);
+    return;
+  }
+  if (controlClaimPending || ws?.readyState !== WebSocket.OPEN || !currentSessionId) return;
+  const { cols, rows } = currentDims();
+  controlClaimPending = true;
+  try {
+    ws.send(JSON.stringify({ type: 'take-control', cols, rows }));
+    setStatus('warn', 'taking control…', 'waiting for this tab to become the terminal controller');
+  } catch {
+    controlClaimPending = false;
+  }
+}
+
+function applyTerminalControlRole(role, sessionTitle = activeSession()?.title || 'terminal') {
+  terminalControlRole = role === 'controller' ? 'controller' : 'spectator';
+  controlClaimPending = false;
+  if (terminalCard) terminalCard.dataset.controlRole = terminalControlRole;
+  if (terminalControlRole === 'controller') {
+    lastSentTerminalSize = '';
+    const { cols, rows } = currentDims();
+    sendResizeIfChanged(cols, rows);
+    flushPendingTerminalInputs(ws, currentSessionId);
+    setStatus('ok', 'connected', `${sessionTitle} • this tab has control`);
+  } else {
+    setStatus('warn', 'view only', `${sessionTitle} • type or click the terminal to take control`);
+    if (pendingInputChars(currentSessionId) > 0) claimTerminalControl();
+  }
+}
+
+function writeTerminalOutput(data) {
+  terminalOutputRevision += 1;
+  terminalWriteDepth += 1;
+  try {
+    term.write(data, () => {
+      terminalWriteDepth = Math.max(0, terminalWriteDepth - 1);
+      handleTerminalWriteComplete();
+    });
+  } catch (error) {
+    terminalWriteDepth = Math.max(0, terminalWriteDepth - 1);
+    throw error;
+  }
+}
+
 function refreshReadableFromTmuxSoon(delay = 250, preferCapture = false) {
   if (!bidiReaderEnabled || !currentSessionId) return;
   setTimeout(() => {
@@ -1556,10 +1898,11 @@ function refreshReadableFromTmuxSoon(delay = 250, preferCapture = false) {
   }, delay);
 }
 
-function connectToSession(sessionId) {
+function connectToSession(sessionId, { reconnecting = false } = {}) {
   const session = sessions.find((candidate) => candidate.id === sessionId);
   if (!session?.alive) return;
 
+  clearReconnectTimer({ resetAttempts: !reconnecting });
   connectionSerial += 1;
   const serial = connectionSerial;
   sessionGeneration += 1;
@@ -1570,9 +1913,13 @@ function connectToSession(sessionId) {
   clearTerminalFocusFollowups();
   disconnectCurrent({ quiet: true });
   currentSessionId = sessionId;
-  stalePromptRecoverySent = false;
-  lastCapturedReaderEntries = [];
+  terminalControlRole = 'pending';
+  controlClaimPending = false;
+  lastSentTerminalSize = '';
+  resetCapturedReaderState();
   lastBidiReaderCaptureAt = 0;
+  bidiReaderCaptureSuccessCount = 0;
+  terminalOutputRevision = 0;
   bidiReaderCaptureRefreshQueued = null;
   lastBidiReaderRenderSource = 'xterm';
   blocks = [];
@@ -1593,10 +1940,8 @@ function connectToSession(sessionId) {
 
   socket.addEventListener('open', () => {
     if (serial !== connectionSerial || ws !== socket) return;
-    setStatus('ok', 'connected', `${session.title} • tmux resumable`);
-    const { cols, rows } = currentDims();
-    socket.send(JSON.stringify({ type: 'resize', cols, rows }));
-    flushPendingTerminalInputs(socket, sessionId);
+    reconnectAttempts = 0;
+    setStatus('warn', 'connected', `${session.title} • negotiating control`);
     refreshReadableFromTmuxSoon(200, true);
     focusPreferredInput();
   });
@@ -1604,8 +1949,7 @@ function connectToSession(sessionId) {
   socket.addEventListener('message', (event) => {
     if (serial !== connectionSerial || ws !== socket) return;
     if (event.data instanceof ArrayBuffer) {
-      scheduleBidiReaderCaptureAfterOutput();
-      term.write(new Uint8Array(event.data), handleTerminalWriteComplete);
+      writeTerminalOutput(new Uint8Array(event.data));
       return;
     }
 
@@ -1613,15 +1957,19 @@ function connectToSession(sessionId) {
     try {
       msg = JSON.parse(event.data);
     } catch {
-      scheduleBidiReaderCaptureAfterOutput();
-      term.write(event.data, handleTerminalWriteComplete);
+      writeTerminalOutput(event.data);
       return;
     }
 
     if (msg.type === 'hello') {
-      setStatus('ok', 'connected', `tmux ${msg.sessionId} • attach pid ${msg.pid}`);
+      if (terminalControlRole === 'pending') {
+        setStatus('warn', 'connected', `tmux ${msg.sessionId} • negotiating control`);
+      } else {
+        applyTerminalControlRole(terminalControlRole, session.title);
+      }
       refreshReadableFromTmuxSoon(200, true);
-      focusPreferredInput();
+    } else if (msg.type === 'role') {
+      applyTerminalControlRole(msg.role, session.title);
     } else if (msg.type === 'server-error') {
       setStatus('bad', 'error', msg.message || 'server error');
       term.writeln(`\r\n\x1b[31m${msg.message || 'server error'}\x1b[0m`);
@@ -1642,12 +1990,10 @@ function connectToSession(sessionId) {
     if (intentionalClose) {
       setStatus('warn', 'detached', 'tmux session kept alive');
     } else {
-      const droppedChars = discardPendingTerminalInputs(sessionId);
-      setStatus('bad', 'disconnected', droppedChars ? `${droppedChars} queued chars were not sent` : 'click session to attach again');
+      scheduleReconnect(sessionId);
     }
     setTimeout(() => {
       refreshSessions().catch(() => {});
-      if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
     }, 300);
   });
 
@@ -1667,6 +2013,10 @@ function sendRaw(data, { directTmux = false, sessionId = currentSessionId } = {}
   const item = { data: String(data || ''), directTmux: Boolean(directTmux), sessionId };
   if (ws?.readyState === WebSocket.OPEN && sendTerminalInputOverSocket(ws, item)) return;
   if (!queueTerminalInput(item)) return;
+  if (ws?.readyState === WebSocket.OPEN) {
+    claimTerminalControl();
+    return;
+  }
   if (ws?.readyState === WebSocket.CONNECTING) {
     setStatus('warn', 'attaching…', `${pendingInputChars(sessionId)} input chars queued`);
     return;
@@ -1677,7 +2027,7 @@ function sendRaw(data, { directTmux = false, sessionId = currentSessionId } = {}
 function selectedReadableText() {
   const selection = window.getSelection?.();
   if (!selection || selection.isCollapsed || !bidiReaderLines) return '';
-  const text = selection.toString();
+  const text = selection.toString().replace(/▌/gu, '');
   if (!text) return '';
   for (let index = 0; index < selection.rangeCount; index += 1) {
     const range = selection.getRangeAt(index);
@@ -1770,40 +2120,10 @@ function forwardReaderKeyToXterm(event) {
   return terminalInputEventSerial !== inputSerialBefore;
 }
 
-function currentCursorLineText() {
-  const buffer = term.buffer?.active;
-  if (!buffer) return '';
-  const line = buffer.getLine(buffer.baseY + buffer.cursorY);
-  return line?.translateToString(true).trimEnd() || '';
-}
-
-function looksLikeShellPrompt(text = '') {
-  return /(?:^|\s)[^\n]{0,160}(?:[%$#❯›➜>]\s*)(?:.*)$/u.test(String(text));
-}
-
-function looksLikePromptOnly(text = '') {
-  return /^[^\n]{0,160}(?:[%$#❯›➜>]\s*)$/u.test(String(text).trimEnd());
-}
-
-function shouldRecoverStalePromptBeforeInput(data) {
-  if (stalePromptRecoverySent || !bidiReaderEnabled || !data || data.length !== 1 || data < ' ') return false;
-  const activeLine = currentCursorLineText();
-  if (activeLine.trim()) return looksLikePromptOnly(activeLine);
-  const recentLines = getReadableTerminalLines(12).filter((line) => line.trim());
-  const lastNonEmpty = recentLines.at(-1) || '';
-  return looksLikeShellPrompt(lastNonEmpty);
-}
-
-function maybeRecoverStalePromptBeforeInput(data) {
-  if (!shouldRecoverStalePromptBeforeInput(data)) return false;
-  stalePromptRecoverySent = true;
-  sendRaw('\x07\x15', { directTmux: true });
-  return true;
-}
-
 function handleReadableTerminalKeydown(event) {
   if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
   if (isXtermHelperTarget(event.target) || event.isComposing || event.metaKey) return;
+  if (event.ctrlKey && event.shiftKey && ['c', 'v'].includes(event.key.toLowerCase())) return;
   event.preventDefault();
   event.stopPropagation();
   suppressTerminalFocusReports();
@@ -1812,15 +2132,26 @@ function handleReadableTerminalKeydown(event) {
   if (data) term.input(data, true);
 }
 
-function handleReadableTerminalPaste(event) {
-  if (!bidiReaderEnabled || !isTerminalKeyTarget(event)) return;
-  if (isXtermHelperTarget(event.target)) return;
+function prepareTerminalPasteText(rawText, { bracketedPasteMode = false } = {}) {
+  return window.WarpishPasteSafety.prepareTerminalPasteText(rawText, { bracketedPasteMode });
+}
+
+function handleTerminalPaste(event) {
+  if (!isTerminalKeyTarget(event)) return;
   const text = event.clipboardData?.getData('text/plain');
   if (!text) return;
+  const prepared = prepareTerminalPasteText(text, {
+    bracketedPasteMode: Boolean(term.modes?.bracketedPasteMode),
+  });
   event.preventDefault();
   event.stopPropagation();
+  event.stopImmediatePropagation();
   focusTerminalOnceWithoutScroll();
-  term.paste(text);
+  if (prepared.text) term.paste(prepared.text);
+  const lineDetail = prepared.internalLineBreaks
+    ? `${prepared.internalLineBreaks + 1} lines inserted safely`
+    : 'text inserted safely';
+  setStatus('ok', 'pasted — press Enter to run', lineDetail);
 }
 
 term.onData((data) => handleTerminalInput(data));
@@ -1866,6 +2197,7 @@ async function refreshBidiReaderForScroll(deltaY) {
 
 function handleBidiReaderWheel(event) {
   if (!bidiReaderEnabled || !bidiReaderLines) return;
+  if (readerMouseMode === 'raw') return;
   event.preventDefault();
   event.stopPropagation();
   const needsTmuxHistory = event.deltaY !== 0;
@@ -1875,20 +2207,29 @@ function handleBidiReaderWheel(event) {
 }
 
 resizeObserver.observe(terminalEl);
-terminalEl.addEventListener('pointerdown', () => focusTerminalSoon());
+terminalEl.addEventListener('pointerdown', () => {
+  claimTerminalControl();
+  focusTerminalSoon();
+});
 terminalCard?.addEventListener('pointerdown', (event) => {
+  if (readerMouseMode === 'reader' && event.target?.closest?.('#bidiReader')) return;
   if (!shouldPreserveControlFocus(event)) focusTerminalSoon();
 });
 terminalCard?.addEventListener('click', (event) => {
+  if (readerSelectionIsActive()) return;
   if (!shouldPreserveControlFocus(event)) focusPreferredInput();
 });
 terminalCard?.addEventListener('keydown', handleReadableTerminalKeydown, { capture: true });
-terminalCard?.addEventListener('paste', handleReadableTerminalPaste, { capture: true });
+terminalCard?.addEventListener('paste', handleTerminalPaste, { capture: true });
 bidiReaderLines?.addEventListener('scroll', handleBidiReaderScroll, { passive: true });
+document.addEventListener('selectionchange', () => {
+  if (!readerSelectionIsActive() && bidiReaderEnabled) scheduleBidiReaderUpdate({ immediate: true });
+});
 bidiReader?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 bidiReaderLines?.addEventListener('wheel', handleBidiReaderWheel, { capture: true, passive: false });
 terminalEl.addEventListener('wheel', (event) => {
   if (event.ctrlKey) return;
+  if (readerMouseMode === 'raw' && term.modes?.mouseTrackingMode !== 'none') return;
   event.stopPropagation();
   const lineHeight = 18;
   const lines = Math.max(1, Math.min(12, Math.round(Math.abs(event.deltaY) / lineHeight)));
@@ -1908,14 +2249,18 @@ terminalEl.addEventListener('wheel', (event) => {
 }, { capture: true, passive: false });
 
 newSessionButton.addEventListener('click', async () => {
+  const selectedAtRequestStart = currentSessionId;
   newSessionButton.disabled = true;
+  beginSessionsMutation();
   try {
-    const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({}) });
+    const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify({}), timeoutMs: 20_000 });
     sessions = created.sessions || [created.session];
-    connectToSession(created.session.id);
+    renderSessions();
+    if (!currentSessionId || currentSessionId === selectedAtRequestStart) connectToSession(created.session.id);
   } catch (error) {
     setStatus('bad', 'create failed', error.message);
   } finally {
+    endSessionsMutation();
     newSessionButton.disabled = false;
   }
 });
@@ -1934,6 +2279,7 @@ renameSessionButton.addEventListener('click', async () => {
   const title = window.prompt('Rename terminal session:', session.title)?.trim();
   if (!title || title === session.title) return;
   renameSessionButton.disabled = true;
+  beginSessionsMutation();
   try {
     const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'PATCH', body: JSON.stringify({ title }) });
     sessions = payload.sessions || sessions;
@@ -1942,6 +2288,7 @@ renameSessionButton.addEventListener('click', async () => {
   } catch (error) {
     setStatus('bad', 'rename failed', error.message);
   } finally {
+    endSessionsMutation();
     renameSessionButton.disabled = false;
   }
 });
@@ -1967,6 +2314,7 @@ bidiToggleButton.addEventListener('click', () => {
 });
 
 detachSessionButton.addEventListener('click', () => {
+  clearReconnectTimer();
   discardPendingTerminalInputs(currentSessionId);
   disconnectCurrent({ quiet: true });
   setStatus('warn', 'detached', 'click sidebar session to continue');
@@ -1978,32 +2326,29 @@ killSessionButton.addEventListener('click', async () => {
   if (!window.confirm(`Kill tmux session "${session.title}"? This stops the terminal process, not just the browser attach.`)) return;
   killSessionButton.disabled = true;
   detachSessionButton.disabled = true;
-  connectionSerial += 1;
-  sessionGeneration += 1;
-  blocksRequestSerial += 1;
+  beginSessionsMutation();
   discardPendingTerminalInputs(session.id);
-  disconnectCurrent({ quiet: true });
+  if (currentSessionId === session.id) {
+    connectionSerial += 1;
+    sessionGeneration += 1;
+    blocksRequestSerial += 1;
+    disconnectCurrent({ quiet: true });
+  }
   try {
-    await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE' });
-    currentSessionId = null;
-    blocks = [];
-    lastCapturedReaderEntries = [];
-    renderBlocks();
-    term.reset();
-    scheduleBidiReaderUpdate();
-    setStatus('warn', 'session killed', 'create or choose another session');
-    try {
-      await refreshSessions({ createIfEmpty: true });
-    } catch (error) {
-      setStatus('bad', 'refresh failed', `session was killed; ${error.message}`);
+    const payload = await api(`/api/sessions/${encodeURIComponent(session.id)}`, { method: 'DELETE', timeoutMs: 20_000 });
+    sessions = payload.sessions || sessions.filter((candidate) => candidate.id !== session.id);
+    if (currentSessionId === session.id) {
+      currentSessionId = null;
+      resetTerminalSurface();
+      setStatus('warn', 'session killed', 'choosing another terminal…');
     }
+    renderSessions();
+    queueSessionsRefresh({ createIfEmpty: true });
   } catch (error) {
     setStatus('bad', 'kill failed', error.message);
-    try {
-      await refreshSessions();
-      if (sessions.some((candidate) => candidate.id === session.id && candidate.alive)) connectToSession(session.id);
-    } catch {}
+    queueSessionsRefresh({ selectId: currentSessionId === session.id ? session.id : undefined });
   } finally {
+    endSessionsMutation();
     killSessionButton.disabled = false;
     detachSessionButton.disabled = false;
   }
@@ -2028,10 +2373,10 @@ refreshSessions({ createIfEmpty: true }).catch((error) => {
 
 refreshTimer = setInterval(() => {
   refreshSessions().catch(() => {});
-  if (blocksOpen) loadBlocks(currentSessionId, { force: true }).catch(() => {});
 }, 5000);
 
 window.addEventListener('beforeunload', () => {
   if (refreshTimer) clearInterval(refreshTimer);
+  clearReconnectTimer();
   disconnectCurrent({ quiet: true });
 });

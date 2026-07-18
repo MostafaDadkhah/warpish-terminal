@@ -29,14 +29,17 @@ const MAX_BLOCKS_PER_SESSION = 300;
 const MAX_BLOCK_OUTPUT_CHARS = 24000;
 const MAX_CAPTURE_CHARS = 500_000;
 const MAX_EVENT_READ_BYTES = 1_000_000;
-const BLOCK_OUTPUT_FLUSH_MS = 80;
+const BLOCK_OUTPUT_FLUSH_MS = 750;
 const MAX_WS_BUFFERED_BYTES = 4_000_000;
 const TOKEN_FILE = path.resolve(process.env.WARPISH_TOKEN_FILE || path.join(__dirname, '.auth-token'));
+const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'server.lock');
+const INSTANCE_LOCK_ID = crypto.randomUUID();
 
 const activeBlockIds = new Map();
 const pendingBlockOutputs = new Map();
 const eventReadStates = new Map();
 const sessionRuntimes = new Map();
+let instanceLockOwned = false;
 
 ensureLocalBindAllowed();
 const TOKEN = process.env.WARPISH_TOKEN || readOrCreateToken(TOKEN_FILE);
@@ -44,6 +47,13 @@ fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 fs.mkdirSync(EVENTS_DIR, { recursive: true, mode: 0o700 });
 try { fs.chmodSync(DATA_DIR, 0o700); } catch {}
 try { fs.chmodSync(EVENTS_DIR, 0o700); } catch {}
+try {
+  acquireInstanceLock();
+} catch (error) {
+  console.error(error.message || error);
+  process.exit(1);
+}
+process.once('exit', releaseInstanceLock);
 
 function findExecutable(candidates, fallback) {
   for (const candidate of candidates) {
@@ -104,6 +114,65 @@ function cookieOptions(req) {
 function limitText(value, maxChars = MAX_CAPTURE_CHARS) {
   const text = String(value || '');
   return text.length > maxChars ? text.slice(-maxChars) : text;
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+}
+
+function acquireInstanceLock() {
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let fd;
+    try {
+      fd = fs.openSync(INSTANCE_LOCK_FILE, 'wx', 0o600);
+      fs.writeFileSync(fd, `${JSON.stringify({ id: INSTANCE_LOCK_ID, pid: process.pid, startedAt: new Date().toISOString(), port: PORT })}\n`);
+      fs.closeSync(fd);
+      fd = null;
+      instanceLockOwned = true;
+      return;
+    } catch (error) {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch {}
+      }
+      if (error?.code !== 'EEXIST') throw error;
+
+      let owner = null;
+      let ageMs = 0;
+      try {
+        owner = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
+        ageMs = Date.now() - fs.statSync(INSTANCE_LOCK_FILE).mtimeMs;
+      } catch {
+        try { ageMs = Date.now() - fs.statSync(INSTANCE_LOCK_FILE).mtimeMs; } catch {}
+      }
+      const ownerPid = Number(owner?.pid);
+      if (processIsAlive(ownerPid)) {
+        throw new Error(`Warpish data directory is already owned by pid ${ownerPid}${owner?.port ? ` on port ${owner.port}` : ''}. Stop that instance or use a separate WARPISH_DATA_DIR.`);
+      }
+      if (!ownerPid && ageMs >= 0 && ageMs < 10_000) {
+        throw new Error('Warpish data directory lock is being initialized by another process. Retry in a moment or use a separate WARPISH_DATA_DIR.');
+      }
+      try { fs.unlinkSync(INSTANCE_LOCK_FILE); } catch (unlinkError) {
+        if (unlinkError?.code !== 'ENOENT') throw unlinkError;
+      }
+    }
+  }
+  throw new Error(`Could not acquire Warpish data directory lock at ${INSTANCE_LOCK_FILE}.`);
+}
+
+function releaseInstanceLock() {
+  if (!instanceLockOwned) return;
+  try {
+    const owner = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
+    if (owner?.id === INSTANCE_LOCK_ID) fs.unlinkSync(INSTANCE_LOCK_FILE);
+  } catch {}
+  instanceLockOwned = false;
 }
 
 
@@ -205,10 +274,14 @@ function readMetadata() {
 
 function writeMetadata(meta) {
   fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  const temporaryFile = `${METADATA_FILE}.tmp`;
-  fs.writeFileSync(temporaryFile, JSON.stringify(meta, null, 2), { mode: 0o600 });
-  fs.chmodSync(temporaryFile, 0o600);
-  fs.renameSync(temporaryFile, METADATA_FILE);
+  const temporaryFile = `${METADATA_FILE}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temporaryFile, JSON.stringify(meta, null, 2), { mode: 0o600 });
+    fs.chmodSync(temporaryFile, 0o600);
+    fs.renameSync(temporaryFile, METADATA_FILE);
+  } finally {
+    try { fs.unlinkSync(temporaryFile); } catch {}
+  }
 }
 
 function runTmux(args, options = {}) {
@@ -258,7 +331,11 @@ function ensureShellIntegration() {
 function warpishShellCommand(sessionId, eventFile) {
   ensureShellIntegration();
   return [
-    'env',
+    '/usr/bin/env',
+    '-u',
+    'NO_COLOR',
+    'COLORTERM=truecolor',
+    'WARPISH_TERMINAL=1',
     `WARPISH_SESSION_ID=${shellQuote(sessionId)}`,
     `WARPISH_EVENT_FILE=${shellQuote(eventFile)}`,
     'WARPISH_BLOCK_INTEGRATION=1',
@@ -334,7 +411,7 @@ function normalizeBlock(block) {
 
 function getBlocks(sessionId) {
   reconcileEventFile(sessionId);
-  flushPendingBlockOutput(sessionId);
+  if (!flushPendingBlockOutput(sessionId)) refreshActiveBlockOutput(sessionId);
   const meta = readMetadata();
   const record = meta.sessions?.[sessionId];
   return Array.isArray(record?.blocks) ? record.blocks.map(normalizeBlock).slice().reverse() : [];
@@ -371,8 +448,7 @@ function upsertBlockStart(sessionId, marker) {
 }
 
 function appendBlockOutput(sessionId, text) {
-  const clean = stripAnsi(text);
-  if (!clean.trim()) return null;
+  if (!text) return null;
   let blockId = activeBlockIds.get(sessionId);
   if (!blockId) {
     const meta = readMetadata();
@@ -386,8 +462,7 @@ function appendBlockOutput(sessionId, text) {
     flushPendingBlockOutput(sessionId);
     pending = null;
   }
-  if (!pending) pending = { blockId, text: '', timer: null };
-  pending.text = `${pending.text}${clean}`.slice(-MAX_BLOCK_OUTPUT_CHARS);
+  if (!pending) pending = { blockId, timer: null };
   if (!pending.timer) {
     pending.timer = setTimeout(() => flushPendingBlockOutput(sessionId), BLOCK_OUTPUT_FLUSH_MS);
     pending.timer.unref?.();
@@ -401,28 +476,31 @@ function flushPendingBlockOutput(sessionId, expectedBlockId = null) {
   if (!pending || (expectedBlockId && pending.blockId !== expectedBlockId)) return null;
   if (pending.timer) clearTimeout(pending.timer);
   pendingBlockOutputs.delete(sessionId);
-
-  const meta = readMetadata();
-  const record = meta.sessions?.[sessionId];
-  const block = record?.blocks?.find((candidate) => candidate.id === pending.blockId);
-  if (!block || block.status !== 'running' || record?.activeBlockId !== pending.blockId) return null;
-  block.output = `${block.output || ''}${pending.text}`.slice(-MAX_BLOCK_OUTPUT_CHARS);
-  writeMetadata(meta);
-  return normalizeBlock(block);
+  return replaceBlockOutputFromPane(sessionId, pending.blockId, { requireActive: true });
 }
 
 function finishBlock(sessionId, marker) {
-  flushPendingBlockOutput(sessionId, marker.id || null);
-  const meta = readMetadata();
-  const record = meta.sessions?.[sessionId];
+  let meta = readMetadata();
+  let record = meta.sessions?.[sessionId];
   if (!record || !Array.isArray(record.blocks)) return null;
   const id = marker.id || record.activeBlockId;
-  const block = record.blocks.find((candidate) => candidate.id === id);
+  let block = record.blocks.find((candidate) => candidate.id === id);
   if (!block) return null;
   if (block.status !== 'running' && block.endedAt) {
     if (activeBlockIds.get(sessionId) === id) activeBlockIds.delete(sessionId);
     return normalizeBlock(block);
   }
+
+  // End markers are intentionally replayable (OSC plus the event file). Settle
+  // and persist only on the first running -> finished transition; historical or
+  // duplicate End events must never overwrite an older block with today's pane.
+  flushPendingBlockOutput(sessionId, id);
+  replaceBlockOutputFromPane(sessionId, id, { requireActive: true, settle: true });
+  meta = readMetadata();
+  record = meta.sessions?.[sessionId];
+  block = record?.blocks?.find((candidate) => candidate.id === id);
+  if (!block || block.status !== 'running') return block ? normalizeBlock(block) : null;
+
   const exitCode = Number(marker.status ?? 0);
   block.exitCode = Number.isFinite(exitCode) ? exitCode : null;
   block.endedAt = epochToIso(marker.ended);
@@ -439,7 +517,7 @@ function handleBlockMarker(sessionId, payload) {
   const marker = parseMarkerPayload(payload);
   if (marker.event === 'Start') return { type: 'block-start', block: upsertBlockStart(sessionId, marker) };
   if (marker.event === 'End') {
-    const block = enrichFinishedBlockOutput(sessionId, finishBlock(sessionId, marker));
+    const block = finishBlock(sessionId, marker);
     return { type: 'block-end', block };
   }
   return null;
@@ -509,46 +587,123 @@ function createEventReader(sessionId, onBlockEvent) {
   };
 }
 
-function inferOutputFromPane(sessionId, command) {
-  if (!command) return '';
-  let text = '';
-  try {
-    text = runTmux(['capture-pane', '-p', '-t', sessionId, '-S', '-160']);
-  } catch {
-    return '';
+function wrappedCommandEndLine(lines, command) {
+  const needle = String(command || '').replace(/[\r\n]/g, '');
+  if (!needle) return -1;
+  let flattened = '';
+  const lineEndOffsets = [];
+  for (const line of lines) {
+    flattened += line;
+    lineEndOffsets.push(flattened.length);
   }
-  const lines = text.split('\n').map((line) => line.trimEnd());
+  const commandIndex = flattened.lastIndexOf(needle);
+  if (commandIndex < 0) return -1;
+  const commandEndOffset = commandIndex + needle.length;
+  return lineEndOffsets.findIndex((offset) => offset >= commandEndOffset);
+}
+
+function extractBlockOutputFromPane(text, command) {
+  const lines = String(text || '').split('\n').map((line) => line.trimEnd());
   let commandLineIndex = -1;
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    if (lines[i].includes(command)) {
+  if (command) {
+    let fallbackIndex = -1;
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const commandIndex = lines[i].lastIndexOf(command);
+      if (commandIndex < 0) continue;
+      if (fallbackIndex < 0) fallbackIndex = i;
+      const prefix = lines[i].slice(0, commandIndex);
+      if (!/(?:[%$#❯›➜>]\s*)$/u.test(prefix)) continue;
       commandLineIndex = i;
       break;
     }
+    if (commandLineIndex < 0) {
+      commandLineIndex = wrappedCommandEndLine(lines, command);
+      if (commandLineIndex < 0) commandLineIndex = fallbackIndex;
+    }
   }
-  const slice = commandLineIndex >= 0 ? lines.slice(commandLineIndex + 1) : lines.slice(-24);
+  const slice = commandLineIndex >= 0 ? lines.slice(commandLineIndex + 1) : lines.slice(-160);
   const outputLines = [];
   for (const line of slice) {
     if (/^[^\s]+@[^\s]+\s+.*\s[%#]\s*$/.test(line) && outputLines.length > 0) break;
     outputLines.push(line);
   }
+  while (outputLines.length && /^\s*$/.test(outputLines[0])) outputLines.shift();
+  while (outputLines.length && /^\s*$/.test(outputLines.at(-1))) outputLines.pop();
   return outputLines
-    .filter((line) => !/^\s*$/.test(line))
     .filter((line) => !line.includes('\x1b]697;'))
     .join('\n')
     .slice(-MAX_BLOCK_OUTPUT_CHARS);
 }
 
-function enrichFinishedBlockOutput(sessionId, block) {
-  if (!block || (block.output || '').trim()) return block;
-  const inferred = inferOutputFromPane(sessionId, block.command || '');
-  if (!inferred.trim()) return block;
+function captureBlockOutputSnapshot(sessionId, command) {
+  const alternateActive = paneAlternateScreenActive(sessionId);
+  const current = capturePaneResult(sessionId, {
+    lines: 1600,
+    history: !alternateActive,
+  });
+  const alternateStillActive = paneAlternateScreenActive(sessionId);
+  if (alternateStillActive !== alternateActive) {
+    const retry = capturePaneResult(sessionId, {
+      lines: 1600,
+      history: !alternateStillActive,
+    });
+    if (!retry.ok) return { ok: false, output: '' };
+    return {
+      ok: true,
+      output: extractBlockOutputFromPane(retry.text, command),
+      preserveExisting: alternateStillActive && !retry.text.trim(),
+    };
+  }
+  if (!current.ok) return { ok: false, output: '' };
+  return {
+    ok: true,
+    output: extractBlockOutputFromPane(current.text, command),
+    preserveExisting: alternateActive && !current.text.trim(),
+  };
+}
+
+function replaceBlockOutputFromPane(sessionId, blockId, {
+  requireActive = false,
+  settle = false,
+} = {}) {
+  const before = readMetadata();
+  const beforeRecord = before.sessions?.[sessionId];
+  const beforeBlock = beforeRecord?.blocks?.find((candidate) => candidate.id === blockId);
+  if (!beforeBlock) return null;
+  if (requireActive && beforeRecord.activeBlockId !== blockId) return null;
+
+  let snapshot = captureBlockOutputSnapshot(sessionId, beforeBlock.command || '');
+  if (settle) {
+    // The precmd End marker can reach the attached client a few milliseconds
+    // before tmux has committed the final primary-screen redraw. Sample through
+    // that bounded window and use the newest canonical pane state. This also
+    // behaves correctly for commands whose legitimate output is empty.
+    const sleeper = new Int32Array(new SharedArrayBuffer(4));
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      Atomics.wait(sleeper, 0, 0, 20);
+      const next = captureBlockOutputSnapshot(sessionId, beforeBlock.command || '');
+      if (next.ok) snapshot = next;
+    }
+  }
+  if (!snapshot.ok) return null;
+
   const meta = readMetadata();
   const record = meta.sessions?.[sessionId];
-  const stored = record?.blocks?.find((candidate) => candidate.id === block.id);
-  if (!stored) return block;
-  stored.output = inferred;
+  const block = record?.blocks?.find((candidate) => candidate.id === blockId);
+  if (!block) return null;
+  if (requireActive && record.activeBlockId !== blockId) return null;
+  if (snapshot.preserveExisting && (block.output || '').trim()) return normalizeBlock(block);
+  if ((block.output || '') === snapshot.output) return normalizeBlock(block);
+  block.output = snapshot.output;
   writeMetadata(meta);
-  return normalizeBlock(stored);
+  return normalizeBlock(block);
+}
+
+function refreshActiveBlockOutput(sessionId) {
+  const meta = readMetadata();
+  const blockId = meta.sessions?.[sessionId]?.activeBlockId;
+  if (!blockId) return null;
+  return replaceBlockOutputFromPane(sessionId, blockId, { requireActive: true });
 }
 
 function createOutputProcessor(sessionId, { onTerminalData, onBlockEvent, shouldRecordOutput = () => true }) {
@@ -569,10 +724,13 @@ function createOutputProcessor(sessionId, { onTerminalData, onBlockEvent, should
   function forward(text) {
     if (!text) return;
     const stripped = text.endsWith(tmuxPrefix) ? text.slice(0, -tmuxPrefix.length) : text;
-    const safeText = stripTerminalFocusModeControls(stripped);
-    if (!safeText) return;
-    if (shouldRecordOutput()) appendBlockOutput(sessionId, safeText);
-    onTerminalData(Buffer.from(safeText, 'utf8'));
+    if (!stripped) return;
+    const recordableText = stripTerminalFocusModeControls(stripped);
+    if (shouldRecordOutput() && recordableText) appendBlockOutput(sessionId, recordableText);
+    // Focus tracking is a real terminal capability used by full-screen TUIs.
+    // Keep its mode controls in the PTY byte stream while excluding them from
+    // persisted command output. Incoming focus reports are filtered separately.
+    onTerminalData(Buffer.from(stripped, 'utf8'));
   }
 
   function processText(text) {
@@ -665,20 +823,63 @@ function capturePreview(id, lines = 28) {
   }
 }
 
-function capturePaneText(id, { lines = 600, alternate = false, escape = false } = {}) {
+function capturePaneResult(id, {
+  lines = 600,
+  alternate = false,
+  escape = false,
+  history = true,
+  historyOnly = false,
+} = {}) {
   const args = ['capture-pane', '-p', '-J'];
   if (escape) args.push('-e');
   if (alternate) args.push('-a');
-  else args.push('-S', `-${Math.max(20, Math.min(Number(lines) || 600, 5000))}`);
+  else if (history) {
+    args.push('-S', `-${Math.max(20, Math.min(Number(lines) || 600, 5000))}`);
+    if (historyOnly) args.push('-E', '-1');
+  }
   args.push('-t', id);
   try {
-    return runTmux(args)
+    const text = runTmux(args)
       .split('\n')
       .map((line) => line.trimEnd())
       .join('\n')
       .trimEnd();
+    return { ok: true, text };
   } catch {
-    return '';
+    return { ok: false, text: '' };
+  }
+}
+
+function capturePaneText(id, options = {}) {
+  return capturePaneResult(id, options).text;
+}
+
+function paneAlternateScreenActive(id) {
+  try {
+    return runTmux(['display-message', '-p', '-t', id, '#{alternate_on}']).trim() === '1';
+  } catch {
+    return false;
+  }
+}
+
+function paneCursorState(id) {
+  try {
+    const [alternate, x, y, visible] = runTmux([
+      'display-message',
+      '-p',
+      '-t',
+      id,
+      '#{alternate_on}|#{cursor_x}|#{cursor_y}|#{cursor_flag}',
+    ]).trim().split('|');
+    return {
+      ok: true,
+      alternateActive: alternate === '1',
+      x: Math.max(0, Number.parseInt(x, 10) || 0),
+      y: Math.max(0, Number.parseInt(y, 10) || 0),
+      visible: visible !== '0',
+    };
+  } catch {
+    return { ok: false, alternateActive: false, x: 0, y: 0, visible: true };
   }
 }
 
@@ -689,17 +890,41 @@ function captureContentLines(text) {
     .filter(Boolean);
 }
 
-function alternateCaptureIsNormalTail(normal, alternate) {
-  const alternateLines = captureContentLines(alternate)
-    .filter((line) => !/^[~│╭╰╮╯─\s]+$/u.test(line))
-    .slice(-12);
-  if (!alternateLines.length) return false;
-  const normalClean = captureContentLines(normal).join('\n');
-  return alternateLines.filter((line) => normalClean.includes(line)).length / alternateLines.length >= 0.75;
+function joinCaptureSections(first, second) {
+  if (!first) return second || '';
+  if (!second) return first;
+  return `${first.trimEnd()}\n${second.replace(/^\n+/, '')}`.trimEnd();
 }
 
-function alternateCaptureLooksStandaloneTui(alternate) {
-  const lines = captureContentLines(alternate);
+function capturePaneState(id, { lines = 600, escape = false, retryCount = 0 } = {}) {
+  const alternateActive = paneAlternateScreenActive(id);
+  if (!alternateActive) {
+    const normal = capturePaneText(id, { lines, escape });
+    if (paneAlternateScreenActive(id) !== alternateActive && retryCount < 2) {
+      return capturePaneState(id, { lines, escape, retryCount: retryCount + 1 });
+    }
+    return {
+      alternateActive,
+      normal,
+      alternate: '',
+      active: normal,
+      history: normal,
+    };
+  }
+
+  const prefix = capturePaneText(id, { lines, escape, historyOnly: true });
+  const active = capturePaneText(id, { escape, history: false });
+  const alternate = capturePaneText(id, { alternate: true, escape });
+  if (paneAlternateScreenActive(id) !== alternateActive && retryCount < 2) {
+    return capturePaneState(id, { lines, escape, retryCount: retryCount + 1 });
+  }
+  const normal = joinCaptureSections(prefix, active);
+  const history = joinCaptureSections(prefix, alternate);
+  return { alternateActive, normal, alternate, active, history };
+}
+
+function captureLooksStandaloneTui(capture) {
+  const lines = captureContentLines(capture);
   const joined = lines.join('\n');
   const vimTildeLines = lines.filter((line) => /^~\s*$/u.test(line)).length;
   return vimTildeLines >= 3
@@ -708,35 +933,37 @@ function alternateCaptureLooksStandaloneTui(alternate) {
     || /\(END\)(?:\s|$)/mu.test(joined);
 }
 
-function captureLooksLikeAgentScrollback(normal) {
-  return /Hermes Agent|⚕|\bctx --\b|❯|\bgpt-[\w.]+\b/u.test(stripAnsi(normal));
-}
+function choosePaneCapture({ normal = '', active = '', history = '', alternateActive = false } = {}) {
+  // tmux capture-pane without -a always captures the buffer that is currently
+  // visible. When alternate_on=1, `capture-pane -a` is the displaced/saved
+  // primary screen, not the live alternate-screen viewport. Keep the legacy
+  // normal/alternate argument names for the API, but never select `alternate`
+  // as the live screen while an alternate buffer is active.
+  if (!alternateActive && normal.trim()) {
+    return { text: normal, usingAlternate: false, reason: 'normal-active' };
+  }
+  if (!alternateActive) return { text: normal, usingAlternate: false, reason: 'normal-empty' };
 
-function choosePaneCapture({ normal = '', alternate = '' } = {}) {
-  if (!alternate.trim()) return { text: normal, usingAlternate: false, reason: 'normal-only' };
-  if (!normal.trim()) return { text: alternate, usingAlternate: true, reason: 'alternate-only' };
+  const historyLines = captureContentLines(history).length;
+  const activeLines = captureContentLines(active).length;
+  const historyIsMuchRicher = historyLines >= Math.max(activeLines + 20, activeLines * 2);
+  const activeLooksTui = captureLooksStandaloneTui(active);
 
-  const normalLines = captureContentLines(normal).length;
-  const alternateLines = captureContentLines(alternate).length;
-  const normalHasHistory = normalLines >= Math.max(alternateLines + 20, alternateLines * 2);
-  const alternateLooksTui = alternateCaptureLooksStandaloneTui(alternate);
-  const alternateLooksLikeNormalTail = alternateCaptureIsNormalTail(normal, alternate);
-  const normalLooksLikeAgentScrollback = captureLooksLikeAgentScrollback(normal);
-
-  const agentScrollbackIsMuchRicher = normalLooksLikeAgentScrollback
-    && alternateLines <= 60
-    && normalLines >= Math.max(alternateLines + 120, alternateLines * 6);
-
-  // In Hermes/prompt-toolkit-like panes tmux can expose a tiny alternate capture that is
-  // only a stale/current viewport, while the normal capture contains the real scrollback.
-  // Prefer the richer normal capture when it is the same tail or a recognizable, much
-  // richer agent scrollback; keep true editor/TUI alternate screens (vim, less, htop,
-  // unknown full-screen apps with meaningful alternate content, etc.) intact.
-  if (normalHasHistory && !alternateLooksTui && (alternateLooksLikeNormalTail || agentScrollbackIsMuchRicher)) {
-    return { text: normal, usingAlternate: false, reason: 'normal-rich-history' };
+  if (!active.trim()) {
+    return historyIsMuchRicher
+      ? { text: history, usingAlternate: false, reason: 'normal-rich-history' }
+      : { text: '', usingAlternate: true, reason: 'alternate-empty' };
   }
 
-  return { text: alternate, usingAlternate: true, reason: 'alternate-active' };
+  // tmux may prepend scrollback to the active alternate viewport. Classify that
+  // combined capture as history for Hermes/prompt-toolkit-like panes so the
+  // readable surface can retain its canonical scrollback and merge live redraws.
+  // A recognizable standalone editor/TUI remains screen content.
+  if (historyIsMuchRicher && !activeLooksTui) {
+    return { text: history, usingAlternate: false, reason: 'normal-rich-history' };
+  }
+
+  return { text: active, usingAlternate: true, reason: 'alternate-active' };
 }
 
 function summarizeSessions() {
@@ -819,6 +1046,10 @@ function createSession({ title, cwd } = {}) {
     runTmux(['set-option', '-t', id, 'history-limit', '50000']);
     runTmux(['set-option', '-t', id, 'allow-rename', 'off']);
     runTmux(['set-option', '-t', id, 'allow-passthrough', 'on']);
+    runTmux(['set-option', '-t', id, 'focus-events', 'on']);
+    runTmux(['set-environment', '-u', '-t', id, 'NO_COLOR']);
+    runTmux(['set-environment', '-t', id, 'COLORTERM', 'truecolor']);
+    runTmux(['set-environment', '-t', id, 'WARPISH_TERMINAL', '1']);
     runTmux(['set-environment', '-t', id, 'WARPISH_SESSION_ID', id]);
     runTmux(['set-environment', '-t', id, 'WARPISH_EVENT_FILE', eventFile]);
     runTmux(['set-environment', '-t', id, 'WARPISH_BLOCK_INTEGRATION', '1']);
@@ -1049,6 +1280,8 @@ function createPtyWorker({ sessionId, cwd, cols, rows }) {
     WARPISH_TERMINAL: '1',
   };
   delete env.TMUX;
+  delete env.TMUX_PANE;
+  delete env.NO_COLOR;
   return spawn(PYTHON, [
     workerPath,
     '--shell', SHELL,
@@ -1161,14 +1394,19 @@ app.get('/api/sessions/:id/capture', (req, res) => {
   if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
   const lines = clampNumber(req.query.lines, 600, 20, 5000);
   const escape = req.query.ansi === '1' || req.query.escape === '1';
-  const normal = capturePaneText(id, { lines, escape });
-  const alternate = capturePaneText(id, { alternate: true, escape });
-  const selected = choosePaneCapture({ normal, alternate });
+  const capture = capturePaneState(id, { lines, escape });
+  const selected = choosePaneCapture(capture);
   res.json({
     text: limitText(selected.text),
-    normal: limitText(normal),
-    alternate: limitText(alternate),
+    // Backward-compatible names: `normal` is tmux's current/active capture;
+    // while alternate_on=1, `alternate` is the saved primary buffer from -a.
+    normal: limitText(capture.normal),
+    alternate: limitText(capture.alternate),
+    active: limitText(capture.active),
+    savedPrimary: limitText(capture.alternate),
+    history: limitText(capture.history),
     usingAlternate: selected.usingAlternate,
+    alternateActive: capture.alternateActive,
     captureReason: selected.reason,
     ansi: escape,
   });
@@ -1223,11 +1461,98 @@ function broadcastRuntimeControl(runtime, message) {
   for (const ws of runtime.subscribers) sendWsControl(ws, message);
 }
 
+function runtimeSocketIsOpen(ws) {
+  return Boolean(ws && ws.readyState === ws.OPEN);
+}
+
+function sendRuntimeRole(runtime, ws) {
+  return sendWsControl(ws, {
+    type: 'role',
+    role: ws === runtime.controller ? 'controller' : 'spectator',
+    sessionId: runtime.sessionId,
+  });
+}
+
+function broadcastRuntimeRoles(runtime) {
+  for (const ws of runtime.subscribers) sendRuntimeRole(runtime, ws);
+}
+
+function resizeRuntime(runtime, dimensions) {
+  const workerResized = writeWorker(runtime.worker, {
+    type: 'resize',
+    cols: dimensions.cols,
+    rows: dimensions.rows,
+  });
+  let tmuxResized = false;
+  try {
+    // A detached tmux window does not reliably follow the outer attach PTY's
+    // SIGWINCH on every macOS/tmux version. Resize the one-pane window
+    // explicitly so the active controller's geometry is authoritative.
+    runTmux([
+      'resize-window', '-t', runtime.sessionId,
+      '-x', String(dimensions.cols), '-y', String(dimensions.rows),
+    ]);
+    tmuxResized = true;
+  } catch {}
+  return workerResized || tmuxResized;
+}
+
+function resizeRuntimeForController(runtime) {
+  const controller = runtime.controller;
+  if (!runtimeSocketIsOpen(controller) || !runtime.subscribers.has(controller)) return false;
+  const dimensions = runtime.clientDimensions.get(controller) || { cols: 120, rows: 36 };
+  return resizeRuntime(runtime, dimensions);
+}
+
+function setRuntimeController(runtime, ws, { resize = true } = {}) {
+  if (runtime.closed || runtime.stopping) return false;
+  if (!runtime.subscribers.has(ws) || !runtimeSocketIsOpen(ws)) return false;
+  runtime.controller = ws;
+  broadcastRuntimeRoles(runtime);
+  if (resize) resizeRuntimeForController(runtime);
+  return true;
+}
+
+function promoteRuntimeController(runtime) {
+  if (runtime.closed || runtime.stopping) {
+    runtime.controller = null;
+    return null;
+  }
+  for (const candidate of runtime.subscribers) {
+    if (runtimeSocketIsOpen(candidate) && setRuntimeController(runtime, candidate)) return candidate;
+  }
+  runtime.controller = null;
+  broadcastRuntimeRoles(runtime);
+  return null;
+}
+
+function addRuntimeSubscriber(runtime, ws, dimensions) {
+  runtime.subscribers.add(ws);
+  runtime.clientDimensions.set(ws, dimensions);
+  if (!runtimeSocketIsOpen(runtime.controller) || !runtime.subscribers.has(runtime.controller)) {
+    promoteRuntimeController(runtime);
+  } else {
+    broadcastRuntimeRoles(runtime);
+  }
+}
+
+function removeRuntimeSubscriber(runtime, ws) {
+  const wasSubscriber = runtime.subscribers.delete(ws);
+  runtime.clientDimensions.delete(ws);
+  if (!wasSubscriber) return false;
+  if (runtime.controller === ws) {
+    runtime.controller = null;
+    promoteRuntimeController(runtime);
+  }
+  return true;
+}
+
 function broadcastRuntimeData(runtime, bytes) {
   for (const ws of runtime.subscribers) {
     if (ws.readyState !== ws.OPEN) continue;
     if (ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
       sendWsControl(ws, { type: 'server-error', message: 'Terminal client fell too far behind; reconnect to resume.' });
+      removeRuntimeSubscriber(runtime, ws);
       ws.close(1013, 'terminal client too slow');
       continue;
     }
@@ -1254,7 +1579,11 @@ function terminateSessionRuntime(runtime) {
 }
 
 function closeRuntimeSubscribers(runtime, message) {
-  for (const ws of [...runtime.subscribers]) {
+  const subscribers = [...runtime.subscribers];
+  runtime.controller = null;
+  runtime.subscribers.clear();
+  runtime.clientDimensions.clear();
+  for (const ws of subscribers) {
     if (message) sendWsControl(ws, message);
     try { ws.close(); } catch {}
   }
@@ -1262,6 +1591,18 @@ function closeRuntimeSubscribers(runtime, message) {
 
 function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   reconcileEventFile(session.id);
+  try {
+    // Existing tmux sessions may predate the create-time option below. Keep
+    // attach idempotent so raw-mode TUIs can receive browser focus events too.
+    runTmux(['set-option', '-t', session.id, 'focus-events', 'on']);
+    // This cannot rewrite the environment of an already-running shell, but it
+    // makes respawned panes and future windows in older sessions color-capable.
+    runTmux(['set-environment', '-u', '-t', session.id, 'NO_COLOR']);
+    runTmux(['set-environment', '-t', session.id, 'COLORTERM', 'truecolor']);
+    runTmux(['set-environment', '-t', session.id, 'WARPISH_TERMINAL', '1']);
+  } catch (error) {
+    console.warn(`Could not refresh tmux capabilities for ${session.id}: ${error.message || error}`);
+  }
   const worker = createPtyWorker({
     sessionId: session.id,
     cwd: session.cwd || os.homedir(),
@@ -1274,6 +1615,8 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     worker,
     workerPid: null,
     subscribers: new Set(),
+    clientDimensions: new Map(),
+    controller: null,
     stdoutBuffer: '',
     stderrBuffer: '',
     forceKillTimer: null,
@@ -1376,11 +1719,22 @@ function ensureSessionRuntime(session, dimensions = {}) {
 }
 
 function sendRuntimeSnapshot(ws, sessionId) {
-  const normal = capturePaneText(sessionId, { lines: 1200, escape: true });
-  const alternate = capturePaneText(sessionId, { alternate: true, escape: true });
-  const selected = choosePaneCapture({ normal, alternate });
-  if (!selected.text) return;
-  const snapshot = `\x1b[2J\x1b[H${selected.text.replace(/\n/g, '\r\n')}`;
+  let cursor = paneCursorState(sessionId);
+  let current = capturePaneText(sessionId, { escape: true, history: false });
+  let cursorAfterCapture = paneCursorState(sessionId);
+  if (cursor.ok && cursorAfterCapture.ok && cursor.alternateActive !== cursorAfterCapture.alternateActive) {
+    current = capturePaneText(sessionId, { escape: true, history: false });
+    cursorAfterCapture = paneCursorState(sessionId);
+  }
+  cursor = cursorAfterCapture.ok ? cursorAfterCapture : cursor;
+  if (!current) return;
+  const activeText = current.replace(/\n/g, '\r\n');
+  const cursorState = `\x1b[0m\x1b[?25${cursor.visible ? 'h' : 'l'}\x1b[${cursor.y + 1};${cursor.x + 1}H`;
+  // The PTY stream belongs to the outer tmux client, which keeps its own
+  // alternate screen for the lifetime of the attach. Mirror that outer client
+  // state here; pane-level 1049h/l transitions are already rendered by tmux as
+  // screen updates and must not switch the browser's outer buffer independently.
+  const snapshot = `\x1b[?1049h\x1b[0m\x1b[?25h\x1b[2J\x1b[H${activeText}${cursorState}`;
   if (ws.readyState === ws.OPEN) ws.send(Buffer.from(snapshot, 'utf8'));
 }
 
@@ -1426,8 +1780,7 @@ wss.on('connection', (ws, req) => {
   const cols = clampNumber(url.searchParams.get('cols'), 120, 20, 300);
   const rows = clampNumber(url.searchParams.get('rows'), 36, 5, 120);
   const { runtime, created } = ensureSessionRuntime(session, { cols, rows });
-  runtime.subscribers.add(ws);
-  writeWorker(runtime.worker, { type: 'resize', cols, rows });
+  addRuntimeSubscriber(runtime, ws, { cols, rows });
   if (runtime.workerPid) {
     sendWsControl(ws, {
       type: 'hello',
@@ -1445,12 +1798,20 @@ wss.on('connection', (ws, req) => {
     try {
       msg = JSON.parse(String(raw));
     } catch {
+      if (runtime.controller !== ws) {
+        sendRuntimeRole(runtime, ws);
+        return;
+      }
       const rawInputData = stripTerminalFocusReports(String(raw));
       if (rawInputData) writeWorker(runtime.worker, { type: 'input', data: Buffer.from(rawInputData, 'utf8').toString('base64') });
       return;
     }
 
     if (msg.type === 'input' && typeof msg.data === 'string') {
+      if (runtime.controller !== ws) {
+        sendRuntimeRole(runtime, ws);
+        return;
+      }
       const inputData = msg.allowFocusReports ? msg.data : stripTerminalFocusReports(msg.data);
       if (!inputData) return;
       if (msg.directTmux) {
@@ -1463,18 +1824,30 @@ wss.on('connection', (ws, req) => {
         writeWorker(runtime.worker, { type: 'input', data: Buffer.from(inputData, 'utf8').toString('base64') });
       }
     } else if (msg.type === 'resize') {
-      writeWorker(runtime.worker, {
-        type: 'resize',
+      const dimensions = {
         cols: clampNumber(msg.cols, 120, 20, 300),
         rows: clampNumber(msg.rows, 36, 5, 120),
-      });
+      };
+      runtime.clientDimensions.set(ws, dimensions);
+      if (runtime.controller === ws) {
+        resizeRuntime(runtime, dimensions);
+      }
+    } else if (msg.type === 'take-control') {
+      const currentDimensions = runtime.clientDimensions.get(ws) || { cols: 120, rows: 36 };
+      const dimensions = {
+        cols: clampNumber(msg.cols, currentDimensions.cols, 20, 300),
+        rows: clampNumber(msg.rows, currentDimensions.rows, 5, 120),
+      };
+      runtime.clientDimensions.set(ws, dimensions);
+      setRuntimeController(runtime, ws);
     } else if (msg.type === 'detach') {
+      removeRuntimeSubscriber(runtime, ws);
       ws.close(1000, 'detached');
     }
   });
 
   ws.on('close', () => {
-    runtime.subscribers.delete(ws);
+    removeRuntimeSubscriber(runtime, ws);
   });
 });
 
