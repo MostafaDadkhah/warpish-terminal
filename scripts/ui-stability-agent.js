@@ -157,6 +157,17 @@ assert(activity.running?.text === 'command running…'
 assert(activity.legacyFallback?.running?.source === 'process'
   && activity.legacyFallback?.running?.ariaBusy === 'true'
   && activity.legacyFallback?.finished?.text === 'command finished', 'legacy-session foreground-process fallback failed', activity);
+assert(activity.interactiveFallback?.idleDraft?.running === false
+  && activity.interactiveFallback?.idleDraft?.ariaBusy === null
+  && activity.interactiveFallback?.running?.source === 'interactive'
+  && activity.interactiveFallback?.running?.processName === 'Hermes'
+  && activity.interactiveFallback?.running?.ariaBusy === 'true'
+  && activity.interactiveFallback?.finished?.text === 'command finished'
+  && /python/i.test(activity.interactiveFallback?.foregroundAfterTurn || ''), 'interactive foreground process was confused with active work or did not return to ready', activity);
+assert(minimal.xtermDirection?.rowDirection === 'ltr'
+  && minimal.xtermDirection?.helperDirection === 'ltr'
+  && minimal.xtermDirection?.rowUnicodeBidi !== 'plaintext'
+  && minimal.xtermDirection?.helperUnicodeBidi !== 'plaintext', 'browser bidi CSS is still overriding xterm native cell direction', minimal);
 
 if (!process.env.WARPISH_BROWSER_ONLY) {
   const required = [
@@ -199,6 +210,7 @@ if (regressions.nativeFocusReports) {
     && check.reportsHex === check.expectedHex
     && check.protocolMetadataPreserved
     && check.controllerFocusResynced
+    && check.spectatorProtocolRepliesBlocked
     && check.acknowledged, 'native xterm focus reporting or input acknowledgement failed', check);
 }
 if (regressions.runtimeEpochInputSafety) {

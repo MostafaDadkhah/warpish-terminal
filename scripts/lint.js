@@ -200,6 +200,11 @@ if (!appJs.includes("msg.type === 'input-ack'")
   fail('Controller-safe acknowledged input, native focus reports, and generation-safe terminal writes must remain enabled.');
 }
 
+if (!appJs.includes("terminalControlRole !== 'controller' && (focusReport || terminalProtocolReply)")
+  || !browserRegressionJs.includes('spectatorProtocolRepliesBlocked')) {
+  fail('Spectator tabs must not claim terminal control or leak automatic terminal protocol replies into live input.');
+}
+
 if (!appJs.includes("msg.type === 'command-state'")
   || !appJs.includes("setStatus('running', 'command running…'")
   || !stylesCss.includes('.status-running')
@@ -210,6 +215,14 @@ if (!appJs.includes("msg.type === 'command-state'")
   || !shellIntegrationZsh.includes('ActivityStart;id=')
   || !shellIntegrationZsh.includes('ActivityEnd;id=')) {
   fail('Live command-running and command-finished activity signaling must remain enabled.');
+}
+
+if (/xterm-rows[^}]*unicode-bidi\s*:/su.test(stylesCss)
+  || /xterm-helper-textarea[^}]*unicode-bidi\s*:/su.test(stylesCss)
+  || /xterm-helper-textarea[^}]*direction\s*:\s*(?:auto|rtl)/su.test(stylesCss)
+  || !serverJs.includes('inspectKnownInteractivePane(')
+  || !serverJs.includes("source: 'interactive'")) {
+  fail('xterm must keep native cell direction and interactive programs must use prompt readiness instead of permanent process-name activity.');
 }
 
 if (!indexHtml.includes('interactive-widget=resizes-content')

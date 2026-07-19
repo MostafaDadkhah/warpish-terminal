@@ -431,15 +431,6 @@ button.danger:hover {
   background: rgba(1, 1, 6, 0.5);
 }
 
-#terminal .xterm-rows > div {
-  unicode-bidi: plaintext;
-}
-
-#terminal .xterm-helper-textarea {
-  direction: auto;
-  unicode-bidi: plaintext;
-}
-
 .xterm {
   width: 100% !important;
   max-width: 100%;

@@ -1086,6 +1086,40 @@ function paneCursorState(id) {
   }
 }
 
+function inspectKnownInteractivePane(sessionId, { privateSession = false, processName = '' } = {}) {
+  if (privateSession || !/^(?:hermes|python(?:\d+(?:\.\d+)*)?)$/iu.test(String(processName).trim())) return null;
+  const cursor = paneCursorState(sessionId);
+  if (!cursor.ok) return null;
+  const current = capturePaneResult(sessionId, {
+    alternate: cursor.alternateActive,
+    history: false,
+  });
+  if (!current.ok) return null;
+
+  const lines = current.text.split('\n');
+  const cursorLine = lines[cursor.y] || '';
+  const nearby = lines
+    .slice(Math.max(0, cursor.y - 7), Math.min(lines.length, cursor.y + 3))
+    .join('\n');
+
+  // Hermes keeps a compact status row immediately above its prompt. The
+  // foreground process remains Python both while Hermes is idle and while it
+  // is working, so process-name polling alone cannot distinguish those states.
+  // Read only the current tmux screen and use Hermes' own live prompt contract:
+  // a working composer starts with the staff symbol, while an input-ready
+  // composer exposes one of the user-facing prompt symbols below.
+  if (!nearby.includes('⏲')) return null;
+  if (/^\s*(?:⚕|◉)(?:\s|$)/u.test(cursorLine)
+    || nearby.includes('msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel')
+    || nearby.includes('command in progress · input temporarily disabled')) {
+    return { state: 'busy', processName: 'Hermes' };
+  }
+  if (cursor.visible && /^\s*(?:❯|\?|⚠|✎|🔐|🔑|🎤|●)(?:\s|$)/u.test(cursorLine)) {
+    return { state: 'ready', processName: 'Hermes' };
+  }
+  return { state: 'unknown', processName: 'Hermes' };
+}
+
 function summarizeSessions() {
   const meta = readMetadata();
   const activeResult = listActiveTmuxSessions();
@@ -1686,6 +1720,20 @@ function sendWsInputError(ws, code, message) {
 }
 
 function initialRuntimeCommandState(sessionId, privateSession = false) {
+  const processName = tmuxPaneCurrentCommand(sessionId);
+  const interactive = inspectKnownInteractivePane(sessionId, { privateSession, processName });
+  if (interactive?.state === 'ready') return null;
+  if (interactive?.state === 'busy') {
+    return {
+      running: true,
+      phase: 'running',
+      source: 'interactive',
+      activityId: null,
+      startedAt: null,
+      processName: privateSession ? '' : interactive.processName,
+    };
+  }
+
   const record = readMetadata().sessions?.[sessionId];
   const activeBlock = record?.blocks?.find((block) => (
     block.id === record.activeBlockId && block.status === 'running'
@@ -1701,16 +1749,10 @@ function initialRuntimeCommandState(sessionId, privateSession = false) {
     };
   }
 
-  const processName = tmuxPaneCurrentCommand(sessionId);
-  if (foregroundCommandIsShell(processName)) return null;
-  return {
-    running: true,
-    phase: 'running',
-    source: 'process',
-    activityId: null,
-    startedAt: null,
-    processName: privateSession ? '' : processName,
-  };
+  // A non-shell foreground process is not positive proof of work at attach
+  // time: editors, REPLs, and agents remain foreground while waiting for input.
+  // Process fallback begins only after this browser actually submits Enter.
+  return null;
 }
 
 function runtimeCommandStateMessage(runtime, extra = {}) {
@@ -1737,6 +1779,7 @@ function stopRuntimeCommandProbe(runtime) {
   clearRuntimeTimer(runtime, 'commandProbeTimer');
   runtime.commandProbeAttempts = 0;
   runtime.commandProbeSawBusy = false;
+  runtime.commandProbeInitialProcess = '';
 }
 
 function scheduleRuntimeCommandProbe(runtime, token, delay = COMMAND_PROBE_INTERVAL_MS) {
@@ -1746,30 +1789,70 @@ function scheduleRuntimeCommandProbe(runtime, token, delay = COMMAND_PROBE_INTER
     runtime.commandProbeTimer = null;
     if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
 
-    if (runtime.commandState?.source === 'shell') {
-      runtime.eventReader?.poll();
-      if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
-      if (runtime.commandState?.source === 'shell') {
-        scheduleRuntimeCommandProbe(runtime, token, COMMAND_RUNNING_PROBE_INTERVAL_MS);
-      }
-      return;
-    }
-
     // The shell recorder writes activity events synchronously, but a quiet
     // command such as `sleep` may not produce another PTY chunk to trigger the
     // normal event-reader poll. Consume the journal before using the foreground
     // process fallback so exact Start/End state never depends on incidental output.
     runtime.eventReader?.poll();
     if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
-    if (runtime.commandState?.source === 'shell') return;
 
     runtime.commandProbeAttempts += 1;
+    const processName = tmuxPaneCurrentCommand(runtime.sessionId);
+    const interactive = inspectKnownInteractivePane(runtime.sessionId, {
+      privateSession: runtime.private,
+      processName,
+    });
+
+    if (interactive?.state === 'busy') {
+      runtime.commandProbeSawBusy = true;
+      publishRuntimeCommandState(runtime, {
+        running: true,
+        phase: 'running',
+        source: 'interactive',
+        activityId: null,
+        startedAt: runtime.commandState?.startedAt || new Date().toISOString(),
+        processName: runtime.private ? '' : interactive.processName,
+      });
+      scheduleRuntimeCommandProbe(runtime, token, COMMAND_RUNNING_PROBE_INTERVAL_MS);
+      return;
+    }
+
+    if (interactive?.state === 'ready') {
+      const shellLaunchReachedPrompt = runtime.commandState?.source === 'shell';
+      const submittedInputSettled = runtime.commandProbeSawBusy
+        || runtime.commandProbeAttempts >= COMMAND_PROBE_PENDING_LIMIT;
+      if (shellLaunchReachedPrompt || submittedInputSettled) {
+        publishRuntimeCommandState(runtime, null, { completed: true });
+        stopRuntimeCommandProbe(runtime);
+      } else {
+        scheduleRuntimeCommandProbe(runtime, token);
+      }
+      return;
+    }
+
+    if (runtime.commandState?.source === 'shell') {
+      scheduleRuntimeCommandProbe(runtime, token, COMMAND_RUNNING_PROBE_INTERVAL_MS);
+      return;
+    }
+
     if (runtime.commandState?.source === 'input' && runtime.commandProbeAttempts < 3) {
       scheduleRuntimeCommandProbe(runtime, token);
       return;
     }
-    const processName = tmuxPaneCurrentCommand(runtime.sessionId);
+
+    const initialProcess = runtime.commandProbeInitialProcess;
+    const unchangedInteractiveProcess = !foregroundCommandIsShell(initialProcess)
+      && processName === initialProcess;
     if (!foregroundCommandIsShell(processName)) {
+      if (unchangedInteractiveProcess) {
+        if (runtime.commandProbeAttempts >= COMMAND_PROBE_PENDING_LIMIT) {
+          publishRuntimeCommandState(runtime, null, { completed: true });
+          stopRuntimeCommandProbe(runtime);
+        } else {
+          scheduleRuntimeCommandProbe(runtime, token);
+        }
+        return;
+      }
       runtime.commandProbeSawBusy = true;
       publishRuntimeCommandState(runtime, {
         running: true,
@@ -1793,9 +1876,13 @@ function scheduleRuntimeCommandProbe(runtime, token, delay = COMMAND_PROBE_INTER
   runtime.commandProbeTimer.unref?.();
 }
 
-function startRuntimeCommandProbe(runtime, { submitted = false } = {}) {
+function startRuntimeCommandProbe(runtime, { submitted = false, initialProcess = null } = {}) {
   if (runtime.commandState?.source === 'shell') return;
+  const processBeforeSubmission = initialProcess === null
+    ? tmuxPaneCurrentCommand(runtime.sessionId)
+    : String(initialProcess);
   stopRuntimeCommandProbe(runtime);
+  runtime.commandProbeInitialProcess = processBeforeSubmission;
   const token = runtime.commandProbeToken;
   if (submitted) {
     publishRuntimeCommandState(runtime, {
@@ -1810,7 +1897,28 @@ function startRuntimeCommandProbe(runtime, { submitted = false } = {}) {
     return;
   }
 
-  const processName = tmuxPaneCurrentCommand(runtime.sessionId);
+  const processName = processBeforeSubmission;
+  const interactive = inspectKnownInteractivePane(runtime.sessionId, {
+    privateSession: runtime.private,
+    processName,
+  });
+  if (interactive?.state === 'ready') {
+    publishRuntimeCommandState(runtime, null);
+    return;
+  }
+  if (interactive?.state === 'busy') {
+    runtime.commandProbeSawBusy = true;
+    publishRuntimeCommandState(runtime, {
+      running: true,
+      phase: 'running',
+      source: 'interactive',
+      activityId: null,
+      startedAt: runtime.commandState?.startedAt || null,
+      processName: runtime.private ? '' : interactive.processName,
+    });
+    scheduleRuntimeCommandProbe(runtime, token, COMMAND_RUNNING_PROBE_INTERVAL_MS);
+    return;
+  }
   const processBusy = !foregroundCommandIsShell(processName);
   runtime.commandProbeSawBusy = processBusy;
   if (processBusy) {
@@ -1830,14 +1938,18 @@ function startRuntimeCommandProbe(runtime, { submitted = false } = {}) {
   );
 }
 
-function noteRuntimeCommandSubmission(runtime, bytes) {
-  if (!Buffer.from(bytes || '').some((byte) => byte === 0x0a || byte === 0x0d)) return;
+function terminalInputSubmitsLine(bytes) {
+  return Buffer.from(bytes || '').some((byte) => byte === 0x0a || byte === 0x0d);
+}
+
+function noteRuntimeCommandSubmission(runtime, bytes, initialProcess = null) {
+  if (!terminalInputSubmitsLine(bytes)) return;
   if (runtime.commandState?.source === 'shell') return;
   if (runtime.commandState?.source === 'process') {
     if (!runtime.commandProbeTimer) startRuntimeCommandProbe(runtime);
     return;
   }
-  startRuntimeCommandProbe(runtime, { submitted: true });
+  startRuntimeCommandProbe(runtime, { submitted: true, initialProcess });
 }
 
 function handleRuntimeShellEvent(runtime, event) {
@@ -1870,12 +1982,15 @@ function handleRuntimeShellEvent(runtime, event) {
 
 function writeRuntimeInput(runtime, ws, bytes) {
   if (!bytes?.length) return true;
+  const initialProcess = terminalInputSubmitsLine(bytes)
+    ? tmuxPaneCurrentCommand(runtime.sessionId)
+    : null;
   const result = queueWorkerMessage(runtime.worker, {
     type: 'input',
     data: Buffer.from(bytes).toString('base64'),
   });
   if (!result.ok) sendWsInputError(ws, result.code, result.message);
-  else noteRuntimeCommandSubmission(runtime, bytes);
+  else noteRuntimeCommandSubmission(runtime, bytes, initialProcess);
   return result.ok;
 }
 
@@ -2133,6 +2248,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     commandProbeToken: 0,
     commandProbeAttempts: 0,
     commandProbeSawBusy: false,
+    commandProbeInitialProcess: '',
     stdoutBuffer: '',
     stderrBuffer: '',
     forceKillTimer: null,
@@ -2233,7 +2349,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   });
 
   scheduleRuntimeIdleTeardown(runtime);
-  if (runtime.commandState?.source === 'process') startRuntimeCommandProbe(runtime);
+  if (['process', 'interactive'].includes(runtime.commandState?.source)) startRuntimeCommandProbe(runtime);
   return runtime;
 }
 
@@ -2399,10 +2515,13 @@ wss.on('connection', (ws, req) => {
       }
       let accepted = false;
       if (msg.directTmux) {
+        const initialProcess = terminalInputSubmitsLine(Buffer.from(inputData, 'utf8'))
+          ? tmuxPaneCurrentCommand(runtime.sessionId)
+          : null;
         try {
           writeTmuxInput(sessionId, inputData);
           accepted = true;
-          noteRuntimeCommandSubmission(runtime, Buffer.from(inputData, 'utf8'));
+          noteRuntimeCommandSubmission(runtime, Buffer.from(inputData, 'utf8'), initialProcess);
         } catch (error) {
           sendWsControl(ws, { type: 'server-error', message: `tmux input failed: ${error.message || error}` });
         }

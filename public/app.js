@@ -1223,10 +1223,11 @@ function handleTerminalInput(data) {
   const input = String(data || '');
   if (!input) return false;
   const focusReport = /^\x1b\[(?:I|O)$/u.test(input);
+  const terminalProtocolReply = /^(?:(?:\x1b\[(?:\?|>)[0-9;]*c)|(?:\x1b\[[0-9;?]*[nR])|(?:\x1b\[[0-9;]*t)|(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)))+$/u.test(input);
   if (input === '\x1b[O') controllerFocusReported = false;
   if (terminalSurfaceTransitioning) return false;
-  if (terminalControlRole !== 'controller' && focusReport) {
-    controllerFocusReported = false;
+  if (terminalControlRole !== 'controller' && (focusReport || terminalProtocolReply)) {
+    if (focusReport) controllerFocusReported = false;
     return false;
   }
   const queued = sendRaw(input, { sessionId: currentSessionId });

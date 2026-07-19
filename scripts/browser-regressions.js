@@ -659,6 +659,10 @@ async function testMinimalUi(page) {
       .filter(([, selector]) => document.querySelector(selector)));
     const dialogs = [...document.querySelectorAll('dialog')].map((dialog) => ({ id: dialog.id, open: dialog.open }));
     const card = document.querySelector('.terminal-card');
+    const row = document.querySelector('#terminal .xterm-rows > div');
+    const helper = document.querySelector('#terminal .xterm-helper-textarea');
+    const rowStyle = row ? getComputedStyle(row) : null;
+    const helperStyle = helper ? getComputedStyle(helper) : null;
     return {
       present,
       dialogs,
@@ -666,6 +670,12 @@ async function testMinimalUi(page) {
       terminalChildren: [...(card?.children || [])].map((child) => child.id || child.className),
       newSessionType: document.querySelector('#newSession')?.type || '',
       mobileKeyCount: document.querySelectorAll('.mobile-terminal-keys button').length,
+      xtermDirection: {
+        rowDirection: rowStyle?.direction || '',
+        rowUnicodeBidi: rowStyle?.unicodeBidi || '',
+        helperDirection: helperStyle?.direction || '',
+        helperUnicodeBidi: helperStyle?.unicodeBidi || '',
+      },
     };
   })()`);
 
@@ -678,6 +688,10 @@ async function testMinimalUi(page) {
     && state.terminalChildren.includes('terminal')
     && state.terminalChildren.includes('mobile-terminal-keys'), 'terminal card contains a legacy overlay or action surface', state.terminalChildren);
   assert(state.newSessionType === 'button' && state.mobileKeyCount === 8, 'minimal core controls are incomplete', state);
+  assert(state.xtermDirection.rowDirection === 'ltr'
+    && state.xtermDirection.helperDirection === 'ltr'
+    && state.xtermDirection.rowUnicodeBidi !== 'plaintext'
+    && state.xtermDirection.helperUnicodeBidi !== 'plaintext', 'xterm native cell direction was overridden by browser bidi layout', state.xtermDirection);
 
   return {
     removedSelectorsPresent: Object.keys(state.present),
@@ -685,6 +699,7 @@ async function testMinimalUi(page) {
     rawXterm: state.rawXterm,
     terminalChildren: state.terminalChildren,
     mobileKeyCount: state.mobileKeyCount,
+    xtermDirection: state.xtermDirection,
   };
 }
 
@@ -856,7 +871,7 @@ async function testCommandActivityIndicator(page, sessionId) {
   await page.waitFor(`statusText.textContent === 'command finished' && !commandActivity`, 10_000, 'activity integration disable command');
   await page.waitFor(`statusText.textContent === 'connected' && !commandActivity`, 10_000, 'legacy fallback setup readiness');
 
-  await page.eval(`(() => { term.input('sleep 1.4\\r', true); return true; })()`);
+  await page.eval(`(() => { term.input('sleep 2.5\\r', true); return true; })()`);
   const legacyRunning = await page.waitFor(`(() => commandActivity?.source === 'process'
     && document.querySelector('#statusCard')?.classList.contains('status-running')
     ? {
@@ -876,6 +891,80 @@ async function testCommandActivityIndicator(page, sessionId) {
     }
     : false)()`, 10_000, 'legacy-session command completion');
 
+  const fakeHermesPath = path.join(runtimeRoot, 'fake-hermes.py');
+  fs.writeFileSync(fakeHermesPath, [
+    'import sys',
+    'import time',
+    'print(" ⚕ fake-model │ ctx -- │ [░░░░] -- │ 1m │ ⏲ 0s")',
+    'print("────────────────────────────────────────────────")',
+    'sys.stdout.write("❯ ")',
+    'sys.stdout.flush()',
+    'for line in sys.stdin:',
+    '    if line.strip() == "exit":',
+    '        break',
+    '    sys.stdout.write("\\r\\x1b[2K⚕ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel")',
+    '    sys.stdout.flush()',
+    '    time.sleep(1.2)',
+    '    sys.stdout.write("\\r\\x1b[2K❯ ")',
+    '    sys.stdout.flush()',
+    '',
+  ].join('\n'), 'utf8');
+
+  await page.eval(`(() => { term.input(${JSON.stringify(`python3 ${shellQuote(fakeHermesPath)}\r`)}, true); return true; })()`);
+  const interactiveLaunchRunning = await page.waitFor(`(() => commandActivity?.running
+    ? {
+      source: commandActivity.source,
+      phase: commandActivity.phase,
+      text: statusText.textContent,
+    }
+    : false)()`, 10_000, 'interactive program launch activity');
+  const interactiveReady = await page.waitFor(`(() => !commandActivity
+    && (statusText.textContent === 'command finished' || statusText.textContent === 'connected')
+    ? {
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+    }
+    : false)()`, 10_000, 'interactive program input-ready state');
+
+  await page.eval(`(() => { term.input('draft without enter', true); return true; })()`);
+  await delay(600);
+  const idleDraft = await page.eval(`(() => ({
+    running: Boolean(commandActivity?.running),
+    status: statusText.textContent,
+    ariaBusy: document.querySelector('#statusCard')?.getAttribute('aria-busy'),
+  }))()`);
+  assert(!idleDraft.running
+    && idleDraft.status !== 'command running…'
+    && idleDraft.ariaBusy === null, 'typing without Enter falsely marked an interactive program busy', idleDraft);
+
+  await page.eval(`(() => { term.input('\\x15work\\r', true); return true; })()`);
+  const interactiveRunning = await page.waitFor(`(() => commandActivity?.source === 'interactive'
+    && document.querySelector('#statusCard')?.classList.contains('status-running')
+    ? {
+      source: commandActivity.source,
+      processName: commandActivity.processName,
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+      ariaBusy: document.querySelector('#statusCard')?.getAttribute('aria-busy'),
+    }
+    : false)()`, 10_000, 'interactive program busy prompt');
+  const interactiveFinished = await page.waitFor(`(() => statusText.textContent === 'command finished'
+    && !commandActivity
+    ? {
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+      ariaBusy: document.querySelector('#statusCard')?.getAttribute('aria-busy'),
+    }
+    : false)()`, 10_000, 'interactive program returned to input-ready prompt');
+  const foregroundAfterTurn = execFileSync(tmuxBin, [
+    'display-message', '-p', '-t', legacySession.id, '#{pane_current_command}',
+  ], { encoding: 'utf8', env: tmuxEnvironment }).trim();
+  assert(/python/i.test(foregroundAfterTurn), 'interactive activity finished only because the foreground program exited', foregroundAfterTurn);
+
+  await page.eval(`(() => { term.input('exit\\r', true); return true; })()`);
+  await page.waitFor(`(() => !commandActivity
+    && (statusText.textContent === 'command finished' || statusText.textContent === 'connected'))()`, 10_000, 'interactive fixture exit');
+
   return {
     sessionId,
     running,
@@ -886,6 +975,15 @@ async function testCommandActivityIndicator(page, sessionId) {
       sessionId: legacySession.id,
       running: legacyRunning,
       finished: legacyFinished,
+    },
+    interactiveFallback: {
+      sessionId: legacySession.id,
+      launchRunning: interactiveLaunchRunning,
+      ready: interactiveReady,
+      idleDraft,
+      running: interactiveRunning,
+      finished: interactiveFinished,
+      foregroundAfterTurn,
     },
   };
 }
@@ -1042,6 +1140,13 @@ async function testNativeFocusReports(page) {
   const resyncEventCursor = page.events.length;
   const controllerResync = await page.eval(`(async () => {
     applyTerminalControlRole('spectator', 'focus regression');
+    const spectatorProtocolReplies = [];
+    const protocolSubscription = term.onData((data) => {
+      if (data.includes('c')) spectatorProtocolReplies.push(data);
+    });
+    await new Promise((resolve) => term.write('\x1b[c\x1b[>c', resolve));
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    protocolSubscription.dispose();
     term.blur();
     await new Promise((resolve) => window.setTimeout(resolve, 50));
     term.focus();
@@ -1049,7 +1154,7 @@ async function testNativeFocusReports(page) {
     const focusedAsSpectator = document.activeElement === document.querySelector('#terminal .xterm-helper-textarea');
     applyTerminalControlRole('controller', 'focus regression');
     await new Promise((resolve) => window.setTimeout(resolve, 80));
-    return { focusedAsSpectator, controllerFocusReported, role: terminalControlRole };
+    return { focusedAsSpectator, controllerFocusReported, role: terminalControlRole, spectatorProtocolReplies };
   })()`);
   await page.waitFor(`pendingTerminalInputs.filter((item) => item.sessionId === ${JSON.stringify(session.id)}).length === 0`, 10_000, 'controller focus-resync acknowledgement');
   await delay(150);
@@ -1065,14 +1170,29 @@ async function testNativeFocusReports(page) {
         return [];
       }
     });
+  const leakedProtocolFrames = page.events.slice(resyncEventCursor)
+    .filter((event) => event.method === 'Network.webSocketFrameSent'
+      && event.params?.requestId === socketRequestId
+      && event.params?.response?.opcode === 1)
+    .flatMap((event) => {
+      try {
+        const message = JSON.parse(event.params.response.payloadData);
+        return message.type === 'input' && /\x1b\[(?:\?|>)[0-9;]*c/u.test(message.data) ? [message] : [];
+      } catch {
+        return [];
+      }
+    });
   assert(controllerResync.focusedAsSpectator
+    && controllerResync.spectatorProtocolReplies.length >= 1
     && controllerResync.controllerFocusReported
     && controllerResync.role === 'controller'
+    && leakedProtocolFrames.length === 0
     && resyncFrames.length === 1
     && resyncFrames[0].data === '\x1b[I', 'spectator-to-controller transition did not resynchronize the focused TUI state exactly once', {
-    controllerResync,
-    resyncFrames,
-  });
+      controllerResync,
+      resyncFrames,
+      leakedProtocolFrames,
+    });
   await page.eval(`new Promise((resolve) => term.write('\\x1b[?1004l', resolve))`);
 
   return {
@@ -1082,6 +1202,7 @@ async function testNativeFocusReports(page) {
     expectedHex: Buffer.from(expected, 'binary').toString('hex'),
     protocolMetadataPreserved: true,
     controllerFocusResynced: true,
+    spectatorProtocolRepliesBlocked: true,
     acknowledged: true,
   };
 }
@@ -1212,6 +1333,10 @@ async function testMinimalApiSurface(sessionId) {
 
 async function testPasteAffinityAndStoppedHistory(page, sourceSessionId, targetSessionId) {
   await selectLiveSession(page, sourceSessionId);
+  // Exercise the explicit multiline-safety dialog deterministically. zsh
+  // normally enables bracketed paste at its prompt, where multiline input is
+  // intentionally inserted directly and this dialog should not appear.
+  await page.eval(`new Promise((resolve) => term.write('\x1b[?2004l', resolve))`);
   const affinityMarker = `__PASTE_AFFINITY_${Date.now()}__`;
   const dispatch = await page.eval(`(() => {
     const target = document.querySelector('#terminal .xterm-helper-textarea');
@@ -1229,6 +1354,8 @@ async function testPasteAffinityAndStoppedHistory(page, sourceSessionId, targetS
       prevented: event.defaultPrevented,
       dialogOpen: Boolean(document.querySelector('#pasteDialog')?.open),
       pendingSessionId: pendingMultilinePaste?.sessionId || null,
+      bracketedPasteMode: Boolean(term.modes?.bracketedPasteMode),
+      status: statusText.textContent,
     };
   })()`);
   assert(dispatch.targetFound && dispatch.prevented && dispatch.dialogOpen
