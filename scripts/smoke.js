@@ -16,6 +16,7 @@ const smokeTokenFile = path.join(smokeRoot, 'token');
 const smokeTmuxDir = path.join(smokeRoot, 'tmux');
 fs.mkdirSync(smokeTmuxDir, { recursive: true, mode: 0o700 });
 const smokePrefix = `warpishsmoke-${process.pid.toString(36)}-`;
+const tmuxFormatSeparator = '|';
 const tmuxBin = process.env.TMUX_BIN
   || ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find((candidate) => fs.existsSync(candidate))
   || 'tmux';
@@ -27,12 +28,25 @@ function isolatedTmuxEnvironment(extra = {}) {
   return env;
 }
 
+function launchdLikeServerEnvironment(extra = {}) {
+  const env = isolatedTmuxEnvironment(extra);
+  delete env.LANG;
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('LC_')) delete env[key];
+  }
+  return env;
+}
+
 function paneHistoryState(sessionId) {
   const output = execFileSync(tmuxBin, [
-    'list-panes', '-s', '-t', sessionId, '-F', '#{pane_id}\t#{history_limit}\t#{history_size}',
+    'list-panes', '-s', '-t', sessionId, '-F', [
+      '#{pane_id}',
+      '#{history_limit}',
+      '#{history_size}',
+    ].join(tmuxFormatSeparator),
   ], { encoding: 'utf8', env: isolatedTmuxEnvironment() });
   return output.trim().split('\n').filter(Boolean).map((line) => {
-    const [paneId, limit, size] = line.split('\t');
+    const [paneId, limit, size] = line.split(tmuxFormatSeparator);
     return { paneId, limit: Number(limit), size: Number(size) };
   });
 }
@@ -52,7 +66,9 @@ function startServerProcess() {
   tokenUrl = undefined;
   const serverProcess = spawn(process.execPath, ['server.js'], {
     cwd: projectRoot,
-    env: isolatedTmuxEnvironment({
+    // A user LaunchAgent commonly has no LANG/LC_* variables. Keep the full
+    // smoke suite in that environment so tmux list parsing cannot regress.
+    env: launchdLikeServerEnvironment({
       PORT: String(port),
       HOST: '127.0.0.1',
       WARPISH_DATA_DIR: smokeDataDir,

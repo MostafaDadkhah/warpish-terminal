@@ -48,6 +48,7 @@ const WS_HEARTBEAT_INTERVAL_MS = clampNumber(process.env.WARPISH_WS_HEARTBEAT_MS
 const PTY_RUNTIME_IDLE_GRACE_MS = clampNumber(process.env.WARPISH_PTY_IDLE_GRACE_MS, 30_000, 100, 600_000);
 const TMUX_COMMAND_TIMEOUT_MS = clampNumber(process.env.WARPISH_TMUX_TIMEOUT_MS, 5000, 250, 60_000);
 const TMUX_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+const TMUX_FORMAT_SEPARATOR = '|';
 const TOKEN_FILE = path.resolve(process.env.WARPISH_TOKEN_FILE || path.join(__dirname, '.auth-token'));
 const INSTANCE_LOCK_FILE = path.join(DATA_DIR, 'server.lock');
 const INSTANCE_LOCK_ID = crypto.randomUUID();
@@ -338,12 +339,16 @@ function tmuxPaneCurrentPath(sessionId) {
 
 function tmuxPaneHistoryState(sessionId) {
   try {
-    const panes = runTmux(['list-panes', '-s', '-t', sessionId, '-F', '#{pane_id}\t#{history_limit}\t#{history_size}'])
+    const panes = runTmux(['list-panes', '-s', '-t', sessionId, '-F', [
+      '#{pane_id}',
+      '#{history_limit}',
+      '#{history_size}',
+    ].join(TMUX_FORMAT_SEPARATOR)])
       .split('\n')
       .map((value) => value.trim())
       .filter(Boolean)
       .map((line) => {
-        const [paneId, limit, size] = line.split('\t');
+        const [paneId, limit, size] = line.split(TMUX_FORMAT_SEPARATOR);
         return { paneId, limit: Number(limit), size: Number(size) };
       })
       .filter((pane) => /^%\d+$/u.test(pane.paneId) && Number.isFinite(pane.limit) && Number.isFinite(pane.size));
@@ -924,7 +929,16 @@ let lastKnownActiveTmuxSessions = new Map();
 function listActiveTmuxSessions() {
   let output = '';
   try {
-    output = runTmux(['list-sessions', '-F', '#{session_name}\t#{session_created}\t#{session_attached}\t#{session_windows}']);
+    // tmux sanitizes literal control characters in format strings when launchd
+    // starts the process without a locale. A tab delimiter then becomes `_`,
+    // merging every field into a fake session id. Session ids cannot contain
+    // `|`, so use a printable separator that is stable with or without LANG.
+    output = runTmux(['list-sessions', '-F', [
+      '#{session_name}',
+      '#{session_created}',
+      '#{session_attached}',
+      '#{session_windows}',
+    ].join(TMUX_FORMAT_SEPARATOR)]);
   } catch (error) {
     const detail = `${error?.stderr || ''}\n${error?.message || ''}`;
     if (/no server running/iu.test(detail)) {
@@ -938,7 +952,7 @@ function listActiveTmuxSessions() {
   const active = new Map();
   for (const line of output.split('\n')) {
     if (!line.trim()) continue;
-    const [name, created, attached, windows] = line.split('\t');
+    const [name, created, attached, windows] = line.split(TMUX_FORMAT_SEPARATOR);
     if (!name?.startsWith(PREFIX)) continue;
     active.set(name, {
       id: name,
