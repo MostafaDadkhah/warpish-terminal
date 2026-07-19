@@ -5,6 +5,16 @@ cd "$(dirname "$0")"
 PROJECT_ROOT="$(pwd -P)"
 PID_FILE=".server.pid"
 PORT="${PORT:-8765}"
+LAUNCH_AGENT_LABEL="${WARPISH_LAUNCH_AGENT_LABEL:-com.warpish.terminal}"
+LAUNCH_AGENT_TARGET="gui/$(id -u)/${LAUNCH_AGENT_LABEL}"
+
+if [[ "$PORT" == "8765" ]] && launchctl print "$LAUNCH_AGENT_TARGET" >/dev/null 2>&1; then
+  launchctl bootout "$LAUNCH_AGENT_TARGET"
+  rm -f "$PID_FILE"
+  echo "Stopped Warpish Terminal LaunchAgent for this login session."
+  echo "Run ./start.sh to start it again; it will also start automatically at the next login."
+  exit 0
+fi
 
 pid_cwd() {
   local pid="$1"

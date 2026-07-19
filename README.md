@@ -33,14 +33,25 @@ Run:
 git clone https://github.com/MostafaDadkhah/warpish-terminal.git
 cd warpish-terminal
 npm install
-./start.sh
+npm run service:install
+./start.sh # opens the already-running service in Chrome
 ```
+
+`service:install` creates a per-user macOS LaunchAgent named `com.warpish.terminal`. It starts Warpish Terminal automatically whenever you log in and restarts the Node process if it exits unexpectedly. The service stays local at `127.0.0.1:8765`; its logs are stored in `~/Library/Logs/Warpish Terminal/`.
+
+For a one-off/manual run without installing the LaunchAgent, omit `npm run service:install` and use `./start.sh` directly.
 
 Stop the web server:
 
 ```bash
 cd warpish-terminal
 ./stop.sh
+```
+
+When the LaunchAgent is installed, `stop.sh` stops it for the current login session. Run `./start.sh` to load it again. To remove automatic startup permanently:
+
+```bash
+npm run service:uninstall
 ```
 
 Note: stopping the web server does not necessarily kill live `tmux` sessions. Use the UI's `Kill session` button to stop a specific terminal session.

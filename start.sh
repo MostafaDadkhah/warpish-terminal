@@ -10,6 +10,15 @@ LOG_FILE="${LOG_FILE:-warpish-terminal.log}"
 PID_FILE=".server.pid"
 TOKEN_FILE="${WARPISH_TOKEN_FILE:-.auth-token}"
 HEALTH_URL="http://${HOST}:${PORT}/healthz"
+LAUNCH_AGENT_LABEL="${WARPISH_LAUNCH_AGENT_LABEL:-com.warpish.terminal}"
+LAUNCH_AGENT_TARGET="gui/$(id -u)/${LAUNCH_AGENT_LABEL}"
+LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LAUNCH_AGENT_LABEL}.plist"
+LAUNCH_AGENT_LOG_DIR="${HOME}/Library/Logs/Warpish Terminal"
+USING_LAUNCH_AGENT=0
+
+if [[ "$HOST" == "127.0.0.1" && "$PORT" == "8765" && -f "$LAUNCH_AGENT_PLIST" ]]; then
+  USING_LAUNCH_AGENT=1
+fi
 
 if [[ -e "$LOG_FILE" ]]; then
   chmod 600 "$LOG_FILE"
@@ -45,6 +54,20 @@ is_warpish_instance() {
 
 if is_warpish_instance; then
   echo "Warpish Terminal is already running on http://${HOST}:${PORT}"
+elif [[ "$USING_LAUNCH_AGENT" == "1" ]]; then
+  echo "Starting Warpish Terminal through ${LAUNCH_AGENT_LABEL}..."
+  launchctl enable "$LAUNCH_AGENT_TARGET"
+  if ! launchctl print "$LAUNCH_AGENT_TARGET" >/dev/null 2>&1; then
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PLIST"
+  fi
+  launchctl kickstart -k "$LAUNCH_AGENT_TARGET"
+
+  for _ in {1..100}; do
+    if is_warpish_instance; then
+      break
+    fi
+    sleep 0.1
+  done
 else
   echo "Starting Warpish Terminal on ${HOST}:${PORT}..."
   touch "$LOG_FILE"
@@ -61,8 +84,15 @@ else
 fi
 
 if ! is_warpish_instance; then
-  echo "Server did not become healthy or health endpoint did not identify Warpish Terminal. Last log lines:" >&2
-  tail -80 "$LOG_FILE" >&2 || true
+  echo "Server did not become healthy or health endpoint did not identify Warpish Terminal." >&2
+  if [[ "$USING_LAUNCH_AGENT" == "1" ]]; then
+    echo "Last LaunchAgent log lines:" >&2
+    tail -60 "${LAUNCH_AGENT_LOG_DIR}/warpish-terminal.log" >&2 || true
+    tail -60 "${LAUNCH_AGENT_LOG_DIR}/warpish-terminal.error.log" >&2 || true
+  else
+    echo "Last log lines:" >&2
+    tail -80 "$LOG_FILE" >&2 || true
+  fi
   exit 1
 fi
 
@@ -81,12 +111,22 @@ fi
 
 READY_BODY="$(curl --connect-timeout 1 --max-time 5 -fsS -H "x-warpish-token: $TOKEN" "http://${HOST}:${PORT}/readyz" 2>/dev/null || true)"
 if [[ "$READY_BODY" != *'"app":"warpish-terminal"'* || "$READY_BODY" != *'"ok":true'* ]]; then
-  echo "Server is listening, but Warpish Terminal is not ready. Last log lines:" >&2
-  tail -80 "$LOG_FILE" >&2 || true
+  echo "Server is listening, but Warpish Terminal is not ready." >&2
+  if [[ "$USING_LAUNCH_AGENT" == "1" ]]; then
+    tail -60 "${LAUNCH_AGENT_LOG_DIR}/warpish-terminal.log" >&2 || true
+    tail -60 "${LAUNCH_AGENT_LOG_DIR}/warpish-terminal.error.log" >&2 || true
+  else
+    tail -80 "$LOG_FILE" >&2 || true
+  fi
   exit 1
 fi
 
 URL="http://${HOST}:${PORT}/?token=${TOKEN}"
 open -a "Google Chrome" "$URL"
 echo "Opened in Chrome: http://${HOST}:${PORT}/?token=<redacted>"
-echo "Log: $(pwd)/$LOG_FILE"
+if [[ "$USING_LAUNCH_AGENT" == "1" ]]; then
+  echo "LaunchAgent: ${LAUNCH_AGENT_LABEL}"
+  echo "Logs: ${LAUNCH_AGENT_LOG_DIR}"
+else
+  echo "Log: $(pwd)/$LOG_FILE"
+fi
