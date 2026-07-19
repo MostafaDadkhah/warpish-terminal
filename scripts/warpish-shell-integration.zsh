@@ -1,6 +1,7 @@
 # Warpish shell integration for zsh.
 # Loaded only inside Warpish Terminal sessions via an isolated ZDOTDIR.
-# Emits invisible OSC markers that the web server converts into command blocks.
+# Emits CWD metadata for new sessions. Start/End markers are available only
+# while retiring already-running sessions that explicitly opt into legacy mode.
 
 if [[ -n "${__WARPISH_SHELL_INTEGRATION_LOADED:-}" ]]; then
   return 0
@@ -57,6 +58,7 @@ __warpish_marker() {
 
 __warpish_preexec() {
   emulate -L zsh
+  [[ "${WARPISH_BLOCK_INTEGRATION:-0}" == 1 ]] || return 0
   local command_line="$1"
   [[ -z "$command_line" ]] && return 0
   [[ "$command_line" == __warpish_* ]] && return 0
@@ -81,33 +83,10 @@ __warpish_precmd() {
   return $exit_code
 }
 
-add-zsh-hook preexec __warpish_preexec 2>/dev/null || true
+if [[ "${WARPISH_BLOCK_INTEGRATION:-0}" == 1 ]]; then
+  add-zsh-hook preexec __warpish_preexec 2>/dev/null || true
+fi
 add-zsh-hook precmd __warpish_precmd 2>/dev/null || true
-
-__warpish_hermes_should_force_cli() {
-  emulate -L zsh
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --cli|--tui|--dev|-z|--oneshot|-h|--help|--version|-V)
-        return 1
-        ;;
-    esac
-  done
-
-  # Hermes' modern TUI uses an alternate screen and can trap scrollback inside
-  # browser xterm. In Warpish, default interactive/resume Hermes sessions to the
-  # classic CLI unless the user explicitly asks for --tui.
-  [[ $# -eq 0 ]] && return 0
-  for arg in "$@"; do
-    case "$arg" in
-      --resume|--resume=*|-r|--continue|--continue=*|-c)
-        return 0
-        ;;
-    esac
-  done
-  return 1
-}
 
 typeset -gr __WARPISH_HERMES_CHOICE_PROMPT_MARKER='[warpish-terminal:clarify-choices:v2]'
 typeset -gr __WARPISH_HERMES_CHOICE_PROMPT='[warpish-terminal:clarify-choices:v2] Warpish Terminal interaction contract: whenever you call the clarify tool, always provide 2 to 4 short, mutually exclusive, context-aware choices. Never omit choices or pass an empty choices array. Hermes automatically adds the Other free-text row, so do not add an Other choice yourself.'
@@ -144,17 +123,9 @@ hermes() {
     choice_prompt="$(__warpish_hermes_ephemeral_prompt)"
   fi
 
-  if __warpish_hermes_should_force_cli "$@"; then
-    if [[ -n "$choice_prompt" ]]; then
-      HERMES_EPHEMERAL_SYSTEM_PROMPT="$choice_prompt" command hermes --cli "$@"
-    else
-      command hermes --cli "$@"
-    fi
+  if [[ -n "$choice_prompt" ]]; then
+    HERMES_EPHEMERAL_SYSTEM_PROMPT="$choice_prompt" command hermes "$@"
   else
-    if [[ -n "$choice_prompt" ]]; then
-      HERMES_EPHEMERAL_SYSTEM_PROMPT="$choice_prompt" command hermes "$@"
-    else
-      command hermes "$@"
-    fi
+    command hermes "$@"
   fi
 }

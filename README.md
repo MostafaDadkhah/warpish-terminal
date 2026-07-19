@@ -2,20 +2,19 @@
 
 Local-only Chrome web terminal for macOS, with Warp-like resumable terminal sessions.
 
-![Warpish Terminal screenshot](docs/screenshots/warpish-terminal.png)
-
 What it does:
 - Opens a modern Chrome UI with a left sidebar.
 - Sidebar shows terminal session history with live/stopped state and recent preview.
-- Click a live session to continue it, or open a stopped session as read-only history. `New terminal` starts immediately in Home with an automatic title, the `default` profile, and normal history; `Options…` exposes the optional title, starting directory, profile label, and private mode.
+- Click a live session to continue it, or open a stopped session as read-only history.
+- `New terminal` starts immediately in Home with an automatic title, the `default` profile, and normal history. There is no creation form or custom title/directory/profile/private option in the browser UI.
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
-- Adds Warp-style command blocks for new sessions; the block panel is hidden by default and opens only when you ask for it.
-- Includes find-in-terminal, text export, rename/copy, configurable theme/font/line-height/scrollback, terminal-bell notifications, mobile Esc/Tab/Ctrl/arrow keys, and tmux pane split/next controls.
+- Keeps the main workspace deliberately minimal: one raw xterm surface with no terminal action toolbar.
+- Includes mobile Esc/Tab/Ctrl/arrow keys.
 - Multiline paste is intercepted: choose a safe single-line draft, preserve line breaks explicitly, or cancel. A trailing newline never silently submits a command.
-- Private sessions keep their live PTY/tmux behavior but retain no command blocks, previews, terminal capture, or scrollback (every pane is created with an effective `tmux history-limit=0`). Missing SQLite metadata is recovered conservatively from the tmux environment without exposing a preview. A recovered legacy pane whose immutable history capacity is nonzero is visibly quarantined: Warpish clears existing history and refuses attach/input/capture instead of pretending it is private-safe.
-- Stores sessions, command blocks, previews, and the durable shell-event journal in the standalone `.warpish/warpish.sqlite3` database; runtime state is no longer persisted in JSON or per-session event files.
-- Uses a terminal-native layout: normal xterm input goes to the real shell, while input echo and output are shown through a default readable terminal mask. When an LTR shell prompt is followed by Persian/Arabic input, the prompt stays LTR and the typed suffix becomes a compact Word-style RTL segment; English commands, paths, flags, and code stay isolated LTR islands. The readable surface keeps typing focus across old-session reattaches, handles wheel scrolling through tmux-captured history, renders safe links and ANSI/truecolor styles, and throttles redraws. State-aware fallback keys cover application-cursor mode, modifiers, F-keys, Alt/Ctrl, and binary input. Generic full-screen TUI detection temporarily switches to native display/raw mouse; `TUI: manual`, `Readable`, and `Mouse` remain explicit overrides.
+- The browser no longer creates private sessions. Existing or recovered legacy private sessions remain fail-closed: Warpish suppresses retained content, clears recoverable history, and refuses attach/input/capture when a pane cannot satisfy the zero-history privacy boundary.
+- Stores sessions, previews, and backend-only command/event compatibility records in the standalone `.warpish/warpish.sqlite3` database; runtime state is no longer persisted in JSON or per-session event files.
+- Normal xterm input and output stay on the real PTY path. State-aware fallback keys cover application-cursor mode, modifiers, function keys, Alt/Ctrl, and binary input without introducing a separate composer or display layer.
 - WebSocket heartbeat, byte-bounded UTF-8/binary chunking and browser/Node/Python input queues, payload limits, tmux command timeouts, and idle attach-PTY teardown keep stalled clients from growing memory while the tmux shell remains resumable. The current CWD is updated live after each prompt.
 - Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
 
@@ -54,7 +53,7 @@ When the LaunchAgent is installed, `stop.sh` stops it for the current login sess
 npm run service:uninstall
 ```
 
-Note: stopping the web server does not necessarily kill live `tmux` sessions. Use the UI's `Kill session` button to stop a specific terminal session.
+Note: stopping the web server does not necessarily kill live `tmux` sessions. Manage those sessions directly with `tmux` when you intentionally want to stop them.
 
 On the first start after upgrading from the file-based storage version, Warpish imports `sessions.json` and legacy event files into SQLite, then moves the originals into a timestamped `.warpish/legacy-storage-*` recovery directory. All subsequent reads and writes use SQLite.
 
@@ -73,7 +72,7 @@ cd warpish-terminal
 npm test
 ```
 
-`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies private panes have zero history and no durable content even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home-directory creation, the separate Options flow, Hermes/RTL styling, controller transfer, runtime snapshots, 140KB ordered UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile layout, mouse/TUI modes, long scrollback, and typing flicker. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/preferences/paste tests. CI retains the complete test log for 14 days even on failure.
+`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies that legacy private panes remain fail-closed even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home/default/normal creation, raw xterm input, controller transfer, runtime snapshots, ordered large UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile keys/layout, and the absence of the removed toolbar and creation form. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/paste tests. CI retains the complete test log for 14 days even on failure.
 
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.

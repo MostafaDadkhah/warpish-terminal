@@ -48,12 +48,13 @@ function invokeHermes(args = [], existingPrompt) {
   const capturedArgs = rawArgs.length
     ? rawArgs.toString('utf8').split('\0').slice(0, -1)
     : [];
+  if (capturedArgs.length === 1 && capturedArgs[0] === '') capturedArgs.length = 0;
   return { prompt, args: capturedArgs };
 }
 
 try {
   const defaultLaunch = invokeHermes();
-  assert.deepEqual(defaultLaunch.args, ['--cli']);
+  assert.deepEqual(defaultLaunch.args, []);
   assert.match(defaultLaunch.prompt, /\[warpish-terminal:clarify-choices:v2\]/);
   assert.match(defaultLaunch.prompt, /Warpish Terminal interaction contract:/);
   assert.match(defaultLaunch.prompt, /clarify tool/);
@@ -67,7 +68,7 @@ try {
   assert.equal((explicitTui.prompt.match(/\[warpish-terminal:clarify-choices:v2\]/g) || []).length, 1);
 
   const resumedCli = invokeHermes(['--resume', 'session with spaces']);
-  assert.deepEqual(resumedCli.args, ['--cli', '--resume', 'session with spaces']);
+  assert.deepEqual(resumedCli.args, ['--resume', 'session with spaces']);
 
   const explicitCli = invokeHermes(['--cli', 'chat']);
   assert.deepEqual(explicitCli.args, ['--cli', 'chat']);

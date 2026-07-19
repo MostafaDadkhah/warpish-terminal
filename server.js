@@ -40,9 +40,8 @@ const MAX_CWD_MARKER_BYTES = 4096;
 const MAX_OSC_MARKER_CHARS = 64 * 1024;
 const MAX_BLOCK_COMMAND_BYTES = 32 * 1024;
 const MAX_BLOCK_ID_CHARS = 180;
+const MAX_INPUT_ID_CHARS = 160;
 const MAX_WORKER_STDIN_BUFFER_BYTES = 1024 * 1024;
-const MAX_SESSION_TITLE_CHARS = 80;
-const MAX_SESSION_PROFILE_CHARS = 40;
 const SESSION_PROFILE_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,39})$/;
 const WS_HEARTBEAT_INTERVAL_MS = clampNumber(process.env.WARPISH_WS_HEARTBEAT_MS, 30_000, 1000, 120_000);
 const PTY_RUNTIME_IDLE_GRACE_MS = clampNumber(process.env.WARPISH_PTY_IDLE_GRACE_MS, 30_000, 100, 600_000);
@@ -358,11 +357,6 @@ function tmuxPaneHistoryState(sessionId) {
   }
 }
 
-function privateSessionHistorySafe(sessionId) {
-  const state = tmuxPaneHistoryState(sessionId);
-  return state.ok && state.panes.every((pane) => pane.limit === 0);
-}
-
 function clearPrivateSessionHistory(sessionId) {
   const state = tmuxPaneHistoryState(sessionId);
   for (const pane of state.panes) {
@@ -403,7 +397,7 @@ function ensureShellIntegration() {
   fs.writeFileSync(path.join(ZDOTDIR, '.zshrc'), zshrc);
 }
 
-function warpishShellCommand(sessionId, { privateSession = false, profile = 'default' } = {}) {
+function warpishShellCommand(sessionId) {
   ensureShellIntegration();
   return [
     '/usr/bin/env',
@@ -415,23 +409,14 @@ function warpishShellCommand(sessionId, { privateSession = false, profile = 'def
     `WARPISH_DATABASE_FILE=${shellQuote(DATABASE_FILE)}`,
     `WARPISH_EVENT_RECORDER=${shellQuote(SHELL_EVENT_RECORDER)}`,
     `WARPISH_PYTHON=${shellQuote(PYTHON)}`,
-    'WARPISH_BLOCK_INTEGRATION=1',
-    `WARPISH_PRIVATE_SESSION=${privateSession ? '1' : '0'}`,
-    `WARPISH_SESSION_PROFILE=${shellQuote(profile)}`,
+    'WARPISH_BLOCK_INTEGRATION=0',
+    'WARPISH_PRIVATE_SESSION=0',
+    'WARPISH_SESSION_PROFILE=default',
     `ZDOTDIR=${shellQuote(ZDOTDIR)}`,
     shellQuote(SHELL),
     '-l',
     '-i',
   ].join(' ');
-}
-
-function stripAnsi(text) {
-  return String(text)
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-    .replace(/\x1b[()][A-Za-z0-9]/g, '')
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
-    .replace(/\r/g, '')
-    .replace(/[ \t]+\n/g, '\n');
 }
 
 function epochToIso(value) {
@@ -541,15 +526,6 @@ function normalizeBlock(block) {
     endedAt: block.endedAt || null,
     durationMs: block.durationMs ?? null,
   };
-}
-
-function getBlocks(sessionId) {
-  if (sessionIsPrivate(sessionId)) return [];
-  reconcileDatabaseEvents(sessionId);
-  if (!flushPendingBlockOutput(sessionId)) refreshActiveBlockOutput(sessionId);
-  const meta = readMetadata();
-  const record = meta.sessions?.[sessionId];
-  return Array.isArray(record?.blocks) ? record.blocks.map(normalizeBlock).slice().reverse() : [];
 }
 
 function upsertBlockStart(sessionId, marker) {
@@ -1041,89 +1017,6 @@ function paneCursorState(id) {
   }
 }
 
-function captureContentLines(text) {
-  return stripAnsi(text)
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
-
-function joinCaptureSections(first, second) {
-  if (!first) return second || '';
-  if (!second) return first;
-  return `${first.trimEnd()}\n${second.replace(/^\n+/, '')}`.trimEnd();
-}
-
-function capturePaneState(id, { lines = 600, escape = false, retryCount = 0 } = {}) {
-  const alternateActive = paneAlternateScreenActive(id);
-  if (!alternateActive) {
-    const normal = capturePaneText(id, { lines, escape });
-    if (paneAlternateScreenActive(id) !== alternateActive && retryCount < 2) {
-      return capturePaneState(id, { lines, escape, retryCount: retryCount + 1 });
-    }
-    return {
-      alternateActive,
-      normal,
-      alternate: '',
-      active: normal,
-      history: normal,
-    };
-  }
-
-  const prefix = capturePaneText(id, { lines, escape, historyOnly: true });
-  const active = capturePaneText(id, { escape, history: false });
-  const alternate = capturePaneText(id, { alternate: true, escape });
-  if (paneAlternateScreenActive(id) !== alternateActive && retryCount < 2) {
-    return capturePaneState(id, { lines, escape, retryCount: retryCount + 1 });
-  }
-  const normal = joinCaptureSections(prefix, active);
-  const history = joinCaptureSections(prefix, alternate);
-  return { alternateActive, normal, alternate, active, history };
-}
-
-function captureLooksStandaloneTui(capture) {
-  const lines = captureContentLines(capture);
-  const joined = lines.join('\n');
-  const vimTildeLines = lines.filter((line) => /^~\s*$/u.test(line)).length;
-  return vimTildeLines >= 3
-    || /--\s*(?:INSERT|NORMAL|VISUAL|REPLACE)\s*--/u.test(joined)
-    || /\b(?:VIM - Vi IMproved|GNU nano|less\s+\d|htop|top -)\b/iu.test(joined)
-    || /\(END\)(?:\s|$)/mu.test(joined);
-}
-
-function choosePaneCapture({ normal = '', active = '', history = '', alternateActive = false } = {}) {
-  // tmux capture-pane without -a always captures the buffer that is currently
-  // visible. When alternate_on=1, `capture-pane -a` is the displaced/saved
-  // primary screen, not the live alternate-screen viewport. Keep the legacy
-  // normal/alternate argument names for the API, but never select `alternate`
-  // as the live screen while an alternate buffer is active.
-  if (!alternateActive && normal.trim()) {
-    return { text: normal, usingAlternate: false, reason: 'normal-active' };
-  }
-  if (!alternateActive) return { text: normal, usingAlternate: false, reason: 'normal-empty' };
-
-  const historyLines = captureContentLines(history).length;
-  const activeLines = captureContentLines(active).length;
-  const historyIsMuchRicher = historyLines >= Math.max(activeLines + 20, activeLines * 2);
-  const activeLooksTui = captureLooksStandaloneTui(active);
-
-  if (!active.trim()) {
-    return historyIsMuchRicher
-      ? { text: history, usingAlternate: false, reason: 'normal-rich-history' }
-      : { text: '', usingAlternate: true, reason: 'alternate-empty' };
-  }
-
-  // tmux may prepend scrollback to the active alternate viewport. Classify that
-  // combined capture as history for Hermes/prompt-toolkit-like panes so the
-  // readable surface can retain its canonical scrollback and merge live redraws.
-  // A recognizable standalone editor/TUI remains screen content.
-  if (historyIsMuchRicher && !activeLooksTui) {
-    return { text: history, usingAlternate: false, reason: 'normal-rich-history' };
-  }
-
-  return { text: active, usingAlternate: true, reason: 'alternate-active' };
-}
-
 function summarizeSessions() {
   const meta = readMetadata();
   const activeResult = listActiveTmuxSessions();
@@ -1221,73 +1114,15 @@ function requestError(message, statusCode = 400) {
   return error;
 }
 
-function validateSessionTitle(value, { allowEmpty = true } = {}) {
-  if (value !== undefined && value !== null && typeof value !== 'string') {
-    throw requestError('title must be a string');
-  }
-  const title = String(value || '').trim();
-  if (!allowEmpty && !title) throw requestError('title must not be empty');
-  if (title.length > MAX_SESSION_TITLE_CHARS) {
-    throw requestError(`title must be ${MAX_SESSION_TITLE_CHARS} characters or fewer`);
-  }
-  if (/[\u0000-\u001f\u007f]/u.test(title)) {
-    throw requestError('title must not contain control characters');
-  }
-  return title;
-}
-
-function validateNewSessionInput(input = {}) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) {
-    throw requestError('request body must be a JSON object');
-  }
-
-  const title = validateSessionTitle(input.title);
-
-  let requestedCwd = input.cwd;
-  if (requestedCwd !== undefined && requestedCwd !== null && typeof requestedCwd !== 'string') {
-    throw requestError('cwd must be a string');
-  }
-  requestedCwd = String(requestedCwd || '').trim();
-  if (requestedCwd.includes('\u0000')) throw requestError('cwd must not contain NUL bytes');
-  if (!requestedCwd) requestedCwd = os.homedir();
-  if (requestedCwd === '~') requestedCwd = os.homedir();
-  else if (requestedCwd.startsWith('~/')) requestedCwd = path.join(os.homedir(), requestedCwd.slice(2));
-  if (!path.isAbsolute(requestedCwd)) {
-    throw requestError('cwd must be an absolute directory path or start with ~/');
-  }
-  const cwd = path.resolve(requestedCwd);
-  try {
-    if (!fs.statSync(cwd).isDirectory()) throw requestError('cwd must reference an existing directory');
-    fs.accessSync(cwd, fs.constants.X_OK);
-  } catch (error) {
-    if (error?.statusCode) throw error;
-    throw requestError('cwd must reference an existing accessible directory');
-  }
-
-  let profile = input.profile;
-  if (profile !== undefined && profile !== null && typeof profile !== 'string') {
-    throw requestError('profile must be a string');
-  }
-  profile = String(profile || 'default').trim();
-  if (profile.length > MAX_SESSION_PROFILE_CHARS || !SESSION_PROFILE_PATTERN.test(profile)) {
-    throw requestError(`profile must be a lowercase identifier of ${MAX_SESSION_PROFILE_CHARS} characters or fewer using letters, numbers, dot, underscore, or dash`);
-  }
-
-  if (input.private !== undefined && typeof input.private !== 'boolean') {
-    throw requestError('private must be a boolean');
-  }
-
-  return { title, cwd, profile, privateSession: Boolean(input.private) };
-}
-
-function createSession(input = {}) {
-  const { title, cwd, profile, privateSession } = validateNewSessionInput(input);
+function createSession() {
   const meta = readMetadata();
   const now = new Date();
   const index = meta.nextIndex || Object.keys(meta.sessions).length + 1;
   const id = `${PREFIX}${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
-  const safeCwd = cwd;
-  const sessionTitle = title || `Terminal ${index}`;
+  const safeCwd = os.homedir();
+  const sessionTitle = `Terminal ${index}`;
+  const profile = 'default';
+  const privateSession = false;
   let tmuxCreated = false;
   let metadataWritten = false;
 
@@ -1295,11 +1130,11 @@ function createSession(input = {}) {
     const bootstrapWindow = 'warpish-bootstrap';
     // tmux copies history-limit into each pane only when that pane is created.
     // Create a content-free bootstrap first, configure the session, then launch
-    // the real shell in a new pane so 0/50000 is effective rather than cosmetic.
+    // the real shell in a new pane so the normal 50000-line limit is effective.
     runTmux(['new-session', '-d', '-s', id, '-n', bootstrapWindow, '-c', safeCwd, '/bin/sleep 60']);
     tmuxCreated = true;
     runTmux(['set-option', '-t', id, 'status', 'off']);
-    runTmux(['set-option', '-t', id, 'history-limit', privateSession ? '0' : '50000']);
+    runTmux(['set-option', '-t', id, 'history-limit', '50000']);
     runTmux(['set-option', '-t', id, 'allow-rename', 'off']);
     runTmux(['set-option', '-t', id, 'allow-passthrough', 'on']);
     runTmux(['set-option', '-t', id, 'focus-events', 'on']);
@@ -1310,8 +1145,8 @@ function createSession(input = {}) {
     runTmux(['set-environment', '-t', id, 'WARPISH_DATABASE_FILE', DATABASE_FILE]);
     runTmux(['set-environment', '-t', id, 'WARPISH_EVENT_RECORDER', SHELL_EVENT_RECORDER]);
     runTmux(['set-environment', '-t', id, 'WARPISH_PYTHON', PYTHON]);
-    runTmux(['set-environment', '-t', id, 'WARPISH_BLOCK_INTEGRATION', '1']);
-    runTmux(['set-environment', '-t', id, 'WARPISH_PRIVATE_SESSION', privateSession ? '1' : '0']);
+    runTmux(['set-environment', '-t', id, 'WARPISH_BLOCK_INTEGRATION', '0']);
+    runTmux(['set-environment', '-t', id, 'WARPISH_PRIVATE_SESSION', '0']);
     runTmux(['set-environment', '-t', id, 'WARPISH_SESSION_PROFILE', profile]);
     runTmux(['set-environment', '-t', id, 'ZDOTDIR', ZDOTDIR]);
     runTmux([
@@ -1320,12 +1155,9 @@ function createSession(input = {}) {
       '-t', `${id}:`,
       '-n', 'terminal',
       '-c', safeCwd,
-      warpishShellCommand(id, { privateSession, profile }),
+      warpishShellCommand(id),
     ]);
     runTmux(['kill-window', '-t', `${id}:${bootstrapWindow}`]);
-    if (privateSession && !clearPrivateSessionHistory(id).safe) {
-      throw new Error('private tmux pane was not created with an effective zero history limit');
-    }
 
     meta.nextIndex = index + 1;
     meta.sessions[id] = {
@@ -1365,14 +1197,6 @@ function touchSession(id) {
     meta.sessions[id].lastOpenedAt = new Date().toISOString();
     writeMetadata(meta);
   }
-}
-
-function renameSession(id, title) {
-  const meta = readMetadata();
-  if (!meta.sessions[id]) return null;
-  meta.sessions[id].title = validateSessionTitle(title, { allowEmpty: false });
-  writeMetadata(meta);
-  return summarizeSessions().find((session) => session.id === id) || null;
 }
 
 function clearSessionTransientState(id) {
@@ -1448,146 +1272,6 @@ function purgeStoppedSessions() {
 
   if (purged.length) writeMetadata(meta);
   return purged;
-}
-
-function requireSessionRecord(id) {
-  const record = readMetadata().sessions?.[id];
-  if (!record) throw requestError('session not found', 404);
-  return record;
-}
-
-function requireLiveSession(id) {
-  const record = requireSessionRecord(id);
-  const activeResult = listActiveTmuxSessions();
-  if (!activeResult.ok) {
-    throw requestError('tmux session state is temporarily unavailable', 503);
-  }
-  if (!activeResult.sessions.has(id)) {
-    throw requestError('session is stopped; pane operations require a live session', 409);
-  }
-  return record;
-}
-
-function paneCount(id) {
-  const value = Number.parseInt(runTmux(['display-message', '-p', '-t', id, '#{window_panes}']).trim(), 10);
-  return Number.isFinite(value) ? value : null;
-}
-
-function splitSessionPane(id, direction) {
-  const record = requireLiveSession(id);
-  if (record.private && !privateSessionHistorySafe(id)) {
-    throw requestError('private session is quarantined because an existing pane has nonzero tmux history capacity', 409);
-  }
-  if (direction !== 'vertical' && direction !== 'horizontal') {
-    throw requestError('direction must be either vertical or horizontal');
-  }
-  try {
-    const splitFlag = direction === 'vertical' ? '-h' : '-v';
-    const paneId = runTmux([
-      'split-window',
-      splitFlag,
-      '-P',
-      '-F',
-      '#{pane_id}',
-      '-t',
-      id,
-      '-c',
-      '#{pane_current_path}',
-      warpishShellCommand(id, {
-        privateSession: Boolean(record.private),
-        profile: record.profile || 'default',
-      }),
-    ]).trim();
-    if (record.private) clearPrivateSessionHistory(id);
-    return { paneId, panes: paneCount(id), direction };
-  } catch (error) {
-    error.statusCode = error.statusCode || 503;
-    throw error;
-  }
-}
-
-function selectNextSessionPane(id) {
-  const record = requireLiveSession(id);
-  if (record.private && !privateSessionHistorySafe(id)) {
-    throw requestError('private session is quarantined because an existing pane has nonzero tmux history capacity', 409);
-  }
-  try {
-    runTmux(['select-pane', '-t', `${id}:.+`]);
-    const paneId = runTmux(['display-message', '-p', '-t', id, '#{pane_id}']).trim();
-    return { paneId, panes: paneCount(id) };
-  } catch (error) {
-    error.statusCode = error.statusCode || 503;
-    throw error;
-  }
-}
-
-function exportFilename(record) {
-  const stem = String(record.title || record.id || 'terminal')
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60) || 'terminal';
-  const date = new Date().toISOString().slice(0, 10);
-  return `${stem}-${date}.txt`;
-}
-
-function sessionExport(id) {
-  const record = requireSessionRecord(id);
-  const privateSession = Boolean(record.private);
-  const activeResult = listActiveTmuxSessions();
-  const alive = activeResult.ok && activeResult.sessions.has(id);
-  const blocks = privateSession ? [] : getBlocks(id).slice().reverse();
-  let capture = '';
-
-  if (alive) {
-    if (!privateSession) {
-      const selected = choosePaneCapture(capturePaneState(id, { lines: 5000 }));
-      capture = selected.text;
-    }
-  } else if (!privateSession) {
-    capture = record.lastPreview || '';
-  }
-
-  const lines = [
-    `Warpish Terminal export`,
-    `Title: ${record.title || record.id}`,
-    `Session: ${record.id}`,
-    `Created: ${record.createdAt || 'unknown'}`,
-    `State: ${alive ? 'live' : 'stopped'}`,
-    `Working directory: ${record.cwd || os.homedir()}`,
-    `Shell: ${record.shell || SHELL}`,
-    `Profile: ${record.profile || 'default'}`,
-    `Private: ${privateSession ? 'yes' : 'no'}`,
-    `Exported: ${new Date().toISOString()}`,
-    '',
-  ];
-
-  if (privateSession) {
-    lines.push('Private session: command blocks, previews, scrollback, and terminal capture were not retained or exported.');
-    lines.push('');
-  }
-
-  if (blocks.length) {
-    lines.push('Command blocks', '==============', '');
-    blocks.forEach((block, index) => {
-      lines.push(
-        `[${index + 1}] ${block.command || '(empty command)'}`,
-        `Status: ${block.status || 'unknown'}${block.exitCode === null ? '' : ` (exit ${block.exitCode})`}`,
-        `Started: ${block.startedAt || 'unknown'}`,
-        `Ended: ${block.endedAt || 'unknown'}`,
-      );
-      if (block.output) lines.push('', stripAnsi(block.output));
-      lines.push('', '---', '');
-    });
-  }
-
-  if (capture) {
-    lines.push(privateSession ? 'Current pane' : 'Terminal capture', '================', '', stripAnsi(limitText(capture)), '');
-  } else {
-    lines.push(privateSession ? 'No private terminal content is available.' : 'No terminal capture is available.', '');
-  }
-
-  return { filename: exportFilename(record), text: lines.join('\n').trimEnd() + '\n' };
 }
 
 function workerWriteState(worker) {
@@ -1882,103 +1566,10 @@ app.delete('/api/sessions', (req, res) => {
   }
 });
 
-app.post('/api/sessions', (req, res) => {
+app.post('/api/sessions', (_req, res) => {
   try {
-    const session = createSession(req.body || {});
+    const session = createSession();
     res.status(201).json({ session, sessions: summarizeSessions() });
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
-  }
-});
-
-app.get('/api/sessions/:id/blocks', (req, res) => {
-  const { id } = req.params;
-  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  if (!readMetadata().sessions?.[id]) return res.status(404).json({ error: 'session not found' });
-  res.json({ blocks: getBlocks(id) });
-});
-
-app.get('/api/sessions/:id/export', (req, res) => {
-  const { id } = req.params;
-  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  try {
-    res.json(sessionExport(id));
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
-  }
-});
-
-app.post('/api/sessions/:id/panes', (req, res) => {
-  const { id } = req.params;
-  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  try {
-    const pane = splitSessionPane(id, req.body?.direction);
-    res.status(201).json({ ok: true, pane, sessions: summarizeSessions() });
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
-  }
-});
-
-app.post('/api/sessions/:id/panes/next', (req, res) => {
-  const { id } = req.params;
-  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  try {
-    const pane = selectNextSessionPane(id);
-    res.json({ ok: true, pane, sessions: summarizeSessions() });
-  } catch (error) {
-    res.status(error.statusCode || 500).json({ error: error.message || String(error) });
-  }
-});
-
-app.get('/api/sessions/:id/capture', (req, res) => {
-  const { id } = req.params;
-  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  const record = readMetadata().sessions?.[id];
-  if (!record) return res.status(404).json({ error: 'session not found' });
-  if (record.private) {
-    const alternateActive = paneAlternateScreenActive(id);
-    return res.json({
-      text: '',
-      normal: '',
-      alternate: '',
-      active: '',
-      savedPrimary: '',
-      history: '',
-      usingAlternate: alternateActive,
-      alternateActive,
-      captureReason: alternateActive ? 'alternate-active' : 'private-session',
-      ansi: req.query.ansi === '1' || req.query.escape === '1',
-      private: true,
-      warning: 'Private sessions do not expose terminal capture or scrollback.',
-    });
-  }
-  const lines = clampNumber(req.query.lines, 600, 20, 5000);
-  const escape = req.query.ansi === '1' || req.query.escape === '1';
-  const capture = capturePaneState(id, { lines, escape });
-  const selected = choosePaneCapture(capture);
-  res.json({
-    text: limitText(selected.text),
-    // Backward-compatible names: `normal` is tmux's current/active capture;
-    // while alternate_on=1, `alternate` is the saved primary buffer from -a.
-    normal: limitText(capture.normal),
-    alternate: limitText(capture.alternate),
-    active: limitText(capture.active),
-    savedPrimary: limitText(capture.alternate),
-    history: limitText(capture.history),
-    usingAlternate: selected.usingAlternate,
-    alternateActive: capture.alternateActive,
-    captureReason: selected.reason,
-    ansi: escape,
-  });
-});
-
-app.patch('/api/sessions/:id', (req, res) => {
-  const { id } = req.params;
-  if (!isValidSessionId(id)) return res.status(400).json({ error: 'invalid session id' });
-  try {
-    const session = renameSession(id, req.body?.title);
-    if (!session) return res.status(404).json({ error: 'session not found' });
-    res.json({ session, sessions: summarizeSessions() });
   } catch (error) {
     res.status(error.statusCode || 500).json({ error: error.message || String(error) });
   }
@@ -2001,7 +1592,6 @@ const vendor = {
   '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js',
   '/vendor/fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js',
   '/vendor/web-links.js': 'node_modules/@xterm/addon-web-links/lib/addon-web-links.js',
-  '/vendor/search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js',
 };
 
 for (const [route, relPath] of Object.entries(vendor)) {
@@ -2034,6 +1624,42 @@ function writeRuntimeInput(runtime, ws, bytes) {
   });
   if (!result.ok) sendWsInputError(ws, result.code, result.message);
   return result.ok;
+}
+
+function parseInputId(value) {
+  if (typeof value !== 'string' || value.length > MAX_INPUT_ID_CHARS) return null;
+  const match = /^([a-z0-9._-]{1,128}):([1-9][0-9]{0,15})$/iu.exec(value);
+  if (!match) return null;
+  const sequence = Number(match[2]);
+  if (!Number.isSafeInteger(sequence) || sequence < 1) return null;
+  return { clientId: match[1], sequence };
+}
+
+function validInputId(value) {
+  return Boolean(parseInputId(value));
+}
+
+function acknowledgeRuntimeInput(runtime, ws, inputId) {
+  if (!inputId) return;
+  runtime.acceptedInputIds.set(inputId, Date.now());
+  while (runtime.acceptedInputIds.size > 65_536) {
+    runtime.acceptedInputIds.delete(runtime.acceptedInputIds.keys().next().value);
+  }
+  sendWsControl(ws, {
+    type: 'input-ack',
+    sessionId: runtime.sessionId,
+    inputId,
+  });
+}
+
+function inputWasAccepted(runtime, ws, inputId) {
+  if (!inputId || !runtime.acceptedInputIds.has(inputId)) return false;
+  sendWsControl(ws, {
+    type: 'input-ack',
+    sessionId: runtime.sessionId,
+    inputId,
+  });
+  return true;
 }
 
 function broadcastRuntimeControl(runtime, message) {
@@ -2203,6 +1829,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     runTmux(['set-environment', '-u', '-t', session.id, 'NO_COLOR']);
     runTmux(['set-environment', '-t', session.id, 'COLORTERM', 'truecolor']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_TERMINAL', '1']);
+    runTmux(['set-environment', '-t', session.id, 'WARPISH_BLOCK_INTEGRATION', '0']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_PRIVATE_SESSION', privateSession ? '1' : '0']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_SESSION_PROFILE', profile]);
     if (privateSession) privateHistoryState = clearPrivateSessionHistory(session.id);
@@ -2225,6 +1852,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   });
   const runtime = {
     sessionId: session.id,
+    epoch: crypto.randomUUID(),
     cwd: persistedCwd,
     private: privateSession,
     profile,
@@ -2232,6 +1860,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     workerPid: null,
     subscribers: new Set(),
     clientDimensions: new Map(),
+    acceptedInputIds: new Map(),
     controller: null,
     stdoutBuffer: '',
     stderrBuffer: '',
@@ -2288,6 +1917,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
           type: 'hello',
           pid: runtime.workerPid,
           sessionId: runtime.sessionId,
+          runtimeEpoch: runtime.epoch,
           cwd: runtime.cwd,
           shell: SHELL,
         });
@@ -2438,6 +2068,7 @@ wss.on('connection', (ws, req) => {
       type: 'hello',
       pid: runtime.workerPid,
       sessionId,
+      runtimeEpoch: runtime.epoch,
       cwd: runtime.cwd,
       shell: SHELL,
     });
@@ -2480,17 +2111,28 @@ wss.on('connection', (ws, req) => {
         sendWsInputError(ws, 'input-too-large', `Terminal input exceeds the ${MAX_TERMINAL_INPUT_BYTES}-byte limit.`);
         return;
       }
+      if (msg.inputId !== undefined && !validInputId(msg.inputId)) {
+        sendWsInputError(ws, 'invalid-input-id', 'Terminal input id is invalid.');
+        return;
+      }
+      if (inputWasAccepted(runtime, ws, msg.inputId)) return;
       const inputData = msg.allowFocusReports ? msg.data : stripTerminalFocusReports(msg.data);
-      if (!inputData) return;
+      if (!inputData) {
+        acknowledgeRuntimeInput(runtime, ws, msg.inputId);
+        return;
+      }
+      let accepted = false;
       if (msg.directTmux) {
         try {
           writeTmuxInput(sessionId, inputData);
+          accepted = true;
         } catch (error) {
           sendWsControl(ws, { type: 'server-error', message: `tmux input failed: ${error.message || error}` });
         }
       } else {
-        writeRuntimeInput(runtime, ws, Buffer.from(inputData, 'utf8'));
+        accepted = writeRuntimeInput(runtime, ws, Buffer.from(inputData, 'utf8'));
       }
+      if (accepted) acknowledgeRuntimeInput(runtime, ws, msg.inputId);
     } else if (msg?.type === 'input-binary') {
       if (runtime.controller !== ws) {
         sendRuntimeRole(runtime, ws);
@@ -2504,7 +2146,14 @@ wss.on('connection', (ws, req) => {
         sendWsInputError(ws, decoded.code, message);
         return;
       }
-      writeRuntimeInput(runtime, ws, decoded.bytes);
+      if (msg.inputId !== undefined && !validInputId(msg.inputId)) {
+        sendWsInputError(ws, 'invalid-input-id', 'Binary terminal input id is invalid.');
+        return;
+      }
+      if (inputWasAccepted(runtime, ws, msg.inputId)) return;
+      if (writeRuntimeInput(runtime, ws, decoded.bytes)) {
+        acknowledgeRuntimeInput(runtime, ws, msg.inputId);
+      }
     } else if (msg?.type === 'resize') {
       const dimensions = {
         cols: clampNumber(msg.cols, 120, 20, 300),

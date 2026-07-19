@@ -17,10 +17,9 @@ const appJs = read('public/app.js');
 const indexHtml = read('public/index.html');
 const pasteSafetyJs = read('public/paste-safety.js');
 const terminalKeyDataJs = read('public/terminal-key-data.js');
-const terminalPreferencesJs = read('public/terminal-preferences.js');
+const terminalInputJs = read('public/terminal-input.js');
 const serverJs = read('server.js');
 const storageJs = read('storage.js');
-const shellIntegration = read('scripts/warpish-shell-integration.zsh');
 const stylesCss = read('public/styles.css');
 const smokeJs = read('scripts/smoke.js');
 const browserRegressionJs = read('scripts/browser-regressions.js');
@@ -46,19 +45,45 @@ if (!serverJs.includes('WARPISH_ALLOW_REMOTE') || !serverJs.includes('isAllowedO
 if (!packageJson.dependencies?.['better-sqlite3']
   || !serverJs.includes('openStorage(DATABASE_FILE)')
   || !storageJs.includes('CREATE TABLE IF NOT EXISTS sessions')
-  || !storageJs.includes('CREATE TABLE IF NOT EXISTS blocks')
-  || !storageJs.includes('CREATE TABLE IF NOT EXISTS shell_events')
-  || shellIntegration.includes('WARPISH_EVENT_FILE')
-  || !shellIntegration.includes('__warpish_database_event')) {
-  fail('Runtime session, block, and shell-event persistence must use the standalone SQLite database without JSON/event sidecar files.');
+  || !serverJs.includes('migrateLegacyStorage')) {
+  fail('Runtime session persistence must use the standalone SQLite database without a JSON source of truth.');
 }
 
-if (/\.toolbar-actions\s*\{[^}]*display:\s*none/s.test(stylesCss)) {
-  fail('styles.css must not hide critical toolbar actions on narrow/mobile layouts. Use an overflow/compact layout.');
+const removedUiIdentifiers = [
+  'terminal-toolbar',
+  'toolbar-actions',
+  'newSessionOptions',
+  'newSessionDialog',
+  'settingsDialog',
+  'settingsToggle',
+  'terminalSearchToggle',
+  'terminalSearchPanel',
+  'blocksToggle',
+  'blocksPanel',
+  'renameSession',
+  'exportSession',
+  'splitVertical',
+  'splitHorizontal',
+  'nextPane',
+];
+const removedUiSources = `${indexHtml}\n${appJs}\n${stylesCss}`;
+const survivingUiIdentifiers = removedUiIdentifiers.filter((identifier) => removedUiSources.includes(identifier));
+if (survivingUiIdentifiers.length) {
+  fail(`Removed toolbar, Options, settings, search, blocks, rename, export, or pane UI identifiers remain: ${survivingUiIdentifiers.join(', ')}`);
 }
 
-if (!stylesCss.includes('body.reader-mouse-raw .bidi-reader')) {
-  fail('styles.css must preserve raw mouse passthrough mode for readable overlay/TUI interaction.');
+if (!indexHtml.includes('id="newSession"')
+  || !indexHtml.includes('id="terminal"')
+  || !indexHtml.includes('data-terminal-key="Escape"')
+  || !indexHtml.includes('data-terminal-key="Tab"')
+  || !appJs.includes('new TerminalCtor(')
+  || !appJs.includes('new FitAddonCtor(')
+  || !/function\s+handleTerminalInput\s*\(/.test(appJs)
+  || !/function\s+sendRaw\s*\(\s*data\b/.test(appJs)
+  || !appJs.includes("socket.binaryType = 'arraybuffer'")
+  || !appJs.includes('writeTerminalOutput(new Uint8Array(event.data))')
+  || !appJs.includes('writeTerminalOutput(event.data)')) {
+  fail('The minimal one-click xterm UI and its core terminal input path must remain present.');
 }
 
 if (!smokeJs.includes('freePort()')) {
@@ -90,7 +115,7 @@ if (packageJson.scripts?.regression !== 'node scripts/ui-stability-agent.js') {
 }
 
 const appScriptIndex = indexHtml.indexOf('<script src="/app.js"></script>');
-for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-preferences.js']) {
+for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js']) {
   const scriptIndex = indexHtml.indexOf(`<script src="${clientScript}"></script>`);
   if (scriptIndex < 0 || appScriptIndex < 0 || scriptIndex > appScriptIndex) {
     fail(`${clientScript} must be loaded before /app.js.`);
@@ -99,16 +124,18 @@ for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/termi
 
 if (!terminalKeyDataJs.includes('WarpishTerminalKeys')
   || !terminalKeyDataJs.includes('terminalKeyData')
-  || !terminalPreferencesJs.includes('WarpishTerminalPreferences')
-  || !terminalPreferencesJs.includes('normalize')) {
-  fail('Terminal key mapping and preferences modules must expose their stable browser APIs.');
+  || !terminalInputJs.includes('WarpishTerminalInput')
+  || !terminalInputJs.includes('MAX_MESSAGE_BYTES')) {
+  fail('Terminal key mapping and byte-bounded input modules must expose their stable browser APIs.');
 }
 
-if (!packageJson.dependencies?.['@xterm/addon-search']
-  || !indexHtml.includes('<script src="/vendor/search.js"></script>')
-  || !serverJs.includes('/vendor/search.js')
-  || !serverJs.includes('@xterm/addon-search/lib/addon-search.js')) {
-  fail('The xterm search addon must be installed, served locally, and loaded by the terminal UI.');
+if (packageJson.dependencies?.['@xterm/addon-search']
+  || indexHtml.includes('/vendor/search.js')
+  || serverJs.includes('/vendor/search.js')
+  || serverJs.includes('@xterm/addon-search')
+  || indexHtml.includes('/terminal-preferences.js')
+  || packageJson.scripts?.check?.includes('terminal-preferences')) {
+  fail('Removed search and terminal-preferences code must not remain installed, served, loaded, or tested.');
 }
 
 if (!/function\s+prepareTerminalPasteText\s*\(/.test(appJs)
@@ -121,11 +148,59 @@ if (!/function\s+prepareTerminalPasteText\s*\(/.test(appJs)
   fail('public/app.js must keep safe multiline paste interception and explicit-submit protection.');
 }
 
-if (/pending\.text\s*=/.test(serverJs)
-  || !/function\s+replaceBlockOutputFromPane\s*\(/.test(serverJs)
-  || !/block\.output\s*=\s*snapshot\.output/.test(serverJs)
-  || serverJs.includes('enrichFinishedBlockOutput')) {
-  fail('server.js must persist canonical tmux snapshots instead of appending raw PTY redraw chunks.');
+const removedRoutePatterns = [
+  /app\.get\(\s*['"]\/api\/sessions\/:id\/blocks['"]/,
+  /app\.get\(\s*['"]\/api\/sessions\/:id\/export['"]/,
+  /app\.get\(\s*['"]\/api\/sessions\/:id\/capture['"]/,
+  /app\.post\(\s*['"]\/api\/sessions\/:id\/panes['"]/,
+  /app\.post\(\s*['"]\/api\/sessions\/:id\/panes\/next['"]/,
+  /app\.patch\(\s*['"]\/api\/sessions\/:id['"]/,
+];
+if (removedRoutePatterns.some((pattern) => pattern.test(serverJs))) {
+  fail('Removed blocks, export, capture, pane, or rename API routes must stay absent.');
+}
+
+if (!/app\.get\(\s*['"]\/api\/sessions['"]/.test(serverJs)
+  || !/app\.post\(\s*['"]\/api\/sessions['"]/.test(serverJs)
+  || !/app\.delete\(\s*['"]\/api\/sessions['"]/.test(serverJs)
+  || !/app\.delete\(\s*['"]\/api\/sessions\/:id['"]/.test(serverJs)) {
+  fail('Core list, one-click create, stop, and stopped-session cleanup routes must remain present.');
+}
+
+if (!/const\s+MAX_TERMINAL_INPUT_BYTES\s*=\s*64\s*\*\s*1024/.test(serverJs)
+  || !serverJs.includes('maxPayload: MAX_WS_PAYLOAD_BYTES')
+  || !serverJs.includes("decodeBase64Strict(msg.data, MAX_TERMINAL_INPUT_BYTES)")
+  || !serverJs.includes("ws.on('pong'")
+  || !serverJs.includes('ws.ping()')
+  || !serverJs.includes('MAX_WORKER_STDIN_BUFFER_BYTES')) {
+  fail('WebSocket payload, heartbeat, strict binary decoding, and bounded terminal input safeguards must remain present.');
+}
+
+if (!appJs.includes("msg.type === 'input-ack'")
+  || !appJs.includes('releaseUnacknowledgedInputs')
+  || !appJs.includes('inputId: item.inputId')
+  || !appJs.includes('allowFocusReports: true')
+  || !appJs.includes('terminalSurfaceGeneration')
+  || !appJs.includes('terminalSurfaceTransitioning')
+  || !appJs.includes('reconcilePendingInputsForRuntime')
+  || !appJs.includes('resyncControllerFocus')
+  || !appJs.includes('&& !last.sentRuntimeEpoch')
+  || !serverJs.includes("type: 'input-ack'")
+  || !serverJs.includes('acceptedInputIds: new Map()')
+  || !serverJs.includes('runtimeEpoch: runtime.epoch')
+  || !serverJs.includes('inputWasAccepted(runtime, ws, msg.inputId)')) {
+  fail('Controller-safe acknowledged input, native focus reports, and generation-safe terminal writes must remain enabled.');
+}
+
+if (!indexHtml.includes('interactive-widget=resizes-content')
+  || !appJs.includes("setProperty('--app-viewport-height'")
+  || !appJs.includes("setProperty('--app-viewport-top'")
+  || !appJs.includes("setProperty('--app-viewport-left'")
+  || !stylesCss.includes('height: var(--app-viewport-height)')
+  || !stylesCss.includes('width: var(--app-viewport-width)')
+  || !stylesCss.includes('top: var(--app-viewport-top)')
+  || !stylesCss.includes('left: var(--app-viewport-left)')) {
+  fail('Mobile terminal layout must follow the visual viewport when the software keyboard opens.');
 }
 
 if (failures.length) {
@@ -133,4 +208,4 @@ if (failures.length) {
   process.exit(1);
 }
 
-console.log('lint: security/UX guardrails passed');
+console.log('lint: minimal terminal/security guardrails passed');

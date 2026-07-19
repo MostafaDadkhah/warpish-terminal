@@ -2,7 +2,7 @@
 
 ## Mission
 
-Maintain a local-only, Warp-inspired Chrome terminal that talks to the real host shell safely. Prioritize working behavior over visual polish: resumable sessions, reliable terminal I/O, block history, and explicit security boundaries matter most.
+Maintain a local-only Chrome terminal that talks to the real host shell safely. Prioritize resumable sessions, reliable raw terminal I/O, safe paste handling, mobile terminal keys, and explicit security boundaries.
 
 ## First steps for any agent
 
@@ -112,10 +112,10 @@ bash -n start.sh stop.sh
 - `public/app.js`
   - Browser app state.
   - WebSocket connection management.
-  - xterm.js rendering.
+  - Raw xterm.js rendering and input.
   - Sidebar/session UI.
-  - Default readable terminal input/output.
-  - Command-block search/copy/rerun UI.
+  - One-click default session creation.
+  - Multiline-paste safety and mobile terminal keys.
 
 - `public/terminal-key-data.js`
   - Pure state-aware terminal key mapping for application cursor mode, modifiers, function/navigation keys, Alt, Ctrl, and IME/Meta guards.
@@ -123,52 +123,40 @@ bash -n start.sh stop.sh
 - `public/terminal-input.js`
   - Pure 64 KiB byte-aware UTF-8/binary chunking used by the ordered, bounded browser reconnect/backpressure queue.
 
-- `public/terminal-preferences.js`
-  - Browser-local normalized theme/font/scrollback/accessibility/default-session preferences.
-
 - `public/index.html` and `public/styles.css`
-  - Layout and visual design.
+  - Minimal terminal/sidebar layout, dialogs, and mobile-key presentation.
 
 - `scripts/smoke.js`
   - End-to-end backend/tmux regression test.
   - Runs against a temporary `WARPISH_DATA_DIR`, token file, and session prefix so smoke sessions do not pollute the real sidebar.
-  - Must keep proving reconnect and real Node-server restart resume, command-block byte-for-byte persistence, bidi output, sidebar preview evidence, and stopped-history cleanup.
+  - Must keep proving reconnect and real Node-server restart resume, SQLite shell-event/block persistence, runtime snapshots, stopped-history cleanup, and legacy-private fail-closed behavior.
 
 - `scripts/browser-regressions.js`
   - Headless Chrome/CDP regression test.
   - Runs against a temporary `WARPISH_DATA_DIR`, token file, session prefix, and Chrome profile.
-  - Must keep proving readable-terminal Hermes palette ANSI styles, safe clickable new-tab links, session-metadata XSS resistance, API plain-text error handling, mobile toolbar/blocks layout, explicit reader/raw mouse modes, empty-reader fail-safe, long Hermes scrollback readability, and no stale-capture flicker while typing.
+  - Must keep proving one-click Home/default/normal creation, raw xterm input, reconnect/controller transfer, safe multiline paste, stopped-history read-only behavior, mobile keys/layout, session-metadata XSS resistance, API plain-text error handling, and the absence of removed controls and creation forms.
 
 ## Critical behavior to preserve
 
-### Persian/English bidi readability
+### Raw terminal surface
 
-- Direct xterm typing must remain the real input path: typing `hermes chat` in the terminal should execute in the shell, not in a separate mask/composer.
-- The readable terminal mask is default-on: terminal input echo and output should render through normal HTML lines. If an LTR shell prompt is followed by Persian/Arabic input, split the prompt from the suffix: keep the prompt LTR, then render the suffix as a compact Word-style RTL segment. Inside that segment, English/code tokens, paths, and flags must stay isolated LTR islands. Do not split Persian words into per-word islands.
-- Keep the primary workspace terminal-native: command blocks must be collapsed/hidden by default so input and output stay in one large terminal surface.
-- Do not add a separate input-mask/composer section; one goal of this project is a readable terminal, so terminal input echo and terminal output should be masked/readable by default.
-- Cmd/Ctrl+K should focus the terminal, not open a separate command mask.
-- Readable overlay/focus/scroll/mouse regression guard: the overlay must not steal typing. Keep explicit focus handlers on the terminal surface/card so that after toolbar blur or old-session reattach, clicking the terminal/readable area focuses xterm. When readable mode is on, bridge keydown/paste from the readable surface directly to the backing tmux pane (`directTmux`) so old attach-session clients cannot swallow input; for stale prompt-only shell rows, a conservative `C-g C-u` recovery before the first printable key is allowed. Wheel over the readable surface should scroll the readable/tmux-captured history and stop propagation in reader mouse mode; raw mouse mode must pass pointer events through to xterm for mouse-enabled TUIs.
-- Do not use tmux/xterm alternate-screen state alone as a signal for input mode because `tmux attach` itself may use alternate screen.
-- Generic TUI auto mode may activate only when capture metadata agrees on `alternateActive`, `usingAlternate`, and `captureReason === 'alternate-active'`; private sessions may expose those non-content booleans but never captured text.
-- Keep the readable terminal mask available as the default surface/toggle; it mirrors recent xterm buffer lines or tmux-captured pane text into normal HTML, splits LTR prompts from RTL suffix segments, isolates English/code/path runs as LTR, preserves live xterm and ANSI-preserving tmux-captured foreground/background/bold styling, dims inline suggestion text after the cursor, and throttles/cache-skips fast redraws so Hermes streaming output does not flicker. If a full-screen/alternate-screen terminal app leaves xterm scrollback at `baseY=0` or exposes only sparse/control-key artifacts, prefer tmux-captured reader content and do not hide raw xterm unless the reader has real content (`bidi-reader-has-content`); wheel should refresh/update this tmux-backed readable layer rather than trying to split the terminal layout or sending history/navigation input to the shell.
-- Preserve bidi styling on sidebar previews, block commands, and block outputs.
-- Do not rely on xterm/tmux raw terminal rendering alone for Persian/Hermes output; terminal grids and redraws are not reliable Unicode bidi boundaries.
-- If changing xterm rendering or terminal layout, verify prompt + `سلام عزیزم koja بودی` against Word-style behavior: the prompt remains LTR; the suffix is one compact `dir=rtl` segment; visual RTL reading order is `سلام` → `عزیزم` → `koja` → `بودی`; and `koja`/paths/flags stay readable LTR internally.
+- xterm is the only browser terminal display and the only live typing path. Input must flow through the selected session's WebSocket/PTY path and output must render directly in xterm.
+- Do not add a readable mirror, HTML terminal mask, command composer, command-block panel, or terminal action toolbar. The terminal grid remains the source of truth for prompt, output, selection, and scrollback.
+- Preserve native xterm behavior for ANSI styling, alternate-screen programs, mouse protocols, selection, scrollback, IME, and full-screen terminal applications. Do not infer or switch presentation modes from tmux capture metadata.
+- Clicking the terminal surface or selecting a live session must leave xterm focusable; mobile terminal keys must feed the same raw input path.
+- Do not reconstruct Persian/English output into separate HTML lines or directional islands. Any bidi behavior is the native terminal renderer's behavior, not a second browser surface.
 
 ### Sessions
 
 - A browser reload or WebSocket close must detach only the current attach process.
 - It must not kill the tmux session.
-- The UI `Kill session` action is the intentional destructive path for live shells.
 - The UI `Clear stopped` action may purge stopped-session rows and their related block/event rows, but it must not kill active `tmux` sessions.
 - Sidebar previews should come from actual tmux pane content, not fabricated state.
 - Stopped session cards must remain selectable as read-only retained history; they must never attempt a WebSocket attach.
-- New-session CWD must resolve to an existing accessible directory, and profile/private metadata must survive SQLite round trips.
-- The primary `+ New terminal` action must create immediately with an empty API request: Home directory, automatic `Terminal N` title, `default` profile, and non-private history. It must not open a form or inherit Options-form preferences. Custom CWD/profile/private/title belong behind the separate `Options…` action.
-- Private sessions must not persist command markers, blocks, output, previews, capture/export text, or tmux scrollback. Live screen rendering and non-content TUI metadata are allowed.
+- `+ New terminal` must create immediately with an empty API request: Home directory, automatic `Terminal N` title, `default` profile, and normal non-private history. It must not open a dialog, options panel, or custom title/CWD/profile/private form.
+- The browser must not expose Rename, Detach, Kill, Split, Next-pane, or custom-session controls. Their dedicated API routes are removed as well.
+- Existing and recovered private sessions must not persist command markers, blocks, output, previews, capture/export text, or tmux scrollback. The browser does not create new private sessions.
 - Set tmux `history-limit` before creating the real shell pane; changing it on an existing pane does not alter that pane's limit. Recovered unknown tmux sessions must never default to non-private, and a private pane whose effective limit is nonzero must stay quarantined from attach/input/capture.
-- Pane split/next operations require a live validated session and must return explicit 4xx/5xx errors instead of silently succeeding.
 
 ### Terminal protocol and lifecycle
 
@@ -179,15 +167,12 @@ bash -n start.sh stop.sh
 - CWD comes from a bounded base64 shell marker, is validated as an absolute existing directory, and is broadcast as `session-meta`.
 - Multiline paste requires an explicit safe single-line/preserve/cancel choice outside bracketed-paste mode; trailing line breaks must never become an implicit submit.
 
-### Command blocks
+### Legacy command-marker compatibility
 
-- New sessions should launch with scoped shell integration enabled via the project-selected zsh-compatible shell (`WARPISH_SHELL` or `/bin/zsh`) as an explicit interactive login zsh (`-l -i`). Do not inherit ambient `SHELL` blindly; GitHub Actions and other CI runners often set `SHELL=/bin/bash`, which bypasses the zsh hook file and makes command blocks disappear.
-- Blocks should record command, output preview, status, exit code, start/end times, and duration.
-- Rerun must send the recorded command back into the same selected session.
-- Search/copy actions are browser-only conveniences and must not mutate session state.
-- Do not rely only on OSC markers. tmux can filter or replay control sequences.
-- If streaming output into the active block, append only while an explicit shell-integration start/end marker says a block is running, keep output capped, and test repeated commands/redraws; tmux redraw/replay can pollute block output.
-- If output extraction changes, update `npm run smoke` to catch regressions.
+- New sessions launch through the project-selected zsh-compatible shell (`WARPISH_SHELL` or `/bin/zsh`) as an explicit interactive login zsh (`-l -i`) with `WARPISH_BLOCK_INTEGRATION=0`.
+- New shells emit CWD metadata only. They must not register command Start/End hooks or create new command blocks.
+- Keep bounded OSC stripping and legacy SQLite/private-session recovery until tmux sessions created by older releases have been retired. That compatibility path must never reappear as a browser Blocks view, search, copy, rerun, export, or second terminal surface.
+- Do not drop legacy block/event tables in place while a user's existing database may still reference them; use an explicit future migration after compatibility retirement.
 
 ### Security
 
@@ -222,18 +207,17 @@ npm test
 Then open the app in Chrome and verify at least:
 
 - sidebar renders sessions,
-- `+ New terminal` creates exactly one default Home-directory session without opening a dialog, while `Options…` preserves explicit CWD/profile/private/title creation,
+- `+ New terminal` creates exactly one Home-directory, automatic-title, `default`-profile, normal-history session without opening a dialog,
+- no custom creation form or terminal toolbar appears, and Blocks, Find, Rename, Copy, Export, Readable, Mouse, TUI, Split, Next, Settings, Detach, and Kill controls are absent,
 - direct terminal input runs in the real shell,
 - reload/reattach preserves terminal output,
-- command blocks render and rerun works,
-- Bidi reader renders Persian/English mixed text in readable order,
-- direct xterm typing of `hermes chat` executes through the real shell path,
-- terminal input echo/output are displayed through the default readable terminal mask without an input-mask section,
-- command blocks are hidden/collapsed by default; terminal viewport remains the dominant daily-driver surface,
+- terminal output, selection, scrollback, mouse handling, and full-screen applications remain on the raw xterm path,
+- multiline paste requires an explicit safe choice when bracketed-paste mode is unavailable,
+- mobile terminal keys send the expected terminal sequences,
 - clearing stopped session history removes stopped sidebar entries and keeps live sessions alive,
-- a disposable full-screen/resume-style terminal fixture leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured text rather than freezing or splitting the layout,
+- stopped sessions remain selectable as read-only history and never attach a WebSocket,
+- legacy private sessions remain fail-closed and unsafe recovered panes remain quarantined,
 - browser console has no JavaScript errors.
-- quick-create Home/default behavior, the separate new-session Options fields, settings persistence, find, export, pane actions, stopped-history selection, and toolbar hit targets work in a real browser.
 
 For docs-only changes, at minimum verify:
 
@@ -263,23 +247,22 @@ These are hard rules for future development:
 2. Any bug that lets same-origin JavaScript run is a shell-execution bug. Prove hostile metadata cannot execute before claiming a browser-terminal security fix is done.
 3. Auth changes must keep tokens out of long-lived frontend-readable storage. API/WS should work via same-origin cookies after bootstrap, with Origin checks and localhost bind guards preserved.
 4. Test servers must use isolated `WARPISH_DATA_DIR`, token files, session prefixes, and dynamic ports. Never let smoke/regression tests pollute the user's real `.warpish` sidebar or tmux sessions.
-5. Responsive UI must never hide destructive/critical controls (`Kill`, `Detach`, `Readable`, `Mouse`, `Blocks`, `Copy`) without an accessible replacement.
-6. Readable overlay changes must preserve both modes: reader mouse mode for selection/links/scrollback and raw mouse passthrough for mouse-enabled TUIs.
+5. Do not reintroduce the removed terminal toolbar, block panel, reader/mode controls, pane actions, settings, or custom-session creation form without an explicit product decision.
+6. Raw xterm must remain the sole terminal surface; input, selection, scrollback, mouse protocols, and full-screen applications must not be intercepted by an HTML mirror.
 7. API clients must handle non-JSON errors and preserve HTTP status in the displayed message.
 8. Start/stop scripts must validate process identity; do not kill arbitrary listeners just because they occupy the configured port.
 9. Durable docs must not contain private resume IDs, tokens, transient ports, or stale runtime claims. Use reproducible fixtures or placeholders.
 10. Before handoff, run `npm test` plus the syntax/check commands, then verify final `git status --short`.
-11. Toolbar overflow must start-align inside its scroll container. `flex-end` can place early controls at negative x coordinates, making Blocks/Find visually present but unclickable.
-12. HTML number defaults must satisfy their own `min`/`step` constraints; native validation can otherwise prevent Settings from submitting without a JavaScript error.
+11. One click on `+ New terminal` must issue one default creation request and must not open or inherit state from a hidden options form.
+12. Legacy/private safety is fail-closed: unknown recovered sessions never default to normal history, and unsafe private panes stay quarantined.
 
 
 ## Known pitfalls
 
-- A pretty xterm.js pane is not enough; Warp-like behavior requires session continuity and block affordances.
+- The browser surface is intentionally small; reliability comes from session continuity, raw terminal semantics, paste safety, and clear failure states.
 - Spawning a raw shell per WebSocket breaks resume.
-- Confusing detach with kill will destroy user work.
+- Confusing attach-process teardown with backing-session termination will destroy user work.
 - Shell integration must not modify global user startup files.
-- tmux capture/output boundaries are tricky; full-screen/TUI apps may not produce useful command block previews.
+- tmux capture/output boundaries are tricky; persisted backend block previews are compatibility data, not the browser terminal surface.
 - Browser screenshot tooling may fail in constrained local environments; use DOM/console/API evidence as fallback.
-- Unicode bidi is visual, not just data correctness: backend output can be correct while terminal rendering is unreadable. Verify the browser reader/styles too.
-- Keep direct terminal typing as the default. Do not add input-mask capture; the readable terminal mask is default-on, while command blocks stay opt-in/collapsible and must not split input from output.
+- Keep direct xterm typing and raw xterm output as the only terminal path. Do not add an input mask, readable overlay, command-block workspace, or presentation-mode switcher.
