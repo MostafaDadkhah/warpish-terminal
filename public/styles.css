@@ -126,12 +126,25 @@ button:hover {
   background: rgba(255, 255, 255, 0.11);
 }
 button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+.new-session-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 82px;
+  gap: 7px;
+}
 .new-session {
-  width: 100%;
+  width: auto;
   height: 44px;
   font-weight: 850;
   border-color: transparent;
   background: linear-gradient(135deg, rgba(139, 92, 246, 0.98), rgba(34, 211, 238, 0.78));
+}
+.new-session-options {
+  width: 82px;
+  height: 44px;
+  padding: 0 9px;
+  border-color: rgba(139, 92, 246, 0.42);
+  font-size: 12px;
+  font-weight: 750;
 }
 
 .sidebar-section-head {
@@ -773,7 +786,9 @@ footer {
   }
   .sidebar .eyebrow, .sidebar-footer { display: none; }
   .sidebar h1 { font-size: 26px; }
-  .new-session { height: 38px; }
+  .new-session, .new-session-options { height: 38px; }
+  .new-session-actions { grid-template-columns: minmax(0, 1fr) 76px; }
+  .new-session-options { width: 76px; }
   .session-list { min-height: 64px; }
   .workspace {
     min-height: 0;
@@ -821,7 +836,9 @@ footer {
   .sidebar .sidebar-section-head {
     display: none;
   }
-  .new-session { height: 32px; }
+  .new-session, .new-session-options { height: 32px; }
+  .new-session-actions { grid-template-columns: minmax(0, 1fr) 72px; }
+  .new-session-options { width: 72px; }
   .session-list {
     min-height: 0;
     flex-direction: row;

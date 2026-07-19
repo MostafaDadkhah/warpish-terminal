@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -147,6 +148,7 @@ if (requestedBrowserCase) {
   }, null, 2));
 } else {
 const requiredChecks = [
+  'quickCreateDefaults',
   'hermesPaletteStyles',
   'capturedHistoryReducer',
   'hermesReadableHistoryStability',
@@ -168,6 +170,12 @@ for (const check of requiredChecks) {
 
 const rich = regressions.richHistoryTypingStability;
 const shortHistory = regressions.shortHistoryTypingFlicker;
+const quickCreate = regressions.quickCreateDefaults;
+assert(/^Terminal \d+$/u.test(quickCreate.automaticTitle), 'quick create did not use an automatic title', quickCreate);
+assert(quickCreate.cwd === os.homedir(), 'quick create did not start in Home', quickCreate);
+assert(quickCreate.profile === 'default' && quickCreate.private === false, 'quick create inherited advanced Options preferences', quickCreate);
+assert(quickCreate.doubleClickCreatedCount === 1, 'quick create double-click produced duplicate sessions', quickCreate);
+assert(quickCreate.regularButtonOpenedDialog === false && quickCreate.advancedDialogAvailable === true, 'quick and Options creation flows were not separated', quickCreate);
 assert(regressions.hermesPaletteStyles.stableSamples >= 4, 'Hermes ANSI colors were not stable across capture refreshes', regressions.hermesPaletteStyles);
 assert(regressions.hermesReadableHistoryStability.lineSpread <= 2, 'Hermes readable history line count oscillated', regressions.hermesReadableHistoryStability);
 assert(regressions.hermesReadableHistoryStability.scrollHeightSpread <= 60, 'Hermes readable history scroll range oscillated', regressions.hermesReadableHistoryStability);
@@ -219,6 +227,7 @@ console.log(JSON.stringify({
   durationMs: Date.now() - startedAt,
   browser: payload.browser,
   checks: {
+    quickCreateDefaults: quickCreate,
     hermesPaletteStyles: regressions.hermesPaletteStyles,
     capturedHistoryReducer: regressions.capturedHistoryReducer,
     hermesReadableHistoryStability: regressions.hermesReadableHistoryStability,

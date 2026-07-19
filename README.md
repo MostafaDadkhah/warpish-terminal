@@ -7,7 +7,7 @@ Local-only Chrome web terminal for macOS, with Warp-like resumable terminal sess
 What it does:
 - Opens a modern Chrome UI with a left sidebar.
 - Sidebar shows terminal session history with live/stopped state and recent preview.
-- Click a live session to continue it, or open a stopped session as read-only history. New terminals can choose a title, starting directory, profile label, and private mode.
+- Click a live session to continue it, or open a stopped session as read-only history. `New terminal` starts immediately in Home with an automatic title, the `default` profile, and normal history; `Options…` exposes the optional title, starting directory, profile label, and private mode.
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
 - Adds Warp-style command blocks for new sessions; the block panel is hidden by default and opens only when you ask for it.
@@ -73,7 +73,7 @@ cd warpish-terminal
 npm test
 ```
 
-`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies private panes have zero history and no durable content even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards Hermes/RTL styling, controller transfer, runtime snapshots, 140KB ordered UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile layout, mouse/TUI modes, long scrollback, and typing flicker. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/preferences/paste tests. CI retains the complete test log for 14 days even on failure.
+`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies private panes have zero history and no durable content even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home-directory creation, the separate Options flow, Hermes/RTL styling, controller transfer, runtime snapshots, 140KB ordered UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile layout, mouse/TUI modes, long scrollback, and typing flicker. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/preferences/paste tests. CI retains the complete test log for 14 days even on failure.
 
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.

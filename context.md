@@ -22,7 +22,7 @@ Implemented capabilities:
 - Terminal-native typing means normal xterm input goes directly to the shell while input echo and output render through the default readable terminal mask; there is no separate input-mask section or auto-captured composer.
 - Terminal rows, the xterm helper textarea, and the readable terminal mask get bidi-safe styling by default; the readable mask keeps LTR shell prompts separate from compact Word-style RTL suffix segments while preserving English commands, paths, flags, and code as isolated LTR islands.
 - The readable terminal mask is on by default and covers the terminal surface without taking extra layout space; the toolbar toggle can switch to raw xterm for edge-case TUIs. The readable surface owns wheel scrolling when enabled: it stops wheel events from becoming shell history/navigation input, refreshes tmux-captured history when xterm has no scrollback, preserves xterm focus for old-session reattaches, and uses direct tmux-pane input for readable-mode keystrokes when attach-session input is stale.
-- New-session title, validated CWD, profile label, and private-mode controls. Private sessions retain no blocks, preview, capture, or tmux scrollback.
+- One-click `New terminal` creation always uses Home, an automatic title, the `default` profile, and normal history. Optional title, validated CWD, profile label, and private mode remain available through the separate `Options…` control. Private sessions retain no blocks, preview, capture, or tmux scrollback.
 - Session rename, copy selection, text export, detach, kill/delete-history, terminal search, settings, bell notifications, mobile accessory keys, and tmux split/next-pane controls.
 - State-aware keyboard fallback and binary-input forwarding for terminal protocols, plus generic full-screen TUI auto/manual presentation.
 - Bounded input queues/payloads across browser, WebSocket, Node, and Python; WebSocket heartbeat; tmux timeouts; idle attach-PTY teardown; and live CWD metadata updates.
@@ -148,7 +148,7 @@ Browser QA also verified:
 
 - Chrome UI loads,
 - session sidebar renders,
-- new session creation works,
+- one-click Home/default session creation works without opening a form, and the separate Options flow still creates explicit CWD/profile/private sessions,
 - direct terminal input executes in the real shell,
 - the readable terminal mask is default-on and covers the terminal surface without adding a separate input section,
 - Direct xterm typing of `hermes chat` was dogfooded with headless Chrome/CDP and screenshot evidence; it stayed in the terminal workflow while command blocks stayed hidden by default,
@@ -157,7 +157,7 @@ Browser QA also verified:
 - block panel renders block count and block cards,
 - rerun creates another successful block,
 - browser console had no JavaScript errors during the checked run.
-- Browser QA verified new-session CWD/profile/private fields, persistent terminal settings, live CWD updates, search, split/next-pane actions, stopped-history read-only mode, toolbar hit targets, and no console warnings/errors.
+- Browser QA verified one-click Home/default session creation, the separate new-session Options flow, persistent terminal settings, live CWD updates, search, split/next-pane actions, stopped-history read-only mode, toolbar hit targets, and no console warnings/errors.
 - Browser regression verified Ctrl/Cmd+F does not leak a control byte, 140KB mixed UTF-8 input remains ordered, cross-session paste is cancelled, stopped history never queues input, and light theme colors reach the readable overlay.
 - Browser QA verified against the user's Word screenshot: prompt + `سلام عزیزم koja بودی` renders as an LTR prompt followed by one compact RTL suffix segment whose visual order matches Word (`سلام`/`عزیزم` on the right, `koja` as an LTR island, `بودی` on the left). Mixed output keeps Persian phrase runs and readable LTR/code islands.
 - Browser QA verified readable terminal interaction fixes: old live session reattach returns focus to `xterm-helper-textarea`; readable-mode keypresses use direct tmux-pane input if attach input is stale, with prompt-only stale recovery via `C-g C-u`; real keyboard input reached Terminal 44 and appeared in both DOM and `tmux capture-pane`; wheel over the readable surface expands from xterm's 23 visible rows to tmux-captured history (149/360 lines in QA) without sending `^[[A`/history input; synthetic inline suggestion text after the cursor renders as `.bidi-ghost` opacity `0.46`; live ANSI/palette/truecolor styles render as `.bidi-style-run` spans (`RED`, `GREEN`, bold blue, truecolor orange, and background color verified); alternate-screen Hermes chat on Terminal 55 was verified to use tmux-captured reader content instead of a blank/`Waiting for terminal output…` overlay or sparse `<F3>` xterm artifact; fast 320-line streaming output rendered only 3 readable redraws with the underlying xterm screen opacity at `0` only when reader content exists, reducing flicker.

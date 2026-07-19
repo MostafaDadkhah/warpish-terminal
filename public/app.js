@@ -8,6 +8,7 @@ const sessionMeta = document.getElementById('sessionMeta');
 const terminalTitle = document.getElementById('terminalTitle');
 const sessionList = document.getElementById('sessionList');
 const newSessionButton = document.getElementById('newSession');
+const newSessionOptionsButton = document.getElementById('newSessionOptions');
 const refreshSessionsButton = document.getElementById('refreshSessions');
 const clearStoppedSessionsButton = document.getElementById('clearStoppedSessions');
 const renameSessionButton = document.getElementById('renameSession');
@@ -44,6 +45,7 @@ const newSessionCwdInput = document.getElementById('newSessionCwd');
 const newSessionProfileInput = document.getElementById('newSessionProfile');
 const newSessionPrivateInput = document.getElementById('newSessionPrivate');
 const newSessionError = document.getElementById('newSessionError');
+const createSessionConfirmButton = document.getElementById('createSessionConfirm');
 const settingsDialog = document.getElementById('settingsDialog');
 const settingsForm = document.getElementById('settingsForm');
 const settingsResetButton = document.getElementById('settingsReset');
@@ -118,6 +120,7 @@ let connectionSerial = 0;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let terminalControlRole = 'controller';
+let newSessionCreationPending = false;
 let terminalWriteDepth = 0;
 let controlClaimPending = false;
 let sessionGeneration = 0;
@@ -2778,7 +2781,19 @@ terminalEl.addEventListener('wheel', (event) => {
   event.preventDefault();
 }, { capture: true, passive: false });
 
-newSessionButton.addEventListener('click', () => {
+function setNewSessionCreationBusy(busy) {
+  newSessionCreationPending = Boolean(busy);
+  for (const control of [newSessionButton, newSessionOptionsButton, createSessionConfirmButton]) {
+    if (control) control.disabled = newSessionCreationPending;
+  }
+  if (newSessionButton) {
+    newSessionButton.textContent = newSessionCreationPending ? 'Creating…' : '+ New terminal';
+    if (newSessionCreationPending) newSessionButton.setAttribute('aria-busy', 'true');
+    else newSessionButton.removeAttribute('aria-busy');
+  }
+}
+
+function openNewSessionOptions() {
   newSessionTitleInput.value = '';
   newSessionCwdInput.value = terminalPreferences.defaultCwd || '';
   newSessionProfileInput.value = terminalPreferences.defaultProfile || 'default';
@@ -2789,40 +2804,53 @@ newSessionButton.addEventListener('click', () => {
   }
   newSessionDialog?.showModal?.();
   window.setTimeout(() => newSessionTitleInput?.focus(), 0);
-});
+}
 
-newSessionForm?.addEventListener('submit', async (event) => {
-  event.preventDefault();
+async function createNewSession(request, { showDialogError = false } = {}) {
+  if (newSessionCreationPending) return null;
   const selectedAtRequestStart = currentSessionId;
-  const submitButton = event.submitter;
-  if (submitButton) submitButton.disabled = true;
+  setNewSessionCreationBusy(true);
   beginSessionsMutation();
   try {
     if (newSessionError) {
       newSessionError.hidden = true;
       newSessionError.textContent = '';
     }
-    const request = {
-      title: newSessionTitleInput.value.trim() || undefined,
-      cwd: newSessionCwdInput.value.trim() || undefined,
-      profile: newSessionProfileInput.value.trim() || 'default',
-      private: newSessionPrivateInput.checked,
-    };
+    setStatus('warn', 'creating terminal…', request.cwd || 'Home directory');
     const created = await api('/api/sessions', { method: 'POST', body: JSON.stringify(request), timeoutMs: 20_000 });
     sessions = created.sessions || [created.session];
-    newSessionDialog.close('created');
+    if (newSessionDialog?.open) newSessionDialog.close('created');
     renderSessions();
     if (!currentSessionId || currentSessionId === selectedAtRequestStart) connectToSession(created.session.id);
+    return created.session;
   } catch (error) {
     setStatus('bad', 'create failed', error.message);
-    if (newSessionError) {
+    if (showDialogError && newSessionError) {
       newSessionError.textContent = error.message;
       newSessionError.hidden = false;
     }
+    return null;
   } finally {
     endSessionsMutation();
-    if (submitButton) submitButton.disabled = false;
+    setNewSessionCreationBusy(false);
   }
+}
+
+newSessionButton?.addEventListener('click', () => {
+  createNewSession({}).catch(() => {});
+});
+
+newSessionOptionsButton?.addEventListener('click', openNewSessionOptions);
+
+newSessionForm?.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const request = {
+    title: newSessionTitleInput.value.trim() || undefined,
+    cwd: newSessionCwdInput.value.trim() || undefined,
+    profile: newSessionProfileInput.value.trim() || 'default',
+    private: newSessionPrivateInput.checked,
+  };
+  await createNewSession(request, { showDialogError: true });
 });
 
 for (const cancelButton of document.querySelectorAll('[data-dialog-cancel]')) {

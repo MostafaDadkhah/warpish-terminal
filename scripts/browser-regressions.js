@@ -2,6 +2,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -369,6 +370,109 @@ async function createSession(title, cwd = runtimeRoot) {
   const payload = await api('/api/sessions', { method: 'POST', body: { title, cwd } });
   createdSessions.push(payload.session.id);
   return payload.session;
+}
+
+async function testQuickCreateUsesHomeWithoutDialog(page) {
+  const optionsCwd = path.join(runtimeRoot, 'quick-create-options-cwd');
+  fs.mkdirSync(optionsCwd, { recursive: true });
+  await page.navigate(`${tokenUrl}&case=quick-create`);
+  await page.waitFor(`document.querySelector('#newSession') && document.querySelector('#newSessionOptions') && sessions.length > 0 && !sessionsRefreshPending`, 15000, 'quick-create controls and startup session');
+  const beforePayload = await api('/api/sessions');
+  const beforeIds = (beforePayload.sessions || []).map((session) => session.id);
+
+  const clickState = await page.eval(`(() => {
+    applyTerminalPreferences({
+      ...terminalPreferences,
+      defaultCwd: ${JSON.stringify(optionsCwd)},
+      defaultProfile: 'options-test',
+      privateByDefault: true,
+    });
+    const dialog = document.querySelector('#newSessionDialog');
+    const button = document.querySelector('#newSession');
+    button.click();
+    button.click();
+    return {
+      dialogOpen: Boolean(dialog?.open),
+      label: button?.textContent || '',
+    };
+  })()`);
+  assert(clickState.dialogOpen === false, 'regular New terminal opened the options dialog', clickState);
+
+  const created = await page.waitFor(`(() => {
+    const priorIds = new Set(${JSON.stringify(beforeIds)});
+    const session = sessions.find((candidate) => !priorIds.has(candidate.id));
+    if (!session || currentSessionId !== session.id || newSessionCreationPending) return false;
+    return {
+      id: session.id,
+      title: session.title,
+      cwd: session.cwd,
+      profile: session.profile,
+      private: session.private,
+      dialogOpen: Boolean(document.querySelector('#newSessionDialog')?.open),
+      quickCreateEnabled: !document.querySelector('#newSession')?.disabled,
+      optionsEnabled: !document.querySelector('#newSessionOptions')?.disabled,
+      optionsLabel: document.querySelector('#newSessionOptions')?.getAttribute('aria-label') || '',
+    };
+  })()`, 20000, 'quick terminal created and selected');
+  createdSessions.push(created.id);
+  const afterQuickPayload = await api('/api/sessions');
+  const quickCreatedSessions = (afterQuickPayload.sessions || []).filter((session) => !beforeIds.includes(session.id));
+  assert(quickCreatedSessions.length === 1, 'double-clicking regular New terminal created more than one session', quickCreatedSessions);
+  assert(/^Terminal \d+$/u.test(created.title), 'quick terminal did not receive an automatic title', created);
+  assert(created.cwd === os.homedir(), 'quick terminal did not start in the home directory', created);
+  assert(created.profile === 'default' && created.private === false, 'quick terminal inherited Options-form preferences instead of normal defaults', created);
+  assert(!created.dialogOpen && created.quickCreateEnabled && created.optionsEnabled, 'quick-create controls did not settle cleanly', created);
+  assert(created.optionsLabel === 'New terminal with options', 'advanced creation control is not clearly labeled', created);
+
+  const optionsState = await page.eval(`(() => {
+    document.querySelector('#newSessionOptions').click();
+    return {
+      open: Boolean(document.querySelector('#newSessionDialog')?.open),
+      title: document.querySelector('#newSessionDialogTitle')?.textContent || '',
+      cwdPlaceholder: document.querySelector('#newSessionCwd')?.getAttribute('placeholder') || '',
+      cwd: document.querySelector('#newSessionCwd')?.value || '',
+      profile: document.querySelector('#newSessionProfile')?.value || '',
+      private: Boolean(document.querySelector('#newSessionPrivate')?.checked),
+    };
+  })()`);
+  assert(optionsState.open && optionsState.title === 'New terminal with options', 'advanced New terminal control did not open its options dialog', optionsState);
+  assert(optionsState.cwdPlaceholder === 'Home directory', 'advanced dialog no longer communicates the Home default', optionsState);
+  assert(optionsState.cwd === optionsCwd && optionsState.profile === 'options-test' && optionsState.private, 'Options-form preferences were not preserved for advanced creation', optionsState);
+
+  const advancedTitle = 'Quick Create Advanced Regression';
+  await page.eval(`(() => {
+    newSessionTitleInput.value = ${JSON.stringify(advancedTitle)};
+    newSessionForm.requestSubmit(createSessionConfirmButton);
+  })()`);
+  const advanced = await page.waitFor(`(() => {
+    const session = sessions.find((candidate) => candidate.title === ${JSON.stringify(advancedTitle)});
+    if (!session || currentSessionId !== session.id || newSessionCreationPending) return false;
+    return {
+      id: session.id,
+      cwd: session.cwd,
+      profile: session.profile,
+      private: session.private,
+      dialogOpen: Boolean(document.querySelector('#newSessionDialog')?.open),
+    };
+  })()`, 20000, 'advanced terminal created and selected');
+  createdSessions.push(advanced.id);
+  assert(advanced.cwd === optionsCwd && advanced.profile === 'options-test' && advanced.private, 'advanced terminal did not use its explicit options', advanced);
+  assert(!advanced.dialogOpen, 'advanced terminal dialog stayed open after successful creation', advanced);
+
+  return {
+    automaticTitle: created.title,
+    cwd: created.cwd,
+    profile: created.profile,
+    private: created.private,
+    doubleClickCreatedCount: quickCreatedSessions.length,
+    regularButtonOpenedDialog: clickState.dialogOpen,
+    advancedDialogAvailable: optionsState.open,
+    advancedSession: {
+      cwd: advanced.cwd,
+      profile: advanced.profile,
+      private: advanced.private,
+    },
+  };
 }
 
 function respawnPane(sessionId, command) {
@@ -2675,16 +2779,22 @@ async function testMouseModeAndMobileLayout(page) {
     const toolbar = document.querySelector('.toolbar-actions');
     const grid = document.querySelector('.terminal-grid');
     const mouseButton = document.getElementById('mouseModeToggle');
-    if (!toolbar || !grid || !mouseButton) return false;
+    const sidebar = document.querySelector('.sidebar');
+    const newSessionActions = document.querySelector('.new-session-actions');
+    if (!toolbar || !grid || !mouseButton || !sidebar || !newSessionActions) return false;
+    const sidebarRect = sidebar.getBoundingClientRect();
+    const newSessionRect = newSessionActions.getBoundingClientRect();
     return {
       toolbarDisplay: getComputedStyle(toolbar).display,
       toolbarOverflowX: getComputedStyle(toolbar).overflowX,
       gridColumns: getComputedStyle(grid).gridTemplateColumns,
       mouseText: mouseButton.textContent,
+      newSessionFitsSidebar: newSessionRect.left >= sidebarRect.left && newSessionRect.right <= sidebarRect.right,
     };
   })()`, 15000, 'mobile toolbar and blocks layout');
   assert(mobile.toolbarDisplay !== 'none', 'critical toolbar controls are hidden on narrow viewport', mobile);
   assert(!mobile.gridColumns.includes('360px'), 'blocks-open mobile grid still forces a desktop second column', mobile);
+  assert(mobile.newSessionFitsSidebar, 'New terminal controls overflow the mobile sidebar', mobile);
   const raw = await page.eval(`(() => {
     document.getElementById('mouseModeToggle')?.click();
     const reader = document.getElementById('bidiReader');
@@ -2771,11 +2881,14 @@ async function main() {
 
   if (browserOnly) {
     const requestedCases = browserOnly === 'high-value'
-      ? ['clipboard-shortcuts', 'reader-selection', 'controller-lease', 'runtime-snapshot', 'hermes-oscillation', 'hermes-palette']
+      ? ['quick-create', 'clipboard-shortcuts', 'reader-selection', 'controller-lease', 'runtime-snapshot', 'hermes-oscillation', 'hermes-palette']
       : [browserOnly];
-    const knownCases = new Set(['short-history-typing', 'terminal56-scroll', 'clipboard-shortcuts', 'reader-selection', 'controller-lease', 'runtime-snapshot', 'hermes-oscillation', 'hermes-palette']);
+    const knownCases = new Set(['quick-create', 'short-history-typing', 'terminal56-scroll', 'clipboard-shortcuts', 'reader-selection', 'controller-lease', 'runtime-snapshot', 'hermes-oscillation', 'hermes-palette']);
     assert(requestedCases.every((name) => knownCases.has(name)), `unknown WARPISH_BROWSER_ONLY case: ${browserOnly}`);
     const regressions = {};
+    if (requestedCases.includes('quick-create')) {
+      regressions.quickCreateDefaults = await testQuickCreateUsesHomeWithoutDialog(page);
+    }
     if (requestedCases.includes('short-history-typing')) {
       regressions.shortHistoryTypingFlicker = await testShortHistoryTypingAndBackspaceStayStable(page);
     }
@@ -2815,6 +2928,7 @@ async function main() {
     return;
   }
 
+  const quickCreateDefaults = await testQuickCreateUsesHomeWithoutDialog(page);
   const hermesPaletteStyles = await testHermesPaletteStyles(page);
   const capturedHistoryReducer = await testCapturedHistoryReducer(page);
   const hermesReadableHistoryStability = await testHermesReadableHistoryDoesNotOscillate(page);
@@ -2849,6 +2963,7 @@ async function main() {
     },
     diagnostics: page.diagnosticSnapshot(),
     regressions: {
+      quickCreateDefaults,
       hermesPaletteStyles,
       capturedHistoryReducer,
       hermesReadableHistoryStability,

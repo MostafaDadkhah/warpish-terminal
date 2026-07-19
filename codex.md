@@ -165,6 +165,7 @@ bash -n start.sh stop.sh
 - Sidebar previews should come from actual tmux pane content, not fabricated state.
 - Stopped session cards must remain selectable as read-only retained history; they must never attempt a WebSocket attach.
 - New-session CWD must resolve to an existing accessible directory, and profile/private metadata must survive SQLite round trips.
+- The primary `+ New terminal` action must create immediately with an empty API request: Home directory, automatic `Terminal N` title, `default` profile, and non-private history. It must not open a form or inherit Options-form preferences. Custom CWD/profile/private/title belong behind the separate `Options…` action.
 - Private sessions must not persist command markers, blocks, output, previews, capture/export text, or tmux scrollback. Live screen rendering and non-content TUI metadata are allowed.
 - Set tmux `history-limit` before creating the real shell pane; changing it on an existing pane does not alter that pane's limit. Recovered unknown tmux sessions must never default to non-private, and a private pane whose effective limit is nonzero must stay quarantined from attach/input/capture.
 - Pane split/next operations require a live validated session and must return explicit 4xx/5xx errors instead of silently succeeding.
@@ -221,7 +222,7 @@ npm test
 Then open the app in Chrome and verify at least:
 
 - sidebar renders sessions,
-- `+ New terminal` creates a session,
+- `+ New terminal` creates exactly one default Home-directory session without opening a dialog, while `Options…` preserves explicit CWD/profile/private/title creation,
 - direct terminal input runs in the real shell,
 - reload/reattach preserves terminal output,
 - command blocks render and rerun works,
@@ -232,7 +233,7 @@ Then open the app in Chrome and verify at least:
 - clearing stopped session history removes stopped sidebar entries and keeps live sessions alive,
 - a disposable full-screen/resume-style terminal fixture leaves the browser/backend connected; when xterm has no scrollback, wheel opens a tmux-backed Bidi reader overlay with captured text rather than freezing or splitting the layout,
 - browser console has no JavaScript errors.
-- new-session CWD/profile/private fields, settings persistence, find, export, pane actions, stopped-history selection, and toolbar hit targets work in a real browser.
+- quick-create Home/default behavior, the separate new-session Options fields, settings persistence, find, export, pane actions, stopped-history selection, and toolbar hit targets work in a real browser.
 
 For docs-only changes, at minimum verify:
 

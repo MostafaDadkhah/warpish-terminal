@@ -20,7 +20,10 @@
           <span class="brand-dot"></span>
         </div>
 
-        <button id="newSession" class="new-session">+ New terminal</button>
+        <div class="new-session-actions">
+          <button id="newSession" class="new-session" type="button" title="Start immediately in your Home directory">+ New terminal</button>
+          <button id="newSessionOptions" class="new-session-options" type="button" title="New terminal with options" aria-label="New terminal with options" aria-haspopup="dialog" aria-controls="newSessionDialog">Options…</button>
+        </div>
 
         <div class="sidebar-section-head">
           <span>Session history</span>
@@ -126,13 +129,13 @@
 
     <dialog id="newSessionDialog" class="warpish-dialog" aria-labelledby="newSessionDialogTitle">
       <form id="newSessionForm" method="dialog">
-        <header><h3 id="newSessionDialogTitle">New terminal</h3><p>Choose where and how this resumable session starts.</p></header>
-        <label>Title <input id="newSessionTitle" autocomplete="off" maxlength="80" placeholder="Automatic" /></label>
-        <label>Working directory <input id="newSessionCwd" autocomplete="off" spellcheck="false" placeholder="Home directory" /></label>
+        <header><h3 id="newSessionDialogTitle">New terminal with options</h3><p>Only change what you need. The regular New terminal button starts immediately in Home.</p></header>
+        <label>Title (optional) <input id="newSessionTitle" autocomplete="off" maxlength="80" placeholder="Automatic" /></label>
+        <label>Working directory (optional) <input id="newSessionCwd" autocomplete="off" spellcheck="false" placeholder="Home directory" /></label>
         <label>Profile <input id="newSessionProfile" autocomplete="off" maxlength="40" pattern="[a-z0-9][a-z0-9._-]{0,39}" title="Start with a lowercase letter or number; then use letters, numbers, dot, underscore, or dash" value="default" required /></label>
         <label class="checkbox-row"><input id="newSessionPrivate" type="checkbox" /> Private session — do not retain blocks or output history</label>
         <p id="newSessionError" class="dialog-error" role="alert" hidden></p>
-        <div class="dialog-actions"><button type="button" data-dialog-cancel>Cancel</button><button id="createSessionConfirm" class="primary" type="submit">Create</button></div>
+        <div class="dialog-actions"><button type="button" data-dialog-cancel>Cancel</button><button id="createSessionConfirm" class="primary" type="submit">Create terminal</button></div>
       </form>
     </dialog>
 
@@ -144,13 +147,13 @@
           <label>Line height <input id="settingLineHeight" type="number" min="1" max="2" step="0.01" /></label>
           <label>Scrollback lines <input id="settingScrollback" type="number" min="1000" max="200000" step="1000" /></label>
           <label>Theme <select id="settingTheme"><option value="midnight">Midnight</option><option value="graphite">Graphite</option><option value="light">Light</option></select></label>
-          <label>Default working directory <input id="settingDefaultCwd" autocomplete="off" spellcheck="false" placeholder="Home directory" /></label>
-          <label>Default profile <input id="settingDefaultProfile" autocomplete="off" maxlength="40" pattern="[a-z0-9][a-z0-9._-]{0,39}" title="Start with a lowercase letter or number; then use letters, numbers, dot, underscore, or dash" required /></label>
+          <label>Options form directory <input id="settingDefaultCwd" autocomplete="off" spellcheck="false" placeholder="Home directory" /></label>
+          <label>Options form profile <input id="settingDefaultProfile" autocomplete="off" maxlength="40" pattern="[a-z0-9][a-z0-9._-]{0,39}" title="Start with a lowercase letter or number; then use letters, numbers, dot, underscore, or dash" required /></label>
         </div>
         <label class="checkbox-row"><input id="settingCursorBlink" type="checkbox" /> Blinking cursor</label>
         <label class="checkbox-row"><input id="settingScreenReader" type="checkbox" /> Screen-reader mode</label>
         <label class="checkbox-row"><input id="settingNotifications" type="checkbox" /> Notify on terminal bell while hidden</label>
-        <label class="checkbox-row"><input id="settingPrivateDefault" type="checkbox" /> New sessions are private by default</label>
+        <label class="checkbox-row"><input id="settingPrivateDefault" type="checkbox" /> Preselect Private in the Options form</label>
         <div class="dialog-actions"><button id="settingsReset" type="button">Reset</button><button type="button" data-dialog-cancel>Cancel</button><button id="settingsApply" class="primary" type="submit">Apply</button></div>
       </form>
     </dialog>
