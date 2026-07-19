@@ -104,6 +104,8 @@ let terminalSurfaceTransitioning = false;
 let terminalInputSequence = 0;
 let terminalRuntimeEpoch = null;
 let controllerFocusReported = false;
+let commandActivity = null;
+let commandCompletionTimer = null;
 
 const intentionallyClosedSockets = new WeakSet();
 const terminalInputClientId = window.crypto?.randomUUID?.()
@@ -173,11 +175,78 @@ async function api(path, options = {}) {
 }
 
 function setStatus(kind, text, detail = '') {
-  statusCard.classList.remove('status-ok', 'status-bad');
+  statusCard.classList.remove('status-ok', 'status-bad', 'status-running');
   if (kind === 'ok') statusCard.classList.add('status-ok');
   if (kind === 'bad') statusCard.classList.add('status-bad');
+  if (kind === 'running') statusCard.classList.add('status-running');
+  if (kind === 'running') statusCard.setAttribute('aria-busy', 'true');
+  else statusCard.removeAttribute('aria-busy');
   statusText.textContent = text;
   sessionText.textContent = detail;
+}
+
+function clearCommandCompletionTimer() {
+  if (commandCompletionTimer) window.clearTimeout(commandCompletionTimer);
+  commandCompletionTimer = null;
+}
+
+function commandActivityDetail(state = commandActivity) {
+  if (state?.phase === 'pending') return 'command accepted • waiting for the shell';
+  const processName = compactText(state?.processName || '', 80);
+  return (processName ? processName + ' • ' : '') + 'Ctrl+C to stop';
+}
+
+function renderCommandActivity() {
+  if (!commandActivity?.running) return false;
+  clearCommandCompletionTimer();
+  setStatus('running', 'command running…', commandActivityDetail());
+  return true;
+}
+
+function renderConnectionStatus(title = activeSession()?.title || 'terminal') {
+  if (renderCommandActivity()) return;
+  if (terminalControlRole === 'controller') {
+    setStatus('ok', 'connected', title + ' • this tab has control');
+  } else if (terminalControlRole === 'spectator') {
+    setStatus('warn', 'view only', title + ' • click or type to take control');
+  }
+}
+
+function resetCommandActivity() {
+  clearCommandCompletionTimer();
+  commandActivity = null;
+  statusCard.removeAttribute('aria-busy');
+  statusCard.classList.remove('status-running');
+}
+
+function applyCommandState(message, { announceCompletion = true } = {}) {
+  const state = message?.state || (message?.running ? message : null);
+  if (state?.running) {
+    commandActivity = state;
+    renderCommandActivity();
+    return;
+  }
+
+  const previous = commandActivity;
+  commandActivity = null;
+  clearCommandCompletionTimer();
+  if (!previous?.running || !announceCompletion) {
+    renderConnectionStatus();
+    return;
+  }
+
+  const exitCode = Number.isInteger(message?.exitCode) ? message.exitCode : null;
+  const elapsedMs = previous.startedAt ? Date.now() - new Date(previous.startedAt).getTime() : null;
+  const durationMs = Number.isFinite(message?.durationMs) ? message.durationMs : elapsedMs;
+  const durationDetail = Number.isFinite(durationMs) && durationMs >= 1000
+    ? Math.max(1, Math.round(durationMs / 1000)) + 's • '
+    : '';
+  const exitDetail = exitCode === null ? '' : 'exit ' + exitCode + ' • ';
+  setStatus(exitCode === null || exitCode === 0 ? 'ok' : 'bad', 'command finished', durationDetail + exitDetail + 'ready for the next command');
+  commandCompletionTimer = window.setTimeout(() => {
+    commandCompletionTimer = null;
+    if (!commandActivity?.running) renderConnectionStatus();
+  }, 1800);
 }
 
 function compactText(text = '', maxChars = SESSION_PREVIEW_CHARS) {
@@ -467,6 +536,7 @@ function selectStoppedSession(sessionId) {
   discardPendingTerminalInputs(sessionId);
   currentSessionId = sessionId;
   terminalControlRole = 'history';
+  resetCommandActivity();
   terminalCard.dataset.controlRole = terminalControlRole;
   controlClaimPending = false;
   resetTerminalSurface();
@@ -489,6 +559,7 @@ function selectQuarantinedSession(sessionId) {
   discardPendingTerminalInputs(sessionId);
   currentSessionId = sessionId;
   terminalControlRole = 'quarantine';
+  resetCommandActivity();
   terminalCard.dataset.controlRole = terminalControlRole;
   controlClaimPending = false;
   resetTerminalSurface();
@@ -872,11 +943,11 @@ function applyTerminalControlRole(role, title = activeSession()?.title || 'termi
     sendResizeIfChanged();
     flushPendingTerminalInputs(ws, currentSessionId);
     resyncControllerFocus();
-    setStatus('ok', 'connected', title + ' • this tab has control');
+    renderConnectionStatus(title);
   } else {
     controllerFocusReported = false;
     releaseUnacknowledgedInputs(ws, currentSessionId);
-    setStatus('warn', 'view only', title + ' • click or type to take control');
+    renderConnectionStatus(title);
     if (pendingInputBytes(currentSessionId) > 0) claimTerminalControl();
   }
 }
@@ -894,6 +965,7 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
   pendingTerminalInputs = pendingTerminalInputs.filter((item) => item.sessionId === sessionId);
   disconnectCurrent({ quiet: true });
   currentSessionId = sessionId;
+  resetCommandActivity();
   terminalRuntimeEpoch = null;
   controllerFocusReported = false;
   terminalControlRole = 'pending';
@@ -944,11 +1016,17 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
           'input not retried',
           uncertainInputBytes + ' unacknowledged bytes were not replayed after terminal runtime restart',
         );
+      } else {
+        applyCommandState({ running: Boolean(msg.commandState?.running), state: msg.commandState }, {
+          announceCompletion: false,
+        });
       }
     } else if (msg.type === 'role') {
       applyTerminalControlRole(msg.role, session.title);
     } else if (msg.type === 'input-ack' && msg.sessionId === sessionId) {
       acknowledgeTerminalInput(socket, sessionId, msg.inputId);
+    } else if (msg.type === 'command-state' && msg.sessionId === sessionId) {
+      applyCommandState(msg);
     } else if (msg.type === 'server-error') {
       if (msg.code === 'pty-input-backpressure') {
         releaseUnacknowledgedInputs(socket, sessionId);

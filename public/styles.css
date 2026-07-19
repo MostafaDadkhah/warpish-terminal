@@ -342,6 +342,26 @@ button.danger:hover {
   background: var(--danger);
 }
 
+.status-running {
+  border-color: color-mix(in srgb, var(--warn) 55%, var(--border));
+  background: color-mix(in srgb, var(--warn) 10%, rgba(255, 255, 255, 0.055));
+}
+
+.status-running .dot {
+  background: var(--warn);
+  animation: command-running-pulse 1.15s ease-out infinite;
+}
+
+@keyframes command-running-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 55%, transparent);
+  }
+  72%,
+  100% {
+    box-shadow: 0 0 0 9px transparent;
+  }
+}
+
 .terminal-grid {
   min-width: 0;
   min-height: 0;
@@ -622,5 +642,10 @@ footer {
 @media (prefers-reduced-motion: reduce) {
   button {
     transition: none;
+  }
+
+  .status-running .dot {
+    animation: none;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 24%, transparent);
   }
 }

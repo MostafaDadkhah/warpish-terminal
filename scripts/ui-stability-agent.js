@@ -138,8 +138,10 @@ assert(diagnostics.runtimeExceptions?.length === 0, 'browser regression emitted 
 const regressions = payload.regressions || {};
 const quick = regressions.quickCreateDefaults;
 const minimal = regressions.minimalUi;
+const activity = regressions.commandActivityIndicator;
 assert(quick, 'quick-create regression is missing', Object.keys(regressions));
 assert(minimal, 'minimal-UI regression is missing', Object.keys(regressions));
+assert(activity, 'command activity regression is missing', Object.keys(regressions));
 assert(/^Terminal \d+$/u.test(quick.automaticTitle), 'quick create did not use an automatic title', quick);
 assert(quick.cwd === os.homedir(), 'quick create did not start in Home', quick);
 assert(quick.profile === 'default' && quick.private === false, 'quick create did not use default/normal settings', quick);
@@ -147,6 +149,14 @@ assert(quick.doubleClickCreatedCount === 1 && quick.postCount === 1, 'double-cli
 assert(JSON.stringify(quick.postBody) === '{}' && quick.regularButtonOpenedDialog === false, 'quick create did not POST {} without a dialog', quick);
 assert(minimal.rawXterm === true && minimal.removedSelectorsPresent.length === 0, 'removed UI is present or raw xterm is missing', minimal);
 assert(minimal.remainingDialogs.length === 1 && minimal.remainingDialogs[0] === 'pasteDialog', 'a removed creation/options dialog remains', minimal);
+assert(activity.running?.text === 'command running…'
+  && activity.running?.ariaBusy === 'true'
+  && activity.finished?.text === 'command finished'
+  && activity.finished?.ariaBusy === null
+  && activity.finished?.detail?.includes('ready for the next command'), 'command activity indicator did not expose running and finished states', activity);
+assert(activity.legacyFallback?.running?.source === 'process'
+  && activity.legacyFallback?.running?.ariaBusy === 'true'
+  && activity.legacyFallback?.finished?.text === 'command finished', 'legacy-session foreground-process fallback failed', activity);
 
 if (!process.env.WARPISH_BROWSER_ONLY) {
   const required = [

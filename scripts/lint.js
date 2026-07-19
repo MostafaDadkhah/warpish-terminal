@@ -20,6 +20,7 @@ const terminalKeyDataJs = read('public/terminal-key-data.js');
 const terminalInputJs = read('public/terminal-input.js');
 const serverJs = read('server.js');
 const storageJs = read('storage.js');
+const shellIntegrationZsh = read('scripts/warpish-shell-integration.zsh');
 const stylesCss = read('public/styles.css');
 const smokeJs = read('scripts/smoke.js');
 const browserRegressionJs = read('scripts/browser-regressions.js');
@@ -190,6 +191,18 @@ if (!appJs.includes("msg.type === 'input-ack'")
   || !serverJs.includes('runtimeEpoch: runtime.epoch')
   || !serverJs.includes('inputWasAccepted(runtime, ws, msg.inputId)')) {
   fail('Controller-safe acknowledged input, native focus reports, and generation-safe terminal writes must remain enabled.');
+}
+
+if (!appJs.includes("msg.type === 'command-state'")
+  || !appJs.includes("setStatus('running', 'command running…'")
+  || !stylesCss.includes('.status-running')
+  || !serverJs.includes('enableTmuxSessionPassthrough(session.id)')
+  || !serverJs.includes("type: 'command-state'")
+  || !serverJs.includes("marker.event === 'ActivityStart'")
+  || !shellIntegrationZsh.includes('WARPISH_ACTIVITY_INTEGRATION')
+  || !shellIntegrationZsh.includes('ActivityStart;id=')
+  || !shellIntegrationZsh.includes('ActivityEnd;id=')) {
+  fail('Live command-running and command-finished activity signaling must remain enabled.');
 }
 
 if (!indexHtml.includes('interactive-widget=resizes-content')

@@ -1,7 +1,7 @@
 # Warpish shell integration for zsh.
 # Loaded only inside Warpish Terminal sessions via an isolated ZDOTDIR.
-# Emits CWD metadata for new sessions. Start/End markers are available only
-# while retiring already-running sessions that explicitly opt into legacy mode.
+# Emits CWD metadata plus lightweight, non-persistent activity markers without command text.
+# Legacy Start/End command-block markers remain opt-in for older sessions.
 
 if [[ -n "${__WARPISH_SHELL_INTEGRATION_LOADED:-}" ]]; then
   return 0
@@ -56,13 +56,26 @@ __warpish_marker() {
   __warpish_emit "$1"
 }
 
+__warpish_activity_marker() {
+  # Warpish enables tmux passthrough before attaching its outer PTY. The tmux
+  # envelope is removed before the marker reaches Node, so command activity is
+  # immediate and never touches SQLite or the browser's terminal surface.
+  command printf '\033Ptmux;\033\033]697;%s\007\033\\' "$1"
+}
+
 __warpish_preexec() {
   emulate -L zsh
-  [[ "${WARPISH_BLOCK_INTEGRATION:-0}" == 1 ]] || return 0
   local command_line="$1"
   [[ -z "$command_line" ]] && return 0
   [[ "$command_line" == __warpish_* ]] && return 0
 
+  if [[ "${WARPISH_ACTIVITY_INTEGRATION:-0}" == 1 ]]; then
+    __WARPISH_ACTIVITY_ID="${WARPISH_SESSION_ID:-warpish}-$(command date +%s)-$RANDOM"
+    __WARPISH_ACTIVITY_STARTED="$(__warpish_now)"
+    __warpish_activity_marker "ActivityStart;id=${__WARPISH_ACTIVITY_ID};started=${__WARPISH_ACTIVITY_STARTED}"
+  fi
+
+  [[ "${WARPISH_BLOCK_INTEGRATION:-0}" == 1 ]] || return 0
   __WARPISH_BLOCK_ID="${WARPISH_SESSION_ID:-warpish}-$(command date +%s)-$RANDOM"
   __WARPISH_BLOCK_STARTED="$(__warpish_now)"
   __warpish_marker "Start;id=${__WARPISH_BLOCK_ID};started=${__WARPISH_BLOCK_STARTED};command=$(__warpish_b64 "$command_line")"
@@ -71,6 +84,11 @@ __warpish_preexec() {
 __warpish_precmd() {
   local exit_code=$?
   emulate -L zsh
+  if [[ -n "${__WARPISH_ACTIVITY_ID:-}" ]]; then
+    local activity_ended="$(__warpish_now)"
+    __warpish_activity_marker "ActivityEnd;id=${__WARPISH_ACTIVITY_ID};ended=${activity_ended};status=${exit_code}"
+    unset __WARPISH_ACTIVITY_ID __WARPISH_ACTIVITY_STARTED
+  fi
   if [[ -n "${__WARPISH_BLOCK_ID:-}" ]]; then
     local ended="$(__warpish_now)"
     __warpish_marker "End;id=${__WARPISH_BLOCK_ID};ended=${ended};status=${exit_code}"
@@ -83,7 +101,7 @@ __warpish_precmd() {
   return $exit_code
 }
 
-if [[ "${WARPISH_BLOCK_INTEGRATION:-0}" == 1 ]]; then
+if [[ "${WARPISH_ACTIVITY_INTEGRATION:-0}" == 1 || "${WARPISH_BLOCK_INTEGRATION:-0}" == 1 ]]; then
   add-zsh-hook preexec __warpish_preexec 2>/dev/null || true
 fi
 add-zsh-hook precmd __warpish_precmd 2>/dev/null || true

@@ -676,6 +676,90 @@ async function testMinimalUi(page) {
   };
 }
 
+async function testCommandActivityIndicator(page, sessionId) {
+  await selectLiveSession(page, sessionId);
+  const command = 'sleep 1.4\r';
+  await page.eval(`(() => { term.input(${JSON.stringify(command)}, true); return true; })()`);
+
+  const running = await page.waitFor(`(() => {
+    const card = document.querySelector('#statusCard');
+    if (!card?.classList.contains('status-running')
+      || card.getAttribute('aria-busy') !== 'true'
+      || statusText.textContent !== 'command running…') return false;
+    return {
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+      className: card.className,
+      ariaBusy: card.getAttribute('aria-busy'),
+    };
+  })()`, 10_000, 'visible command-running status');
+
+  await delay(150);
+  const observedActivity = await page.eval(`(() => commandActivity?.running
+    ? {
+      source: commandActivity.source,
+      activityId: commandActivity.activityId,
+      startedAt: commandActivity.startedAt,
+      detail: sessionText.textContent,
+    }
+    : null)()`);
+
+  const finished = await page.waitFor(`(() => {
+    const card = document.querySelector('#statusCard');
+    if (statusText.textContent !== 'command finished'
+      || card?.classList.contains('status-running')
+      || card?.hasAttribute('aria-busy')) return false;
+    return {
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+      className: card.className,
+      ariaBusy: card.getAttribute('aria-busy'),
+    };
+  })()`, 10_000, 'visible command-finished status');
+
+  assert(running.detail.includes('Ctrl+C') || running.detail.includes('waiting for the shell'), 'running status lacks a wait/cancel cue', running);
+  assert(finished.detail.includes('ready for the next command'), 'finished status lacks a ready cue', finished);
+
+  const legacySession = await createDefaultSession({});
+  await selectLiveSession(page, legacySession.id);
+  await page.eval(`(() => { term.input('export WARPISH_ACTIVITY_INTEGRATION=0\\r', true); return true; })()`);
+  await page.waitFor(`statusText.textContent === 'command finished' && !commandActivity`, 10_000, 'activity integration disable command');
+  await page.waitFor(`statusText.textContent === 'connected' && !commandActivity`, 10_000, 'legacy fallback setup readiness');
+
+  await page.eval(`(() => { term.input('sleep 1.4\\r', true); return true; })()`);
+  const legacyRunning = await page.waitFor(`(() => commandActivity?.source === 'process'
+    && document.querySelector('#statusCard')?.classList.contains('status-running')
+    ? {
+      source: commandActivity.source,
+      processName: commandActivity.processName,
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+      ariaBusy: document.querySelector('#statusCard')?.getAttribute('aria-busy'),
+    }
+    : false)()`, 10_000, 'legacy-session foreground process activity');
+  const legacyFinished = await page.waitFor(`(() => statusText.textContent === 'command finished'
+    && !commandActivity
+    ? {
+      text: statusText.textContent,
+      detail: sessionText.textContent,
+      ariaBusy: document.querySelector('#statusCard')?.getAttribute('aria-busy'),
+    }
+    : false)()`, 10_000, 'legacy-session command completion');
+
+  return {
+    sessionId,
+    running,
+    observedActivity,
+    finished,
+    exactShellActivityObserved: observedActivity?.source === 'shell',
+    legacyFallback: {
+      sessionId: legacySession.id,
+      running: legacyRunning,
+      finished: legacyFinished,
+    },
+  };
+}
+
 async function testRawXtermResume(page, sessionId) {
   await selectLiveSession(page, sessionId);
   const marker = `__WARPISH_RAW_${process.pid}_${Date.now()}__`;
@@ -1299,6 +1383,10 @@ async function main() {
 
   regressions.quickCreateDefaults = await testQuickCreate(page);
   regressions.minimalUi = await testMinimalUi(page);
+  regressions.commandActivityIndicator = await testCommandActivityIndicator(
+    page,
+    regressions.quickCreateDefaults.sessionId,
+  );
 
   if (selected.has('raw-resume')) {
     regressions.rawXtermResume = await testRawXtermResume(page, regressions.quickCreateDefaults.sessionId);

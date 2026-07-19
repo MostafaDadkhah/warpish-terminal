@@ -43,6 +43,9 @@ const MAX_BLOCK_ID_CHARS = 180;
 const MAX_INPUT_ID_CHARS = 160;
 const MAX_WORKER_STDIN_BUFFER_BYTES = 1024 * 1024;
 const SESSION_PROFILE_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,39})$/;
+const COMMAND_PROBE_INTERVAL_MS = 120;
+const COMMAND_PROBE_PENDING_LIMIT = 12;
+const COMMAND_RUNNING_PROBE_INTERVAL_MS = 350;
 const WS_HEARTBEAT_INTERVAL_MS = clampNumber(process.env.WARPISH_WS_HEARTBEAT_MS, 30_000, 1000, 120_000);
 const PTY_RUNTIME_IDLE_GRACE_MS = clampNumber(process.env.WARPISH_PTY_IDLE_GRACE_MS, 30_000, 100, 600_000);
 const TMUX_COMMAND_TIMEOUT_MS = clampNumber(process.env.WARPISH_TMUX_TIMEOUT_MS, 5000, 250, 60_000);
@@ -316,6 +319,26 @@ function runTmux(args, options = {}) {
   }
 }
 
+function enableTmuxSessionPassthrough(sessionId) {
+  let previous = 'off';
+  try {
+    previous = runTmux(['show-options', '-t', sessionId, '-v', 'allow-passthrough']).trim() || 'off';
+  } catch {}
+  runTmux(['set-option', '-t', sessionId, 'allow-passthrough', 'on']);
+  return ['off', 'on', 'all'].includes(previous) ? previous : 'off';
+}
+
+function restoreRuntimeTmuxPassthrough(runtime) {
+  if (!runtime || runtime.passthroughRestored) return;
+  runtime.passthroughRestored = true;
+  try {
+    runTmux([
+      'set-option', '-t', runtime.sessionId,
+      'allow-passthrough', runtime.allowPassthroughPrevious || 'off',
+    ]);
+  } catch {}
+}
+
 function tmuxSessionEnvironmentValue(sessionId, name) {
   try {
     const line = runTmux(['show-environment', '-t', sessionId, name]).trim();
@@ -334,6 +357,25 @@ function tmuxPaneCurrentPath(sessionId) {
   } catch {
     return null;
   }
+}
+
+function tmuxPaneCurrentCommand(sessionId) {
+  try {
+    const activeLine = runTmux([
+      'list-panes', '-s', '-t', sessionId,
+      '-F', '#{window_active}|#{pane_active}|#{pane_current_command}',
+    ])
+      .split('\n')
+      .find((line) => line.startsWith('1|1|'));
+    return String(activeLine || '').split('|').slice(2).join('|').trim().slice(0, 160);
+  } catch {
+    return '';
+  }
+}
+
+function foregroundCommandIsShell(command) {
+  const value = String(command || '').trim();
+  return !value || value === path.basename(SHELL);
 }
 
 function tmuxPaneHistoryState(sessionId) {
@@ -409,6 +451,7 @@ function warpishShellCommand(sessionId) {
     `WARPISH_DATABASE_FILE=${shellQuote(DATABASE_FILE)}`,
     `WARPISH_EVENT_RECORDER=${shellQuote(SHELL_EVENT_RECORDER)}`,
     `WARPISH_PYTHON=${shellQuote(PYTHON)}`,
+    'WARPISH_ACTIVITY_INTEGRATION=1',
     'WARPISH_BLOCK_INTEGRATION=0',
     'WARPISH_PRIVATE_SESSION=0',
     'WARPISH_SESSION_PROFILE=default',
@@ -466,6 +509,13 @@ function validBlockMarkerId(sessionId, value) {
 
 function validateBlockMarker(sessionId, marker) {
   if (!validBlockMarkerId(sessionId, marker?.id)) return false;
+  if (marker.event === 'ActivityStart') {
+    return validMarkerEpoch(marker.started);
+  }
+  if (marker.event === 'ActivityEnd') {
+    const status = Number(marker.status);
+    return validMarkerEpoch(marker.ended) && Number.isInteger(status) && status >= 0 && status <= 255;
+  }
   if (marker.event === 'Start') {
     if (!validMarkerEpoch(marker.started)) return false;
     const command = decodeMarkerCommand(marker.command);
@@ -663,7 +713,26 @@ function updateSessionCwd(sessionId, encodedPath) {
 function handleBlockMarker(sessionId, payload) {
   const marker = parseMarkerPayload(payload);
   if (!marker) return null;
-  if ((marker.event === 'Start' || marker.event === 'End') && !validateBlockMarker(sessionId, marker)) return null;
+  if (
+    ['ActivityStart', 'ActivityEnd', 'Start', 'End'].includes(marker.event)
+    && !validateBlockMarker(sessionId, marker)
+  ) return null;
+  if (marker.event === 'ActivityStart') {
+    return {
+      type: 'command-start',
+      activity: { id: marker.id, startedAt: epochToIso(marker.started) },
+    };
+  }
+  if (marker.event === 'ActivityEnd') {
+    return {
+      type: 'command-end',
+      activity: {
+        id: marker.id,
+        endedAt: epochToIso(marker.ended),
+        exitCode: Number(marker.status),
+      },
+    };
+  }
   if ((marker.event === 'Start' || marker.event === 'End') && sessionIsPrivate(sessionId)) return null;
   if (marker.event === 'Start') return { type: 'block-start', block: upsertBlockStart(sessionId, marker) };
   if (marker.event === 'End') {
@@ -1136,7 +1205,6 @@ function createSession() {
     runTmux(['set-option', '-t', id, 'status', 'off']);
     runTmux(['set-option', '-t', id, 'history-limit', '50000']);
     runTmux(['set-option', '-t', id, 'allow-rename', 'off']);
-    runTmux(['set-option', '-t', id, 'allow-passthrough', 'on']);
     runTmux(['set-option', '-t', id, 'focus-events', 'on']);
     runTmux(['set-environment', '-u', '-t', id, 'NO_COLOR']);
     runTmux(['set-environment', '-t', id, 'COLORTERM', 'truecolor']);
@@ -1145,6 +1213,7 @@ function createSession() {
     runTmux(['set-environment', '-t', id, 'WARPISH_DATABASE_FILE', DATABASE_FILE]);
     runTmux(['set-environment', '-t', id, 'WARPISH_EVENT_RECORDER', SHELL_EVENT_RECORDER]);
     runTmux(['set-environment', '-t', id, 'WARPISH_PYTHON', PYTHON]);
+    runTmux(['set-environment', '-t', id, 'WARPISH_ACTIVITY_INTEGRATION', '1']);
     runTmux(['set-environment', '-t', id, 'WARPISH_BLOCK_INTEGRATION', '0']);
     runTmux(['set-environment', '-t', id, 'WARPISH_PRIVATE_SESSION', '0']);
     runTmux(['set-environment', '-t', id, 'WARPISH_SESSION_PROFILE', profile]);
@@ -1616,6 +1685,189 @@ function sendWsInputError(ws, code, message) {
   return sendWsControl(ws, { type: 'server-error', code, message });
 }
 
+function initialRuntimeCommandState(sessionId, privateSession = false) {
+  const record = readMetadata().sessions?.[sessionId];
+  const activeBlock = record?.blocks?.find((block) => (
+    block.id === record.activeBlockId && block.status === 'running'
+  ));
+  if (activeBlock) {
+    return {
+      running: true,
+      phase: 'running',
+      source: 'shell',
+      activityId: activeBlock.id,
+      startedAt: activeBlock.startedAt || null,
+      processName: privateSession ? '' : path.basename(SHELL),
+    };
+  }
+
+  const processName = tmuxPaneCurrentCommand(sessionId);
+  if (foregroundCommandIsShell(processName)) return null;
+  return {
+    running: true,
+    phase: 'running',
+    source: 'process',
+    activityId: null,
+    startedAt: null,
+    processName: privateSession ? '' : processName,
+  };
+}
+
+function runtimeCommandStateMessage(runtime, extra = {}) {
+  return {
+    type: 'command-state',
+    sessionId: runtime.sessionId,
+    running: Boolean(runtime.commandState?.running),
+    state: runtime.commandState || null,
+    ...extra,
+  };
+}
+
+function publishRuntimeCommandState(runtime, state, extra = {}) {
+  const previous = runtime.commandState;
+  runtime.commandState = state?.running ? state : null;
+  const changed = JSON.stringify(previous || null) !== JSON.stringify(runtime.commandState || null);
+  if (changed || extra.completed) {
+    broadcastRuntimeControl(runtime, runtimeCommandStateMessage(runtime, extra));
+  }
+}
+
+function stopRuntimeCommandProbe(runtime) {
+  runtime.commandProbeToken += 1;
+  clearRuntimeTimer(runtime, 'commandProbeTimer');
+  runtime.commandProbeAttempts = 0;
+  runtime.commandProbeSawBusy = false;
+}
+
+function scheduleRuntimeCommandProbe(runtime, token, delay = COMMAND_PROBE_INTERVAL_MS) {
+  if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
+  clearRuntimeTimer(runtime, 'commandProbeTimer');
+  runtime.commandProbeTimer = setTimeout(() => {
+    runtime.commandProbeTimer = null;
+    if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
+
+    if (runtime.commandState?.source === 'shell') {
+      runtime.eventReader?.poll();
+      if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
+      if (runtime.commandState?.source === 'shell') {
+        scheduleRuntimeCommandProbe(runtime, token, COMMAND_RUNNING_PROBE_INTERVAL_MS);
+      }
+      return;
+    }
+
+    // The shell recorder writes activity events synchronously, but a quiet
+    // command such as `sleep` may not produce another PTY chunk to trigger the
+    // normal event-reader poll. Consume the journal before using the foreground
+    // process fallback so exact Start/End state never depends on incidental output.
+    runtime.eventReader?.poll();
+    if (runtime.closed || runtime.stopping || token !== runtime.commandProbeToken) return;
+    if (runtime.commandState?.source === 'shell') return;
+
+    runtime.commandProbeAttempts += 1;
+    if (runtime.commandState?.source === 'input' && runtime.commandProbeAttempts < 3) {
+      scheduleRuntimeCommandProbe(runtime, token);
+      return;
+    }
+    const processName = tmuxPaneCurrentCommand(runtime.sessionId);
+    if (!foregroundCommandIsShell(processName)) {
+      runtime.commandProbeSawBusy = true;
+      publishRuntimeCommandState(runtime, {
+        running: true,
+        phase: 'running',
+        source: 'process',
+        activityId: null,
+        startedAt: runtime.commandState?.startedAt || new Date().toISOString(),
+        processName: runtime.private ? '' : processName,
+      });
+      scheduleRuntimeCommandProbe(runtime, token, COMMAND_RUNNING_PROBE_INTERVAL_MS);
+      return;
+    }
+
+    if (runtime.commandProbeSawBusy || runtime.commandProbeAttempts >= COMMAND_PROBE_PENDING_LIMIT) {
+      publishRuntimeCommandState(runtime, null, { completed: true });
+      stopRuntimeCommandProbe(runtime);
+      return;
+    }
+    scheduleRuntimeCommandProbe(runtime, token);
+  }, delay);
+  runtime.commandProbeTimer.unref?.();
+}
+
+function startRuntimeCommandProbe(runtime, { submitted = false } = {}) {
+  if (runtime.commandState?.source === 'shell') return;
+  stopRuntimeCommandProbe(runtime);
+  const token = runtime.commandProbeToken;
+  if (submitted) {
+    publishRuntimeCommandState(runtime, {
+      running: true,
+      phase: 'pending',
+      source: 'input',
+      activityId: null,
+      startedAt: new Date().toISOString(),
+      processName: '',
+    });
+    scheduleRuntimeCommandProbe(runtime, token);
+    return;
+  }
+
+  const processName = tmuxPaneCurrentCommand(runtime.sessionId);
+  const processBusy = !foregroundCommandIsShell(processName);
+  runtime.commandProbeSawBusy = processBusy;
+  if (processBusy) {
+    publishRuntimeCommandState(runtime, {
+      running: true,
+      phase: 'running',
+      source: 'process',
+      activityId: null,
+      startedAt: runtime.commandState?.startedAt || null,
+      processName: runtime.private ? '' : processName,
+    });
+  }
+  scheduleRuntimeCommandProbe(
+    runtime,
+    token,
+    processBusy ? COMMAND_RUNNING_PROBE_INTERVAL_MS : COMMAND_PROBE_INTERVAL_MS,
+  );
+}
+
+function noteRuntimeCommandSubmission(runtime, bytes) {
+  if (!Buffer.from(bytes || '').some((byte) => byte === 0x0a || byte === 0x0d)) return;
+  if (runtime.commandState?.source === 'shell') return;
+  if (runtime.commandState?.source === 'process') {
+    if (!runtime.commandProbeTimer) startRuntimeCommandProbe(runtime);
+    return;
+  }
+  startRuntimeCommandProbe(runtime, { submitted: true });
+}
+
+function handleRuntimeShellEvent(runtime, event) {
+  if (!event) return;
+  if (event.type === 'command-start' || event.type === 'block-start') {
+    const activity = event.activity || event.block || {};
+    stopRuntimeCommandProbe(runtime);
+    publishRuntimeCommandState(runtime, {
+      running: true,
+      phase: 'running',
+      source: 'shell',
+      activityId: activity.id || null,
+      startedAt: activity.startedAt || new Date().toISOString(),
+      processName: '',
+    });
+    scheduleRuntimeCommandProbe(runtime, runtime.commandProbeToken, COMMAND_RUNNING_PROBE_INTERVAL_MS);
+  } else if (event.type === 'command-end' || event.type === 'block-end') {
+    const activity = event.activity || event.block || {};
+    if (!runtime.commandState?.activityId || !activity.id || runtime.commandState.activityId === activity.id) {
+      stopRuntimeCommandProbe(runtime);
+      publishRuntimeCommandState(runtime, null, {
+        completed: true,
+        exitCode: Number.isInteger(activity.exitCode) ? activity.exitCode : null,
+        durationMs: Number.isFinite(activity.durationMs) ? activity.durationMs : null,
+      });
+    }
+  }
+  broadcastRuntimeControl(runtime, event);
+}
+
 function writeRuntimeInput(runtime, ws, bytes) {
   if (!bytes?.length) return true;
   const result = queueWorkerMessage(runtime.worker, {
@@ -1623,6 +1875,7 @@ function writeRuntimeInput(runtime, ws, bytes) {
     data: Buffer.from(bytes).toString('base64'),
   });
   if (!result.ok) sendWsInputError(ws, result.code, result.message);
+  else noteRuntimeCommandSubmission(runtime, bytes);
   return result.ok;
 }
 
@@ -1788,6 +2041,8 @@ function terminateSessionRuntime(runtime) {
   if (!runtime || runtime.closed || runtime.stopping) return;
   runtime.stopping = true;
   clearRuntimeTimer(runtime, 'idleTeardownTimer');
+  clearRuntimeTimer(runtime, 'commandProbeTimer');
+  restoreRuntimeTmuxPassthrough(runtime);
   writeWorker(runtime.worker, { type: 'kill' });
   if (Number.isInteger(runtime.workerPid) && runtime.workerPid > 0) {
     try { process.kill(runtime.workerPid, 'SIGHUP'); } catch {}
@@ -1819,6 +2074,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   const privateSession = Boolean(persistedRecord?.private || session.private);
   const profile = persistedRecord?.profile || session.profile || 'default';
   let privateHistoryState = null;
+  let allowPassthroughPrevious = 'off';
   try {
     // These options affect future panes. An existing private pane is accepted
     // below only if its own immutable history capacity is already zero.
@@ -1829,6 +2085,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     runTmux(['set-environment', '-u', '-t', session.id, 'NO_COLOR']);
     runTmux(['set-environment', '-t', session.id, 'COLORTERM', 'truecolor']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_TERMINAL', '1']);
+    runTmux(['set-environment', '-t', session.id, 'WARPISH_ACTIVITY_INTEGRATION', '1']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_BLOCK_INTEGRATION', '0']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_PRIVATE_SESSION', privateSession ? '1' : '0']);
     runTmux(['set-environment', '-t', session.id, 'WARPISH_SESSION_PROFILE', profile]);
@@ -1841,6 +2098,13 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   }
   if (privateSession && !privateHistoryState?.safe) {
     throw requestError('private session is quarantined because an existing pane has a nonzero tmux history capacity', 409);
+  }
+  try {
+    // Scope passthrough to this Warpish-owned session. It is restored when the
+    // web PTY runtime tears down, leaving unrelated tmux sessions untouched.
+    allowPassthroughPrevious = enableTmuxSessionPassthrough(session.id);
+  } catch (error) {
+    console.warn(`Could not enable tmux activity passthrough for ${session.id}; using process-state fallback: ${error.message || error}`);
   }
   const worker = createPtyWorker({
     sessionId: session.id,
@@ -1862,6 +2126,13 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     clientDimensions: new Map(),
     acceptedInputIds: new Map(),
     controller: null,
+    allowPassthroughPrevious,
+    passthroughRestored: false,
+    commandState: initialRuntimeCommandState(session.id, privateSession),
+    commandProbeTimer: null,
+    commandProbeToken: 0,
+    commandProbeAttempts: 0,
+    commandProbeSawBusy: false,
     stdoutBuffer: '',
     stderrBuffer: '',
     forceKillTimer: null,
@@ -1880,10 +2151,10 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
       broadcastRuntimeData(runtime, bytes);
     },
     onBlockEvent(event) {
-      broadcastRuntimeControl(runtime, event);
+      handleRuntimeShellEvent(runtime, event);
     },
   });
-  runtime.eventReader = createEventReader(session.id, (event) => broadcastRuntimeControl(runtime, event));
+  runtime.eventReader = createEventReader(session.id, (event) => handleRuntimeShellEvent(runtime, event));
 
   worker.stdin.on('error', (error) => {
     runtime.stderrBuffer = `${runtime.stderrBuffer}\nstdin ${error.code || 'error'}: ${error.message || error}`.slice(-4096);
@@ -1920,6 +2191,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
           runtimeEpoch: runtime.epoch,
           cwd: runtime.cwd,
           shell: SHELL,
+          commandState: runtime.commandState,
         });
       } else if (message.type === 'exit') {
         runtime.lastExitMessage = { type: 'detached', exitCode: message.exitCode, signal: message.signal };
@@ -1946,6 +2218,8 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     runtime.closed = true;
     clearRuntimeTimer(runtime, 'forceKillTimer');
     clearRuntimeTimer(runtime, 'idleTeardownTimer');
+    clearRuntimeTimer(runtime, 'commandProbeTimer');
+    restoreRuntimeTmuxPassthrough(runtime);
     runtime.eventReader.poll();
     runtime.outputProcessor.flush();
     if (sessionRuntimes.get(runtime.sessionId) === runtime) sessionRuntimes.delete(runtime.sessionId);
@@ -1959,6 +2233,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
   });
 
   scheduleRuntimeIdleTeardown(runtime);
+  if (runtime.commandState?.source === 'process') startRuntimeCommandProbe(runtime);
   return runtime;
 }
 
@@ -2071,6 +2346,7 @@ wss.on('connection', (ws, req) => {
       runtimeEpoch: runtime.epoch,
       cwd: runtime.cwd,
       shell: SHELL,
+      commandState: runtime.commandState,
     });
   }
   if (!created) sendRuntimeSnapshot(ws, sessionId);
@@ -2126,6 +2402,7 @@ wss.on('connection', (ws, req) => {
         try {
           writeTmuxInput(sessionId, inputData);
           accepted = true;
+          noteRuntimeCommandSubmission(runtime, Buffer.from(inputData, 'utf8'));
         } catch (error) {
           sendWsControl(ws, { type: 'server-error', message: `tmux input failed: ${error.message || error}` });
         }
