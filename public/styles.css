@@ -442,6 +442,10 @@ button.danger:hover {
   max-width: 100%;
 }
 
+.xterm-rows .xterm-cursor.warpish-rtl-cursor {
+  transform: translateX(var(--warpish-rtl-cursor-shift));
+}
+
 .xterm-viewport {
   border-radius: 16px;
 }

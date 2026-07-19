@@ -926,6 +926,34 @@ async function testCommandActivityIndicator(page, sessionId) {
     }
     : false)()`, 10_000, 'interactive program input-ready state');
 
+  const persianDraftText = 'فقط کلمه آماده را جواب بده';
+  await page.eval(`(() => { term.input(${JSON.stringify(persianDraftText)}, true); return true; })()`);
+  const rtlDraft = await page.waitFor(`(() => {
+    const cursor = document.querySelector('#terminal .xterm-rows .xterm-cursor');
+    const joinedSpan = cursor?.previousElementSibling;
+    if (!cursor?.classList.contains('warpish-rtl-cursor')
+      || joinedSpan?.textContent !== ${JSON.stringify(persianDraftText)}) return false;
+    const cursorRect = cursor.getBoundingClientRect();
+    const joinedRect = joinedSpan.getBoundingClientRect();
+    return {
+      text: cursor.parentElement?.textContent || '',
+      joinedText: joinedSpan.textContent,
+      joinedElementCount: [...cursor.parentElement.children]
+        .filter((element) => element.textContent === ${JSON.stringify(persianDraftText)}).length,
+      cursorLeft: cursorRect.left,
+      joinedLeft: joinedRect.left,
+      cursorTransform: getComputedStyle(cursor).transform,
+      rowDirection: getComputedStyle(cursor.parentElement).direction,
+      rowUnicodeBidi: getComputedStyle(cursor.parentElement).unicodeBidi,
+    };
+  })()`, 10_000, 'readable Persian draft and reconciled cursor');
+  assert(rtlDraft.joinedElementCount === 1
+    && Math.abs(rtlDraft.cursorLeft - rtlDraft.joinedLeft) <= 1
+    && rtlDraft.cursorTransform !== 'none'
+    && rtlDraft.rowDirection === 'ltr'
+    && rtlDraft.rowUnicodeBidi !== 'plaintext', 'Persian input was not joined and cursor-reconciled inside the native xterm grid', rtlDraft);
+  await page.eval(`(() => { term.input('\x15', true); return true; })()`);
+
   await page.eval(`(() => { term.input('draft without enter', true); return true; })()`);
   await delay(600);
   const idleDraft = await page.eval(`(() => ({
@@ -985,6 +1013,7 @@ async function testCommandActivityIndicator(page, sessionId) {
       finished: interactiveFinished,
       foregroundAfterTurn,
     },
+    persianInput: rtlDraft,
   };
 }
 
