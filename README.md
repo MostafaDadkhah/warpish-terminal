@@ -6,6 +6,7 @@ What it does:
 - Opens a modern Chrome UI with a left sidebar.
 - Sidebar shows terminal session history with live/stopped state and recent preview.
 - Click a live session to continue it, or open a stopped session as read-only history.
+- Close and permanently remove an individual terminal with the `×` button on its sidebar card. Closing a live terminal asks for confirmation because its running processes will be terminated.
 - `New terminal` starts immediately in Home with an automatic title, the `default` profile, and normal history. There is no creation form or custom title/directory/profile/private option in the browser UI.
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.

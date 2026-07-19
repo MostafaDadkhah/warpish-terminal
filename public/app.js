@@ -88,6 +88,7 @@ let reconnectAttempts = 0;
 let terminalControlRole = 'controller';
 let controlClaimPending = false;
 let newSessionCreationPending = false;
+const closingSessionIds = new Set();
 let sessionsRequestSerial = 0;
 let sessionsRefreshPending = false;
 let sessionsRefreshQueued = null;
@@ -325,10 +326,11 @@ function updateSessionHistoryActions() {
 
 function captureSessionListUiState() {
   const active = document.activeElement;
-  const focusedCard = active && sessionList.contains(active) ? active.closest?.('.session-card') : null;
+  const focusedEntry = active && sessionList.contains(active) ? active.closest?.('.session-entry') : null;
   return {
     scrollTop: sessionList.scrollTop,
-    focusedSessionId: focusedCard?.dataset?.sessionId || '',
+    focusedSessionId: focusedEntry?.dataset?.sessionId || '',
+    focusedAction: active?.dataset?.sessionAction || 'select',
   };
 }
 
@@ -336,13 +338,15 @@ function restoreSessionListUiState(state) {
   if (!state) return;
   sessionList.scrollTop = state.scrollTop;
   if (!state.focusedSessionId) return;
-  const card = [...sessionList.querySelectorAll('.session-card')]
-    .find((candidate) => candidate.dataset.sessionId === state.focusedSessionId && !candidate.disabled);
-  if (!card) return;
+  const entry = [...sessionList.querySelectorAll('.session-entry')]
+    .find((candidate) => candidate.dataset.sessionId === state.focusedSessionId);
+  const control = entry?.querySelector(`[data-session-action="${state.focusedAction}"]`)
+    || entry?.querySelector('[data-session-action="select"]');
+  if (!control || control.disabled) return;
   try {
-    card.focus({ preventScroll: true });
+    control.focus({ preventScroll: true });
   } catch {
-    card.focus();
+    control.focus();
   }
   sessionList.scrollTop = state.scrollTop;
 }
@@ -363,11 +367,17 @@ function renderSessions() {
   }
 
   for (const session of sessions) {
+    const entry = document.createElement('div');
+    entry.className = 'session-entry';
+    entry.dataset.sessionId = session.id;
+
     const button = document.createElement('button');
+    button.type = 'button';
     button.className = 'session-card'
       + (session.id === currentSessionId ? ' active' : '')
       + (session.alive ? '' : ' dead');
     button.dataset.sessionId = session.id;
+    button.dataset.sessionAction = 'select';
     if (session.id === currentSessionId) button.setAttribute('aria-current', 'true');
 
     const title = document.createElement('div');
@@ -412,7 +422,24 @@ function renderSessions() {
       else if (session.alive) connectToSession(session.id);
       else selectStoppedSession(session.id);
     });
-    sessionList.appendChild(button);
+
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'session-close';
+    closeButton.dataset.sessionAction = 'close';
+    closeButton.disabled = closingSessionIds.has(session.id);
+    closeButton.setAttribute('aria-label', 'Close and remove ' + session.title);
+    closeButton.title = session.alive
+      ? 'Close terminal and remove it from the list'
+      : 'Remove stopped terminal from the list';
+    closeButton.textContent = '×';
+    closeButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      closeAndRemoveSession(session.id).catch(() => {});
+    });
+
+    entry.append(button, closeButton);
+    sessionList.appendChild(entry);
   }
 
   updateHeader();
@@ -693,6 +720,65 @@ async function clearStoppedSessions() {
   } catch (error) {
     setStatus('bad', 'clear failed', error.message);
   } finally {
+    endSessionsMutation();
+    updateSessionHistoryActions();
+  }
+}
+
+async function closeAndRemoveSession(sessionId) {
+  if (closingSessionIds.has(sessionId)) return false;
+  const sessionIndex = sessions.findIndex((candidate) => candidate.id === sessionId);
+  const session = sessions[sessionIndex];
+  if (!session) return false;
+
+  if (session.alive && !window.confirm(
+    'Close "' + session.title + '"? Any process running in this terminal will be terminated and its history will be removed.',
+  )) {
+    return false;
+  }
+
+  const closingCurrentSession = currentSessionId === sessionId;
+  closingSessionIds.add(sessionId);
+  beginSessionsMutation();
+
+  if (closingCurrentSession) {
+    clearReconnectTimer();
+    connectionSerial += 1;
+    disconnectCurrent({ quiet: true });
+    discardPendingTerminalInputs(sessionId);
+    currentSessionId = null;
+    terminalControlRole = 'pending';
+    terminalCard.dataset.controlRole = terminalControlRole;
+    controlClaimPending = false;
+    resetCommandActivity();
+    resetTerminalSurface();
+    updateHeader();
+  }
+
+  try {
+    const payload = await api('/api/sessions/' + encodeURIComponent(sessionId) + '?purge=1', {
+      method: 'DELETE',
+      timeoutMs: 20000,
+    });
+    sessions = payload.sessions || [];
+    renderSessions();
+
+    if (closingCurrentSession) {
+      const nextSession = sessions[Math.min(sessionIndex, sessions.length - 1)] || null;
+      if (nextSession?.privacyQuarantined) selectQuarantinedSession(nextSession.id);
+      else if (nextSession?.alive) connectToSession(nextSession.id);
+      else if (nextSession) selectStoppedSession(nextSession.id);
+      else setStatus('ok', 'terminal closed', session.title + ' removed');
+    } else {
+      setStatus('ok', 'terminal closed', session.title + ' removed');
+    }
+    return true;
+  } catch (error) {
+    if (closingCurrentSession) queueSessionsRefresh({ selectId: sessionId });
+    setStatus('bad', 'close failed', error.message);
+    return false;
+  } finally {
+    closingSessionIds.delete(sessionId);
     endSessionsMutation();
     updateSessionHistoryActions();
   }

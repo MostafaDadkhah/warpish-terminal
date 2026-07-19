@@ -160,6 +160,7 @@ assert(activity.legacyFallback?.running?.source === 'process'
 
 if (!process.env.WARPISH_BROWSER_ONLY) {
   const required = [
+    'individualSessionClose',
     'rawXtermResume',
     'largeOrderedUtf8',
     'nativeFocusReports',
@@ -174,6 +175,16 @@ if (!process.env.WARPISH_BROWSER_ONLY) {
   }
 }
 
+if (regressions.individualSessionClose) {
+  const check = regressions.individualSessionClose;
+  assert(check.liveCloseConfirmed
+    && check.cancelledClosePreservedSession
+    && check.permanentDeleteRequests === 1
+    && check.tmuxTerminated
+    && check.rowRemoved
+    && check.adjacentSessionSelected
+    && check.closeButtonsMatchSessions, 'individual terminal close did not safely terminate and remove exactly one session', check);
+}
 if (regressions.rawXtermResume) {
   const check = regressions.rawXtermResume;
   assert(check.rawInputReachedPty && check.reloadResumed && check.websocketReconnected && check.tmuxSnapshotPreserved, 'raw xterm resume/reconnect failed', check);

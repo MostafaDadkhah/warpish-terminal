@@ -201,6 +201,11 @@ button.danger:hover {
   overflow: auto;
 }
 
+.session-entry {
+  position: relative;
+  width: 100%;
+}
+
 .session-card {
   width: 100%;
   display: grid;
@@ -215,6 +220,7 @@ button.danger:hover {
 
 .session-card:hover {
   background: rgba(255, 255, 255, 0.075);
+  transform: none;
 }
 
 .session-card.active {
@@ -232,7 +238,37 @@ button.danger:hover {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  padding-right: 30px;
   font-weight: 820;
+}
+
+.session-close {
+  position: absolute;
+  z-index: 1;
+  top: 9px;
+  right: 9px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-color: transparent;
+  border-radius: 9px;
+  color: var(--muted);
+  background: rgba(7, 7, 17, 0.42);
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+.session-close:hover {
+  border-color: rgba(251, 113, 133, 0.45);
+  color: #fecdd3;
+  background: rgba(251, 113, 133, 0.16);
+  opacity: 1;
+}
+
+.session-close:focus-visible {
+  opacity: 1;
 }
 
 .session-card-title > span:first-child {
@@ -594,10 +630,28 @@ footer {
     overflow-y: hidden;
   }
 
-  .session-card {
+  .session-entry {
+    width: auto;
     min-width: 180px;
+  }
+
+  .session-card {
+    min-width: 0;
     gap: 4px;
     padding: 7px 9px;
+  }
+
+  .session-card-title {
+    padding-right: 25px;
+  }
+
+  .session-close {
+    top: 5px;
+    right: 5px;
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    font-size: 18px;
   }
 
   .session-preview {

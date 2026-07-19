@@ -503,6 +503,18 @@ function tmuxCaptureText(sessionId) {
   }
 }
 
+function tmuxSessionExists(sessionId) {
+  try {
+    execFileSync(tmuxBin, ['has-session', '-t', sessionId], {
+      stdio: 'ignore',
+      env: tmuxEnvironment,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function waitForTmuxPaneContains(sessionId, marker, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   let lastCapture = '';
@@ -673,6 +685,124 @@ async function testMinimalUi(page) {
     rawXterm: state.rawXterm,
     terminalChildren: state.terminalChildren,
     mobileKeyCount: state.mobileKeyCount,
+  };
+}
+
+async function testIndividualSessionClose(page, survivorSessionId) {
+  const disposable = await createDefaultSession();
+  await selectLiveSession(page, disposable.id);
+
+  const cancelled = await page.eval(`(() => {
+    const entry = [...document.querySelectorAll('.session-entry')]
+      .find((candidate) => candidate.dataset.sessionId === ${JSON.stringify(disposable.id)});
+    const closeButton = entry?.querySelector('[data-session-action="close"]');
+    const selectButton = entry?.querySelector('[data-session-action="select"]');
+    let confirmText = '';
+    const originalConfirm = window.confirm;
+    window.confirm = (message) => {
+      confirmText = String(message);
+      return false;
+    };
+    closeButton?.click();
+    window.confirm = originalConfirm;
+    return {
+      entryFound: Boolean(entry),
+      closeFound: Boolean(closeButton),
+      separateButtons: Boolean(closeButton && selectButton && !selectButton.contains(closeButton)),
+      closeType: closeButton?.type || '',
+      closeLabel: closeButton?.getAttribute('aria-label') || '',
+      confirmText,
+      sessionStillPresent: sessions.some((session) => session.id === ${JSON.stringify(disposable.id)}),
+      currentSessionId,
+    };
+  })()`);
+  await delay(150);
+  const afterCancel = await api('/api/sessions');
+  assert(cancelled.entryFound
+    && cancelled.closeFound
+    && cancelled.separateButtons
+    && cancelled.closeType === 'button'
+    && cancelled.closeLabel.includes(disposable.title), 'individual terminal close control is missing or inaccessible', cancelled);
+  assert(cancelled.confirmText.includes(disposable.title)
+    && cancelled.confirmText.includes('running')
+    && cancelled.sessionStillPresent
+    && cancelled.currentSessionId === disposable.id
+    && afterCancel.sessions.some((session) => session.id === disposable.id)
+    && tmuxSessionExists(disposable.id), 'cancelling a live terminal close still removed or detached it', {
+    cancelled,
+    afterCancel: afterCancel.sessions.map((session) => session.id),
+  });
+  const disposableIndex = afterCancel.sessions.findIndex((session) => session.id === disposable.id);
+  const remainingInSidebarOrder = afterCancel.sessions.filter((session) => session.id !== disposable.id);
+  const expectedAdjacentId = remainingInSidebarOrder[
+    Math.min(disposableIndex, remainingInSidebarOrder.length - 1)
+  ]?.id || null;
+  assert(expectedAdjacentId, 'individual close test needs a surviving adjacent terminal', {
+    disposableId: disposable.id,
+    sidebarOrder: afterCancel.sessions.map((session) => session.id),
+  });
+
+  const eventCursor = page.events.length;
+  const accepted = await page.eval(`(() => {
+    const entry = [...document.querySelectorAll('.session-entry')]
+      .find((candidate) => candidate.dataset.sessionId === ${JSON.stringify(disposable.id)});
+    const closeButton = entry?.querySelector('[data-session-action="close"]');
+    let confirmText = '';
+    const originalConfirm = window.confirm;
+    window.confirm = (message) => {
+      confirmText = String(message);
+      return true;
+    };
+    closeButton?.click();
+    window.confirm = originalConfirm;
+    return { clicked: Boolean(closeButton), confirmText };
+  })()`);
+
+  const settled = await page.waitFor(`(() => !sessions.some((session) => session.id === ${JSON.stringify(disposable.id)})
+    && !closingSessionIds.has(${JSON.stringify(disposable.id)})
+    && currentSessionId === ${JSON.stringify(expectedAdjacentId)}
+    && ws?.readyState === WebSocket.OPEN
+    && terminalControlRole === 'controller'
+    ? {
+      currentSessionId,
+      role: terminalControlRole,
+      closeButtons: document.querySelectorAll('.session-close').length,
+      sessionCount: sessions.length,
+    }
+    : false)()`, 25_000, 'individual live terminal close and adjacent selection');
+
+  const deleteRequests = page.networkRequestsSince(eventCursor, (request) => {
+    try {
+      const url = new URL(request.url);
+      return request.method === 'DELETE'
+        && url.pathname === '/api/sessions/' + disposable.id
+        && url.searchParams.get('purge') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const afterClose = await api('/api/sessions');
+  assert(accepted.clicked && accepted.confirmText.includes(disposable.title), 'live terminal close confirmation was not accepted', accepted);
+  assert(deleteRequests.length === 1, 'individual close did not issue exactly one permanent-delete request', deleteRequests);
+  assert(!afterClose.sessions.some((session) => session.id === disposable.id)
+    && !tmuxSessionExists(disposable.id)
+    && settled.closeButtons === settled.sessionCount, 'individual close did not remove the tmux session, history row, and only that row', {
+    settled,
+    afterClose: afterClose.sessions.map((session) => session.id),
+    tmuxStillAlive: tmuxSessionExists(disposable.id),
+  });
+  if (expectedAdjacentId !== survivorSessionId) await selectLiveSession(page, survivorSessionId);
+
+  return {
+    closedSessionId: disposable.id,
+    survivorSessionId,
+    liveCloseConfirmed: true,
+    cancelledClosePreservedSession: true,
+    permanentDeleteRequests: deleteRequests.length,
+    tmuxTerminated: true,
+    rowRemoved: true,
+    adjacentSessionSelected: settled.currentSessionId === expectedAdjacentId,
+    closeButtonsMatchSessions: settled.closeButtons === settled.sessionCount,
   };
 }
 
@@ -1351,7 +1481,7 @@ async function testMobileLayoutAndKeys(page, sessionId) {
 }
 
 function requestedCases() {
-  const all = ['raw-resume', 'large-input', 'focus-reports', 'runtime-epoch', 'output-isolation', 'api-surface', 'paste-history', 'mobile'];
+  const all = ['individual-close', 'raw-resume', 'large-input', 'focus-reports', 'runtime-epoch', 'output-isolation', 'api-surface', 'paste-history', 'mobile'];
   if (!browserOnly || browserOnly === 'high-value') return new Set(all);
   const requested = new Set(browserOnly.split(',').map((value) => value.trim()).filter(Boolean));
   const known = new Set(['quick-create', 'minimal-ui', ...all]);
@@ -1387,6 +1517,12 @@ async function main() {
     page,
     regressions.quickCreateDefaults.sessionId,
   );
+  if (selected.has('individual-close')) {
+    regressions.individualSessionClose = await testIndividualSessionClose(
+      page,
+      regressions.quickCreateDefaults.sessionId,
+    );
+  }
 
   if (selected.has('raw-resume')) {
     regressions.rawXtermResume = await testRawXtermResume(page, regressions.quickCreateDefaults.sessionId);

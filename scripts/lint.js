@@ -87,6 +87,13 @@ if (!indexHtml.includes('id="newSession"')
   fail('The minimal one-click xterm UI and its core terminal input path must remain present.');
 }
 
+if (!appJs.includes('function closeAndRemoveSession(')
+  || !appJs.includes("encodeURIComponent(sessionId) + '?purge=1'")
+  || !appJs.includes("closeButton.className = 'session-close'")
+  || !stylesCss.includes('.session-close')) {
+  fail('Each sidebar terminal must retain its accessible individual close-and-remove control.');
+}
+
 if (!smokeJs.includes('freePort()')) {
   fail('scripts/smoke.js must use a dynamic free port by default to avoid CI/local port collisions.');
 }
