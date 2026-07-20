@@ -72,6 +72,16 @@ if (WebLinksAddonCtor) term.loadAddon(new WebLinksAddonCtor());
 term.open(terminalEl);
 term.registerCharacterJoiner?.(rtlCharacterJoinRanges);
 
+term.attachCustomWheelEventHandler((event) => {
+  if (event.ctrlKey) return false;
+  const bufferHasScrollback = (term.buffer?.active?.baseY || 0) > 0;
+  const tmuxHandlesMouse = term.modes?.mouseTrackingMode !== 'none';
+  if (bufferHasScrollback || tmuxHandlesMouse) return true;
+  event.preventDefault();
+  event.stopPropagation();
+  return false;
+});
+
 let rtlCursorFrame = null;
 
 function syncRtlCursorPosition() {

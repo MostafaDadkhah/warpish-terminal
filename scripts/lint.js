@@ -87,6 +87,13 @@ if (!indexHtml.includes('id="newSession"')
   fail('The minimal one-click xterm UI and its core terminal input path must remain present.');
 }
 
+if (!appJs.includes('term.attachCustomWheelEventHandler(')
+  || !appJs.includes("term.modes?.mouseTrackingMode !== 'none'")
+  || !serverJs.includes("runTmux(['set-option', '-t', session.id, 'mouse', 'on'])")
+  || !browserRegressionJs.includes('testWheelScrollbackDoesNotRecallCommands')) {
+  fail('Terminal wheel must use tmux scrollback and never fall back to shell command-history arrows.');
+}
+
 if (!appJs.includes('function closeAndRemoveSession(')
   || !appJs.includes("encodeURIComponent(sessionId) + '?purge=1'")
   || !appJs.includes("closeButton.className = 'session-close'")

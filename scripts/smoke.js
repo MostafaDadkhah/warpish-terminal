@@ -689,6 +689,7 @@ try {
     ['terminal input, WebSocket send, and API response handlers exist', /function\s+handleTerminalInput\s*\(/.test(appJs) && /function\s+sendRaw\s*\(\s*data\b/.test(appJs) && /function\s+parseApiResponse\s*\(/.test(appJs)],
     ['browser terminal input is byte-bounded', terminalInputJs.includes('WarpishTerminalInput') && terminalInputJs.includes('MAX_MESSAGE_BYTES = 64 * 1024') && terminalInputJs.includes('MAX_PENDING_BYTES = 1024 * 1024')],
     ['terminal output reaches generation-guarded xterm writes in text and binary modes', appJs.includes("socket.binaryType = 'arraybuffer'") && /function\s+writeTerminalOutput\s*\(/.test(appJs) && appJs.includes('writeTerminalOutput(new Uint8Array(event.data))') && appJs.includes('writeTerminalOutput(event.data)')],
+    ['wheel scroll uses tmux history and cannot fall back to shell history arrows', appJs.includes('term.attachCustomWheelEventHandler(') && appJs.includes("term.modes?.mouseTrackingMode !== 'none'") && serverJs.includes("runTmux(['set-option', '-t', session.id, 'mouse', 'on'])")],
     ['interactive shell removes inherited NO_COLOR before user startup', serverJs.includes("'/usr/bin/env'") && serverJs.includes("'NO_COLOR'") && serverJs.includes("'COLORTERM=truecolor'")],
     ['direct tmux input and escape-key support exist', /function\s+writeTmuxInput\s*\(/.test(serverJs) && serverJs.includes("['\\x1b[A', 'Up']")],
     ['runtime reconnect snapshot keeps internal tmux capture and cursor restoration', /function\s+sendRuntimeSnapshot\s*\([^)]*\)[\s\S]*?capturePaneText\(sessionId,\s*\{\s*escape:\s*true,\s*history:\s*false\s*\}\)[\s\S]*?paneCursorState\(sessionId\)[\s\S]*?\\x1b\[\?1049h[\s\S]*?cursorState/.test(serverJs)],
@@ -731,6 +732,12 @@ try {
     'normal pane did not inherit configured 50000-line history limit at creation',
     normalHistoryState,
   );
+  const tmuxMouseOption = execFileSync(tmuxBin, [
+    'show-options', '-t', smokeSessionId, '-v', 'mouse',
+  ], { encoding: 'utf8', env: isolatedTmuxEnvironment() }).trim();
+  assert(tmuxMouseOption === 'on', 'normal Warpish session did not enable tmux mouse scrollback', {
+    tmuxMouseOption,
+  });
 
   const removedRouteResponses = await Promise.all([
     ['blocks', `/api/sessions/${smokeSessionId}/blocks`, { token }],

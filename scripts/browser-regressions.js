@@ -326,6 +326,17 @@ class CdpPage {
       .filter(predicate);
   }
 
+  async wheelAt(x, y, deltaY, deltaX = 0) {
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x,
+      y,
+      deltaX,
+      deltaY,
+      modifiers: 0,
+    });
+  }
+
   close() {
     try { this.ws?.close(); } catch {}
   }
@@ -1115,6 +1126,113 @@ async function testRawXtermResume(page, sessionId) {
   };
 }
 
+async function testWheelScrollbackDoesNotRecallCommands(page) {
+  const session = await createDefaultSession({});
+  await selectLiveSession(page, session.id);
+  const topMarker = `__WHEEL_SCROLL_TOP_${Date.now()}__`;
+  const bottomMarker = `__WHEEL_SCROLL_BOTTOM_${Date.now()}__`;
+  const command = `python3 -c ${shellQuote([
+    `print(${JSON.stringify(topMarker)})`,
+    "[print(f'wheel scrollback line {index:04d}') for index in range(240)]",
+    `print(${JSON.stringify(bottomMarker)})`,
+  ].join(';'))}\r`;
+  await page.eval(`(() => { term.input(${JSON.stringify(command)}, true); return true; })()`);
+  await waitForTmuxPaneContains(session.id, bottomMarker);
+  await page.waitFor(`(() => term.modes?.mouseTrackingMode !== 'none'
+    && term.buffer?.active?.type === 'alternate'
+    && terminalSurfaceTransitioning === false
+    ? {
+      mouseTrackingMode: term.modes.mouseTrackingMode,
+      bufferType: term.buffer.active.type,
+      baseY: term.buffer.active.baseY,
+    }
+    : false)()`, 20_000, 'tmux mouse tracking in the outer alternate buffer');
+
+  const mouseOption = execFileSync(tmuxBin, [
+    'show-options', '-t', session.id, '-v', 'mouse',
+  ], { encoding: 'utf8', env: tmuxEnvironment }).trim();
+  assert(mouseOption === 'on', 'Warpish tmux session did not enable mouse scrollback', { mouseOption });
+
+  const wheelPoint = await page.eval(`(() => {
+    const screen = document.querySelector('#terminal .xterm-screen');
+    const rect = screen?.getBoundingClientRect();
+    return rect ? {
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+    } : null;
+  })()`);
+  assert(wheelPoint, 'could not locate the raw xterm surface for wheel regression');
+
+  await page.eval(`(() => {
+    window.__warpishWheelData = [];
+    window.__warpishWheelSubscription?.dispose?.();
+    window.__warpishWheelSubscription = term.onData((data) => window.__warpishWheelData.push(data));
+    return true;
+  })()`);
+  for (let index = 0; index < 4; index += 1) {
+    await page.wheelAt(wheelPoint.x, wheelPoint.y, -480);
+    await delay(80);
+  }
+
+  let copyMode = null;
+  const copyModeDeadline = Date.now() + 5000;
+  while (Date.now() < copyModeDeadline) {
+    const [inMode, scrollPosition] = execFileSync(tmuxBin, [
+      'display-message', '-p', '-t', session.id, '#{pane_in_mode}|#{scroll_position}',
+    ], { encoding: 'utf8', env: tmuxEnvironment }).trim().split('|');
+    copyMode = {
+      inMode: Number.parseInt(inMode, 10) || 0,
+      scrollPosition: Number.parseInt(scrollPosition, 10) || 0,
+    };
+    if (copyMode.inMode === 1 && copyMode.scrollPosition > 0) break;
+    await delay(100);
+  }
+  const trackedWheelData = await page.eval(`window.__warpishWheelData || []`);
+  assert(copyMode?.inMode === 1 && copyMode.scrollPosition > 0,
+    'wheel did not move through tmux scrollback', copyMode);
+  assert(!trackedWheelData.some((data) => /^(?:\x1b\[|\x1bO)[AB]$/u.test(data)),
+    'wheel was converted into shell history arrow keys while tmux mouse tracking was active',
+    trackedWheelData.map((data) => Buffer.from(data).toString('hex')));
+
+  execFileSync(tmuxBin, ['send-keys', '-t', session.id, '-X', 'cancel'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: tmuxEnvironment,
+  });
+  execFileSync(tmuxBin, ['set-option', '-t', session.id, 'mouse', 'off'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: tmuxEnvironment,
+  });
+  await page.waitFor(`term.modes?.mouseTrackingMode === 'none'`, 10_000, 'mouse-off fallback mode');
+  await page.eval(`window.__warpishWheelData = []`);
+  await page.wheelAt(wheelPoint.x, wheelPoint.y, -480);
+  await delay(300);
+  const fallbackWheelData = await page.eval(`window.__warpishWheelData || []`);
+  assert(fallbackWheelData.length === 0,
+    'wheel fallback emitted terminal input instead of staying out of shell command history',
+    fallbackWheelData.map((data) => Buffer.from(data).toString('hex')));
+
+  execFileSync(tmuxBin, ['set-option', '-t', session.id, 'mouse', 'on'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: tmuxEnvironment,
+  });
+  await page.waitFor(`term.modes?.mouseTrackingMode !== 'none'`, 10_000, 'restored tmux mouse tracking');
+  await page.eval(`(() => {
+    window.__warpishWheelSubscription?.dispose?.();
+    delete window.__warpishWheelSubscription;
+    delete window.__warpishWheelData;
+    return true;
+  })()`);
+
+  return {
+    sessionId: session.id,
+    mouseOption,
+    copyMode,
+    tmuxScrollbackMoved: true,
+    shellHistoryArrowsSent: false,
+    noMouseFallbackInputCount: fallbackWheelData.length,
+  };
+}
+
 async function testLargeOrderedUtf8(page) {
   const session = await createDefaultSession({});
   await selectLiveSession(page, session.id);
@@ -1198,9 +1316,11 @@ async function testNativeFocusReports(page) {
       headlessFocusInFallback,
     };
   })()`);
+  const observedFocusSequence = focusState.observedReports.join('');
   assert(focusState.tracking === true
     && focusState.focusedBeforeBlur
-    && focusState.observedReports.join('') === '\x1b[O\x1b[I', 'xterm did not generate ordered focus reports from its input surface', focusState);
+    && ['\x1b[O\x1b[I', '\x1b[I\x1b[O\x1b[I'].includes(observedFocusSequence),
+    'xterm did not generate an ordered blur/focus report pair from its input surface', focusState);
   await page.waitFor(`pendingTerminalInputs.filter((item) => item.sessionId === ${JSON.stringify(session.id)}).length === 0`, 10_000, 'focus-report input acknowledgements');
   await delay(200);
 
@@ -1217,7 +1337,7 @@ async function testNativeFocusReports(page) {
       }
     });
   const reports = inputFrames.map((message) => message.data).join('');
-  const expected = '\x1b[O\x1b[I';
+  const expected = observedFocusSequence;
   assert(reports === expected, 'native xterm focus reports were filtered, lost, duplicated, or reordered before WebSocket transport', {
     reportsHex: Buffer.from(reports, 'binary').toString('hex'),
     inputFrames,
@@ -1696,7 +1816,7 @@ async function testMobileLayoutAndKeys(page, sessionId) {
 }
 
 function requestedCases() {
-  const all = ['individual-close', 'raw-resume', 'large-input', 'focus-reports', 'runtime-epoch', 'output-isolation', 'api-surface', 'paste-history', 'mobile'];
+  const all = ['individual-close', 'raw-resume', 'wheel-scrollback', 'large-input', 'focus-reports', 'runtime-epoch', 'output-isolation', 'api-surface', 'paste-history', 'mobile'];
   if (!browserOnly || browserOnly === 'high-value') return new Set(all);
   const requested = new Set(browserOnly.split(',').map((value) => value.trim()).filter(Boolean));
   const known = new Set(['quick-create', 'minimal-ui', ...all]);
@@ -1741,6 +1861,9 @@ async function main() {
 
   if (selected.has('raw-resume')) {
     regressions.rawXtermResume = await testRawXtermResume(page, regressions.quickCreateDefaults.sessionId);
+  }
+  if (selected.has('wheel-scrollback')) {
+    regressions.wheelScrollback = await testWheelScrollbackDoesNotRecallCommands(page);
   }
   if (selected.has('large-input')) {
     regressions.largeOrderedUtf8 = await testLargeOrderedUtf8(page);

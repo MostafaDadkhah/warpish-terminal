@@ -173,6 +173,7 @@ if (!process.env.WARPISH_BROWSER_ONLY) {
   const required = [
     'individualSessionClose',
     'rawXtermResume',
+    'wheelScrollback',
     'largeOrderedUtf8',
     'nativeFocusReports',
     'runtimeEpochInputSafety',
@@ -202,6 +203,13 @@ if (regressions.individualSessionClose) {
 if (regressions.rawXtermResume) {
   const check = regressions.rawXtermResume;
   assert(check.rawInputReachedPty && check.reloadResumed && check.websocketReconnected && check.tmuxSnapshotPreserved, 'raw xterm resume/reconnect failed', check);
+}
+if (regressions.wheelScrollback) {
+  const check = regressions.wheelScrollback;
+  assert(check.mouseOption === 'on'
+    && check.tmuxScrollbackMoved
+    && check.shellHistoryArrowsSent === false
+    && check.noMouseFallbackInputCount === 0, 'wheel scrolled shell command history or failed to move through terminal scrollback', check);
 }
 if (regressions.largeOrderedUtf8) {
   const check = regressions.largeOrderedUtf8;

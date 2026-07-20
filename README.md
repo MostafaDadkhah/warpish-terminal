@@ -11,6 +11,7 @@ What it does:
 - Clear stopped history from the sidebar without killing any live `tmux` sessions.
 - Uses real macOS PTYs and `tmux`, so browser reloads/switches do not kill the shell.
 - Keeps the main workspace deliberately minimal: one raw xterm surface with no terminal action toolbar.
+- Mouse-wheel and trackpad scrolling move through tmux scrollback without recalling older shell commands.
 - Includes mobile Esc/Tab/Ctrl/arrow keys.
 - Multiline paste is intercepted: choose a safe single-line draft, preserve line breaks explicitly, or cancel. A trailing newline never silently submits a command.
 - The browser no longer creates private sessions. Existing or recovered legacy private sessions remain fail-closed: Warpish suppresses retained content, clears recoverable history, and refuses attach/input/capture when a pane cannot satisfy the zero-history privacy boundary.
@@ -73,7 +74,7 @@ cd warpish-terminal
 npm test
 ```
 
-`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies that legacy private panes remain fail-closed even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home/default/normal creation, raw xterm input, controller transfer, runtime snapshots, ordered large UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile keys/layout, and the absence of the removed toolbar and creation form. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/paste tests. CI retains the complete test log for 14 days even on failure.
+`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies that legacy private panes remain fail-closed even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home/default/normal creation, raw xterm input, wheel-to-tmux scrollback without shell-history arrows, controller transfer, runtime snapshots, ordered large UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile keys/layout, and the absence of the removed toolbar and creation form. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/paste tests. CI retains the complete test log for 14 days even on failure.
 
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.

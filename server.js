@@ -1241,6 +1241,7 @@ function createSession() {
     runTmux(['set-option', '-t', id, 'history-limit', '50000']);
     runTmux(['set-option', '-t', id, 'allow-rename', 'off']);
     runTmux(['set-option', '-t', id, 'focus-events', 'on']);
+    runTmux(['set-option', '-t', id, 'mouse', 'on']);
     runTmux(['set-environment', '-u', '-t', id, 'NO_COLOR']);
     runTmux(['set-environment', '-t', id, 'COLORTERM', 'truecolor']);
     runTmux(['set-environment', '-t', id, 'WARPISH_TERMINAL', '1']);
@@ -2201,6 +2202,7 @@ function createSessionRuntime(session, { cols = 120, rows = 36 } = {}) {
     // below only if its own immutable history capacity is already zero.
     runTmux(['set-option', '-t', session.id, 'focus-events', 'on']);
     runTmux(['set-option', '-t', session.id, 'history-limit', privateSession ? '0' : '50000']);
+    runTmux(['set-option', '-t', session.id, 'mouse', 'on']);
     // This cannot rewrite the environment of an already-running shell, but it
     // makes respawned panes and future windows in older sessions color-capable.
     runTmux(['set-environment', '-u', '-t', session.id, 'NO_COLOR']);
