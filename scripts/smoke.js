@@ -249,10 +249,23 @@ async function verifyHttpAndWebSocketSecurity(token) {
   assert(setCookie, 'token bootstrap did not set the auth cookie', bootstrap.headers);
   assert(/;\s*HttpOnly(?:;|$)/i.test(setCookie), 'auth cookie is missing HttpOnly', setCookie);
   assert(/;\s*SameSite=Strict(?:;|$)/i.test(setCookie), 'auth cookie is missing SameSite=Strict', setCookie);
+  assert(/;\s*Max-Age=2592000(?:;|$)/i.test(setCookie), 'auth cookie does not retain long-running tabs for 30 days', setCookie);
   assert(bootstrap.headers['referrer-policy'] === 'no-referrer', 'bootstrap response must suppress token referrers', bootstrap.headers);
   const cookie = setCookie.split(';', 1)[0];
   const cookieAuth = await httpResponse('/readyz', { headers: { Cookie: cookie } });
   assert(cookieAuth.status === 200, 'HttpOnly cookie did not authenticate a follow-up request', cookieAuth);
+  const missingRefreshAuth = await httpResponse('/api/auth/refresh', { method: 'POST' });
+  assert(missingRefreshAuth.status === 401, 'unauthenticated cookie refresh was not rejected', missingRefreshAuth);
+  const refreshedAuth = await httpResponse('/api/auth/refresh', {
+    method: 'POST',
+    headers: { Cookie: cookie },
+  });
+  const refreshedCookie = (refreshedAuth.headers['set-cookie'] || [])
+    .find((value) => value.startsWith('warpish_token='));
+  assert(refreshedAuth.status === 200 && refreshedCookie, 'authenticated cookie refresh failed', refreshedAuth);
+  assert(/;\s*HttpOnly(?:;|$)/i.test(refreshedCookie)
+    && /;\s*SameSite=Strict(?:;|$)/i.test(refreshedCookie)
+    && /;\s*Max-Age=2592000(?:;|$)/i.test(refreshedCookie), 'refreshed auth cookie lost its security or lifetime attributes', refreshedCookie);
 
   const hostileWs = await websocketHandshakeStatus({ token, origin: 'https://attacker.invalid' });
   const unauthenticatedWs = await websocketHandshakeStatus({ origin: sameOrigin });
@@ -265,7 +278,10 @@ async function verifyHttpAndWebSocketSecurity(token) {
     hostileOriginStatus: hostileOrigin.status,
     sameOriginStatus: acceptedOrigin.status,
     cookieFlagsVerified: true,
+    cookieLifetimeDays: 30,
     cookieAuthStatus: cookieAuth.status,
+    cookieRefreshStatus: refreshedAuth.status,
+    unauthenticatedCookieRefreshStatus: missingRefreshAuth.status,
     hostileWebSocketStatus: hostileWs,
     unauthenticatedWebSocketStatus: unauthenticatedWs,
   };

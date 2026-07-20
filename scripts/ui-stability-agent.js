@@ -190,6 +190,9 @@ if (regressions.individualSessionClose) {
   const check = regressions.individualSessionClose;
   assert(check.liveCloseConfirmed
     && check.cancelledClosePreservedSession
+    && check.expiredAuthClosePreservedSession
+    && check.expiredAuthFeedbackShown
+    && check.terminalSurfacePreservedOnFailure
     && check.permanentDeleteRequests === 1
     && check.tmuxTerminated
     && check.rowRemoved

@@ -78,4 +78,4 @@ npm test
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.
 - Default host is `127.0.0.1`; the server refuses non-loopback binds unless `WARPISH_ALLOW_REMOTE=1` is explicitly set. Do not use that flag unless you add stronger auth/TLS/network allowlisting.
-- Bootstrap URLs include a token, but the browser switches to a same-site HttpOnly cookie for normal API/WebSocket use. If you want phone/remote access later, put it behind Tailscale/Funnel or a proper authenticated gateway, not raw public HTTP.
+- Bootstrap URLs include a token, but the browser switches to a same-site HttpOnly cookie for normal API/WebSocket use. The cookie lasts 30 days and is renewed while the app stays open, so long-running terminal tabs do not silently lose close/input access. If you want phone/remote access later, put it behind Tailscale/Funnel or a proper authenticated gateway, not raw public HTTP.

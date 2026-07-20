@@ -64,6 +64,7 @@ let storage;
 
 ensureLocalBindAllowed();
 const TOKEN = process.env.WARPISH_TOKEN || readOrCreateToken(TOKEN_FILE);
+const AUTH_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30;
 fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 try { fs.chmodSync(DATA_DIR, 0o700); } catch {}
 try {
@@ -138,7 +139,7 @@ function cookieOptions(req) {
     httpOnly: true,
     sameSite: 'strict',
     secure: isSecureRequest(req),
-    maxAge: 1000 * 60 * 60 * 12,
+    maxAge: AUTH_COOKIE_MAX_AGE_MS,
   };
 }
 
@@ -1653,6 +1654,11 @@ app.get('/healthz', (_req, res) => {
 app.get('/readyz', (_req, res) => {
   const readiness = readinessReport();
   res.status(readiness.ok ? 200 : 503).json({ app: APP_NAME, ...readiness });
+});
+
+app.post('/api/auth/refresh', (req, res) => {
+  res.cookie('warpish_token', TOKEN, cookieOptions(req));
+  res.json({ ok: true });
 });
 
 app.get('/api/sessions', (_req, res) => {

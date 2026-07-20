@@ -757,6 +757,62 @@ async function testIndividualSessionClose(page, survivorSessionId) {
     sidebarOrder: afterCancel.sessions.map((session) => session.id),
   });
 
+  const failureMarker = `__CLOSE_FAILURE_SURFACE_${Date.now()}__`;
+  await page.eval(`new Promise((resolve) => term.write(${JSON.stringify(failureMarker)}, resolve))`);
+  await page.waitFor(`${terminalTextExpression()}.includes(${JSON.stringify(failureMarker)})`, 10_000, 'close-failure surface marker');
+  const simulatedExpiredAuth = await page.eval(`(() => {
+    const entry = [...document.querySelectorAll('.session-entry')]
+      .find((candidate) => candidate.dataset.sessionId === ${JSON.stringify(disposable.id)});
+    const closeButton = entry?.querySelector('[data-session-action="close"]');
+    const originalConfirm = window.confirm;
+    window.confirm = () => true;
+    window.__warpishOriginalFetch = window.fetch;
+    window.fetch = (input, options = {}) => {
+      const requestUrl = typeof input === 'string' ? input : input?.url;
+      const requestMethod = String(options.method || input?.method || 'GET').toUpperCase();
+      const pathname = new URL(requestUrl, window.location.href).pathname;
+      if (requestMethod === 'DELETE' && pathname === '/api/sessions/' + ${JSON.stringify(disposable.id)}) {
+        return Promise.resolve(new Response('Unauthorized. Open the printed URL that includes ?token=...', {
+          status: 401,
+          headers: { 'content-type': 'text/plain; charset=utf-8' },
+        }));
+      }
+      return window.__warpishOriginalFetch(input, options);
+    };
+    closeButton?.click();
+    window.confirm = originalConfirm;
+    return { clicked: Boolean(closeButton) };
+  })()`);
+  const expiredAuthState = await page.waitFor(`(() => !closingSessionIds.has(${JSON.stringify(disposable.id)})
+    && sessions.some((session) => session.id === ${JSON.stringify(disposable.id)})
+    && currentSessionId === ${JSON.stringify(disposable.id)}
+    && statusText.textContent === 'sign-in expired'
+    && sessionText.textContent.includes('Terminal was not removed')
+    && ${terminalTextExpression()}.includes(${JSON.stringify(failureMarker)})
+    ? {
+      currentSessionId,
+      status: statusText.textContent,
+      detail: sessionText.textContent,
+      terminalSurfacePreserved: true,
+    }
+    : false)()`, 10_000, 'expired-auth close failure preservation');
+  await page.eval(`(() => {
+    if (window.__warpishOriginalFetch) window.fetch = window.__warpishOriginalFetch;
+    delete window.__warpishOriginalFetch;
+    return true;
+  })()`);
+  const afterExpiredAuth = await api('/api/sessions');
+  assert(simulatedExpiredAuth.clicked
+    && expiredAuthState.status === 'sign-in expired'
+    && expiredAuthState.detail.includes('Terminal was not removed')
+    && expiredAuthState.terminalSurfacePreserved
+    && afterExpiredAuth.sessions.some((session) => session.id === disposable.id)
+    && tmuxSessionExists(disposable.id), 'expired authentication hid or removed a terminal after a failed close', {
+    simulatedExpiredAuth,
+    expiredAuthState,
+    afterExpiredAuth: afterExpiredAuth.sessions.map((session) => session.id),
+  });
+
   const eventCursor = page.events.length;
   const accepted = await page.eval(`(() => {
     const entry = [...document.querySelectorAll('.session-entry')]
@@ -813,6 +869,9 @@ async function testIndividualSessionClose(page, survivorSessionId) {
     survivorSessionId,
     liveCloseConfirmed: true,
     cancelledClosePreservedSession: true,
+    expiredAuthClosePreservedSession: true,
+    expiredAuthFeedbackShown: expiredAuthState.status === 'sign-in expired',
+    terminalSurfacePreservedOnFailure: expiredAuthState.terminalSurfacePreserved,
     permanentDeleteRequests: deleteRequests.length,
     tmuxTerminated: true,
     rowRemoved: true,

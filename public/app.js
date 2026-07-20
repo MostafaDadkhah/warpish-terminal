@@ -122,6 +122,7 @@ if (helperTextarea) {
 }
 
 const SESSION_PREVIEW_CHARS = 900;
+const AUTH_COOKIE_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_TERMINAL_INPUT_MESSAGE_BYTES = terminalInputApi?.MAX_MESSAGE_BYTES || 64 * 1024;
 const MAX_PENDING_TERMINAL_INPUT_BYTES = terminalInputApi?.MAX_PENDING_BYTES || 1024 * 1024;
 const MAX_BROWSER_SOCKET_BUFFERED_BYTES = 256 * 1024;
@@ -145,6 +146,7 @@ let terminalInputFlushTimer = null;
 let terminalFitRaf = null;
 let lastSentTerminalSize = '';
 let refreshTimer = null;
+let authRefreshTimer = null;
 let pendingMultilinePaste = null;
 let focusTimer = null;
 let terminalSurfaceGeneration = 0;
@@ -186,7 +188,9 @@ async function parseApiResponse(response) {
   }
   if (!response.ok) {
     const message = payload.error || payload.message || text || ('HTTP ' + response.status);
-    throw new Error('HTTP ' + response.status + ': ' + message);
+    const error = new Error('HTTP ' + response.status + ': ' + message);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -220,6 +224,13 @@ async function api(path, options = {}) {
     window.clearTimeout(timeout);
     externalSignal?.removeEventListener?.('abort', abortFromExternalSignal);
   }
+}
+
+async function refreshAuthCookie() {
+  return api('/api/auth/refresh', {
+    method: 'POST',
+    timeoutMs: 10000,
+  });
 }
 
 function setStatus(kind, text, detail = '') {
@@ -790,16 +801,7 @@ async function closeAndRemoveSession(sessionId) {
 
   if (closingCurrentSession) {
     clearReconnectTimer();
-    connectionSerial += 1;
-    disconnectCurrent({ quiet: true });
-    discardPendingTerminalInputs(sessionId);
-    currentSessionId = null;
-    terminalControlRole = 'pending';
-    terminalCard.dataset.controlRole = terminalControlRole;
-    controlClaimPending = false;
-    resetCommandActivity();
-    resetTerminalSurface();
-    updateHeader();
+    setStatus('warn', 'closing terminal…', session.title);
   }
 
   try {
@@ -808,6 +810,18 @@ async function closeAndRemoveSession(sessionId) {
       timeoutMs: 20000,
     });
     sessions = payload.sessions || [];
+
+    if (closingCurrentSession) {
+      connectionSerial += 1;
+      disconnectCurrent({ quiet: true });
+      discardPendingTerminalInputs(sessionId);
+      currentSessionId = null;
+      terminalControlRole = 'pending';
+      terminalCard.dataset.controlRole = terminalControlRole;
+      controlClaimPending = false;
+      resetCommandActivity();
+      resetTerminalSurface();
+    }
     renderSessions();
 
     if (closingCurrentSession) {
@@ -821,8 +835,16 @@ async function closeAndRemoveSession(sessionId) {
     }
     return true;
   } catch (error) {
-    if (closingCurrentSession) queueSessionsRefresh({ selectId: sessionId });
-    setStatus('bad', 'close failed', error.message);
+    if (error.status === 401) {
+      setStatus(
+        'bad',
+        'sign-in expired',
+        'Terminal was not removed. Run ./start.sh to reopen Warpish securely, then try again.',
+      );
+    } else {
+      if (closingCurrentSession) queueSessionsRefresh({ selectId: sessionId });
+      setStatus('bad', 'close failed', 'Terminal was not removed. ' + error.message);
+    }
     return false;
   } finally {
     closingSessionIds.delete(sessionId);
@@ -1180,11 +1202,13 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
 
   socket.addEventListener('close', () => {
     const intentionalClose = intentionallyClosedSockets.has(socket);
+    const closingSession = closingSessionIds.has(sessionId);
     intentionallyClosedSockets.delete(socket);
     if (serial !== connectionSerial) return;
     releaseUnacknowledgedInputs(socket, sessionId);
     if (ws === socket) ws = null;
     terminalRuntimeEpoch = null;
+    if (closingSession) return;
     if (intentionalClose) setStatus('warn', 'detached', 'tmux session kept alive');
     else scheduleReconnect(sessionId);
     window.setTimeout(() => refreshSessions().catch(() => {}), 300);
@@ -1474,12 +1498,22 @@ refreshSessions({ createIfEmpty: true }).catch((error) => {
   term.writeln('\x1b[31mStartup failed: ' + error.message + '\x1b[0m');
 });
 
+refreshAuthCookie().catch(() => {});
+authRefreshTimer = window.setInterval(() => {
+  refreshAuthCookie().catch((error) => {
+    if (error.status === 401) {
+      setStatus('bad', 'sign-in expired', 'Run ./start.sh to reopen Warpish securely.');
+    }
+  });
+}, AUTH_COOKIE_REFRESH_INTERVAL_MS);
+
 refreshTimer = window.setInterval(() => {
   refreshSessions().catch(() => {});
 }, 5000);
 
 window.addEventListener('beforeunload', () => {
   if (refreshTimer) window.clearInterval(refreshTimer);
+  if (authRefreshTimer) window.clearInterval(authRefreshTimer);
   clearReconnectTimer();
   disconnectCurrent({ quiet: true });
   window.visualViewport?.removeEventListener('resize', syncVisualViewportHeight);

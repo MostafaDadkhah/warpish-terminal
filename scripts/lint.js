@@ -94,6 +94,14 @@ if (!appJs.includes('function closeAndRemoveSession(')
   fail('Each sidebar terminal must retain its accessible individual close-and-remove control.');
 }
 
+if (!serverJs.includes('AUTH_COOKIE_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 30')
+  || !serverJs.includes("app.post('/api/auth/refresh'")
+  || !appJs.includes('AUTH_COOKIE_REFRESH_INTERVAL_MS')
+  || !appJs.includes('function refreshAuthCookie()')
+  || !appJs.includes("'sign-in expired'")) {
+  fail('Long-running tabs must retain renewable HttpOnly authentication and explicit expiry feedback.');
+}
+
 if (!smokeJs.includes('freePort()')) {
   fail('scripts/smoke.js must use a dynamic free port by default to avoid CI/local port collisions.');
 }
