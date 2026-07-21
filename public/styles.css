@@ -446,6 +446,53 @@ button.danger:hover {
   transform: translateX(var(--warpish-rtl-cursor-shift));
 }
 
+.xterm-rows .warpish-rtl-joined-run {
+  direction: rtl;
+  unicode-bidi: plaintext;
+}
+
+.xterm-rows .warpish-rtl-source-hidden {
+  color: transparent !important;
+  text-shadow: none !important;
+}
+
+.xterm-rows .xterm-cursor.warpish-rtl-native-cursor-hidden {
+  background-color: transparent !important;
+  outline-color: transparent !important;
+}
+
+.warpish-rtl-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.warpish-rtl-overlay {
+  position: absolute;
+  direction: rtl;
+  unicode-bidi: plaintext;
+  white-space: pre;
+}
+
+.warpish-rtl-overlay-text {
+  position: absolute;
+  inset: 0;
+  display: block;
+  direction: rtl;
+  unicode-bidi: plaintext;
+  white-space: pre;
+}
+
+.warpish-rtl-overlay-caret {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--warpish-rtl-caret-color, #22d3ee);
+}
+
 .xterm-viewport {
   border-radius: 16px;
 }

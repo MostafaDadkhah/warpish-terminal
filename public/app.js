@@ -17,6 +17,7 @@ const TerminalCtor = window.Terminal;
 const FitAddonCtor = window.FitAddon?.FitAddon;
 const WebLinksAddonCtor = window.WebLinksAddon?.WebLinksAddon;
 const terminalInputApi = window.WarpishTerminalInput;
+const rtlTerminalApi = window.WarpishRtlTerminal;
 const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
 const TERMINAL_THEME = Object.freeze({
@@ -58,19 +59,11 @@ const term = new TerminalCtor({
   theme: TERMINAL_THEME,
 });
 
-const RTL_SCRIPT_CHARACTER = /[\p{Script=Arabic}\p{Script=Hebrew}]/u;
-
-function rtlCharacterJoinRanges(text) {
-  const start = String(text || '').search(RTL_SCRIPT_CHARACTER);
-  if (start < 0) return [];
-  return [[start, text.length]];
-}
-
 const fitAddon = FitAddonCtor ? new FitAddonCtor() : null;
 if (fitAddon) term.loadAddon(fitAddon);
 if (WebLinksAddonCtor) term.loadAddon(new WebLinksAddonCtor());
 term.open(terminalEl);
-term.registerCharacterJoiner?.(rtlCharacterJoinRanges);
+const rtlTerminalRenderer = rtlTerminalApi?.createRenderer?.(term, terminalEl) || null;
 
 term.attachCustomWheelEventHandler((event) => {
   if (event.ctrlKey) return false;
@@ -81,43 +74,6 @@ term.attachCustomWheelEventHandler((event) => {
   event.stopPropagation();
   return false;
 });
-
-let rtlCursorFrame = null;
-
-function syncRtlCursorPosition() {
-  rtlCursorFrame = null;
-  const priorCursor = terminalEl.querySelector('.xterm-cursor.warpish-rtl-cursor');
-  if (priorCursor) {
-    priorCursor.classList.remove('warpish-rtl-cursor');
-    priorCursor.style.removeProperty('--warpish-rtl-cursor-shift');
-  }
-
-  const cursor = terminalEl.querySelector('.xterm-rows .xterm-cursor');
-  const rtlSpan = cursor?.previousElementSibling;
-  if (!cursor || !rtlSpan || !RTL_SCRIPT_CHARACTER.test(rtlSpan.textContent || '')) return;
-
-  const row = cursor.parentElement;
-  const rowRect = row?.getBoundingClientRect();
-  const cursorRect = cursor.getBoundingClientRect();
-  const rtlRect = rtlSpan.getBoundingClientRect();
-  if (!rowRect || !cursorRect.width || rtlRect.width <= cursorRect.width) return;
-
-  const cursorColumn = Math.round((cursorRect.left - rowRect.left) / cursorRect.width);
-  const rtlEndColumn = Math.round((rtlRect.right - rowRect.left) / cursorRect.width);
-  if (cursorColumn !== rtlEndColumn) return;
-
-  cursor.style.setProperty('--warpish-rtl-cursor-shift', `-${rtlRect.width}px`);
-  cursor.classList.add('warpish-rtl-cursor');
-}
-
-function scheduleRtlCursorPosition() {
-  if (rtlCursorFrame !== null) return;
-  rtlCursorFrame = window.requestAnimationFrame(syncRtlCursorPosition);
-}
-
-term.onRender(scheduleRtlCursorPosition);
-terminalEl.addEventListener('focusin', scheduleRtlCursorPosition);
-terminalEl.addEventListener('focusout', scheduleRtlCursorPosition);
 
 const terminalHelperTextarea = () => terminalEl?.querySelector?.('.xterm-helper-textarea') || null;
 const helperTextarea = terminalHelperTextarea();
@@ -1524,6 +1480,7 @@ refreshTimer = window.setInterval(() => {
 window.addEventListener('beforeunload', () => {
   if (refreshTimer) window.clearInterval(refreshTimer);
   if (authRefreshTimer) window.clearInterval(authRefreshTimer);
+  rtlTerminalRenderer?.dispose?.();
   clearReconnectTimer();
   disconnectCurrent({ quiet: true });
   window.visualViewport?.removeEventListener('resize', syncVisualViewportHeight);

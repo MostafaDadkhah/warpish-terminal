@@ -18,6 +18,7 @@ const indexHtml = read('public/index.html');
 const pasteSafetyJs = read('public/paste-safety.js');
 const terminalKeyDataJs = read('public/terminal-key-data.js');
 const terminalInputJs = read('public/terminal-input.js');
+const rtlTerminalRendererJs = read('public/rtl-terminal-renderer.js');
 const serverJs = read('server.js');
 const storageJs = read('storage.js');
 const shellIntegrationZsh = read('scripts/warpish-shell-integration.zsh');
@@ -150,7 +151,7 @@ if (packageJson.scripts?.regression !== 'node scripts/ui-stability-agent.js') {
 }
 
 const appScriptIndex = indexHtml.indexOf('<script src="/app.js"></script>');
-for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js']) {
+for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js', '/rtl-terminal-renderer.js']) {
   const scriptIndex = indexHtml.indexOf(`<script src="${clientScript}"></script>`);
   if (scriptIndex < 0 || appScriptIndex < 0 || scriptIndex > appScriptIndex) {
     fail(`${clientScript} must be loaded before /app.js.`);
@@ -162,6 +163,14 @@ if (!terminalKeyDataJs.includes('WarpishTerminalKeys')
   || !terminalInputJs.includes('WarpishTerminalInput')
   || !terminalInputJs.includes('MAX_MESSAGE_BYTES')) {
   fail('Terminal key mapping and byte-bounded input modules must expose their stable browser APIs.');
+}
+
+if (!rtlTerminalRendererJs.includes('WarpishRtlTerminal')
+  || !rtlTerminalRendererJs.includes('function activeRtlRun(')
+  || !rtlTerminalRendererJs.includes('function createRenderer(')
+  || !appJs.includes('rtlTerminalApi?.createRenderer?.(term, terminalEl)')
+  || !browserRegressionJs.includes('persianMiddleCursor')) {
+  fail('Persian typing must use the dedicated RTL renderer with a browser regression for middle-of-line cursor editing.');
 }
 
 if (packageJson.dependencies?.['@xterm/addon-search']
@@ -244,7 +253,7 @@ if (!appJs.includes("msg.type === 'command-state'")
   fail('Live command-running and command-finished activity signaling must remain enabled.');
 }
 
-if (/xterm-rows[^}]*unicode-bidi\s*:/su.test(stylesCss)
+if (/\.xterm-rows\s*(?:,|\{)[^}]*unicode-bidi\s*:/su.test(stylesCss)
   || /xterm-helper-textarea[^}]*unicode-bidi\s*:/su.test(stylesCss)
   || /xterm-helper-textarea[^}]*direction\s*:\s*(?:auto|rtl)/su.test(stylesCss)
   || !serverJs.includes('inspectKnownInteractivePane(')

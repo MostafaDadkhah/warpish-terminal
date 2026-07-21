@@ -1023,6 +1023,42 @@ async function testCommandActivityIndicator(page, sessionId) {
     && rtlDraft.cursorTransform !== 'none'
     && rtlDraft.rowDirection === 'ltr'
     && rtlDraft.rowUnicodeBidi !== 'plaintext', 'Persian input was not joined and cursor-reconciled inside the native xterm grid', rtlDraft);
+
+  await page.eval(`new Promise((resolve) => term.write('\\x1b[2D', resolve))`);
+  const persianMiddleCursor = await page.waitFor(`(() => {
+    const overlay = document.querySelector('#terminal .warpish-rtl-overlay');
+    const caret = overlay?.querySelector('.warpish-rtl-overlay-caret');
+    const nativeCursor = document.querySelector('#terminal .xterm-rows .xterm-cursor');
+    if (overlay?.dataset.logicalText !== ${JSON.stringify(persianDraftText)}
+      || !caret
+      || !nativeCursor?.classList.contains('warpish-rtl-native-cursor-hidden')) return false;
+    const overlayRect = overlay.getBoundingClientRect();
+    const caretRect = caret.getBoundingClientRect();
+    return {
+      logicalText: overlay.dataset.logicalText,
+      cursorColumn: Number(overlay.dataset.cursorColumn),
+      runEnd: Number(overlay.dataset.runEnd),
+      visualCursorColumn: Number(overlay.dataset.visualCursorColumn),
+      direction: getComputedStyle(overlay).direction,
+      unicodeBidi: getComputedStyle(overlay).unicodeBidi,
+      color: getComputedStyle(overlay).color,
+      nativeCursorHidden: true,
+      sourceHiddenCount: nativeCursor.parentElement.querySelectorAll('.warpish-rtl-source-hidden').length,
+      caretOffset: caretRect.left - overlayRect.left,
+      overlayWidth: overlayRect.width,
+    };
+  })()`, 10_000, 'middle-of-line Persian cursor overlay');
+  assert(persianMiddleCursor.cursorColumn === persianMiddleCursor.runEnd - 2
+    && persianMiddleCursor.visualCursorColumn === 2
+    && persianMiddleCursor.direction === 'rtl'
+    && persianMiddleCursor.unicodeBidi === 'plaintext'
+    && persianMiddleCursor.color !== 'rgba(0, 0, 0, 0)'
+    && persianMiddleCursor.nativeCursorHidden
+    && persianMiddleCursor.sourceHiddenCount > 1
+    && persianMiddleCursor.caretOffset > 0
+    && persianMiddleCursor.caretOffset < persianMiddleCursor.overlayWidth,
+    'moving inside Persian input fell back to isolated LTR terminal cells', persianMiddleCursor);
+  await page.eval(`new Promise((resolve) => term.write('\\x1b[2C', resolve))`);
   await page.eval(`(() => { term.input('\x15', true); return true; })()`);
 
   await page.eval(`(() => { term.input('draft without enter', true); return true; })()`);
@@ -1085,6 +1121,7 @@ async function testCommandActivityIndicator(page, sessionId) {
       foregroundAfterTurn,
     },
     persianInput: rtlDraft,
+    persianMiddleCursor,
   };
 }
 

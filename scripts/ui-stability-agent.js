@@ -164,6 +164,16 @@ assert(activity.interactiveFallback?.idleDraft?.running === false
   && activity.interactiveFallback?.running?.ariaBusy === 'true'
   && activity.interactiveFallback?.finished?.text === 'command finished'
   && /python/i.test(activity.interactiveFallback?.foregroundAfterTurn || ''), 'interactive foreground process was confused with active work or did not return to ready', activity);
+assert(activity.persianInput?.joinedElementCount === 1
+  && activity.persianInput?.cursorTransform !== 'none'
+  && activity.persianMiddleCursor?.logicalText === 'فقط کلمه آماده را جواب بده'
+  && activity.persianMiddleCursor?.visualCursorColumn === 2
+  && activity.persianMiddleCursor?.direction === 'rtl'
+  && activity.persianMiddleCursor?.unicodeBidi === 'plaintext'
+  && activity.persianMiddleCursor?.color !== 'rgba(0, 0, 0, 0)'
+  && activity.persianMiddleCursor?.nativeCursorHidden === true
+  && activity.persianMiddleCursor?.sourceHiddenCount > 1,
+  'Persian typing or middle-of-line cursor editing regressed to isolated LTR terminal cells', activity);
 assert(minimal.xtermDirection?.rowDirection === 'ltr'
   && minimal.xtermDirection?.helperDirection === 'ltr'
   && minimal.xtermDirection?.rowUnicodeBidi !== 'plaintext'

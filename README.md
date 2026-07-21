@@ -16,7 +16,8 @@ What it does:
 - Multiline paste is intercepted: choose a safe single-line draft, preserve line breaks explicitly, or cancel. A trailing newline never silently submits a command.
 - The browser no longer creates private sessions. Existing or recovered legacy private sessions remain fail-closed: Warpish suppresses retained content, clears recoverable history, and refuses attach/input/capture when a pane cannot satisfy the zero-history privacy boundary.
 - Stores sessions, previews, and backend-only command/event compatibility records in the standalone `.warpish/warpish.sqlite3` database; runtime state is no longer persisted in JSON or per-session event files.
-- Normal xterm input and output stay on the real PTY path. State-aware fallback keys cover application-cursor mode, modifiers, function keys, Alt/Ctrl, and binary input without introducing a separate composer or display layer.
+- Normal xterm input and output stay on the real PTY path. State-aware fallback keys cover application-cursor mode, modifiers, function keys, Alt/Ctrl, and binary input without introducing a separate input/composer path.
+- Persian/Arabic input keeps its logical PTY bytes unchanged while a dedicated RTL renderer shapes the active run and mirrors the visual caret, including cursor movement inside the line. Native xterm rows remain LTR for shell/TUI compatibility.
 - WebSocket heartbeat, byte-bounded UTF-8/binary chunking and browser/Node/Python input queues, payload limits, tmux command timeouts, and idle attach-PTY teardown keep stalled clients from growing memory while the tmux shell remains resumable. The current CWD is updated live after each prompt.
 - Binds to `127.0.0.1`; opening `http://localhost:8765` or `http://127.0.0.1:8765` directly bootstraps a protected local browser session from the random token stored in `.auth-token`.
 
@@ -76,7 +77,7 @@ cd warpish-terminal
 npm test
 ```
 
-`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies that legacy private panes remain fail-closed even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home/default/normal creation, raw xterm input, wheel-to-tmux scrollback without shell-history arrows, controller transfer, runtime snapshots, ordered large UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile keys/layout, and the absence of the removed toolbar and creation form. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/paste tests. CI retains the complete test log for 14 days even on failure.
+`npm run smoke` checks backend/tmux/session behavior on a dynamic free local port, performs a real Node-server restart, proves tmux/SQLite/snapshot resume, and verifies that legacy private panes remain fail-closed even after metadata recovery. `npm run regression` starts an isolated server plus headless Chrome and guards one-click Home/default/normal creation, raw xterm input, Persian RTL shaping at the end and in the middle of a draft, wheel-to-tmux scrollback without shell-history arrows, controller transfer, runtime snapshots, ordered large UTF-8 input, session-affine multiline paste, stopped-history read-only behavior, mobile keys/layout, and the absence of the removed toolbar and creation form. `npm run check` runs guardrail lint, syntax checks, storage migration tests, and pure keyboard/input/paste/RTL-layout tests. CI retains the complete test log for 14 days even on failure.
 
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.
