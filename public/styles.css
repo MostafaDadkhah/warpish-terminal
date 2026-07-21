@@ -497,6 +497,94 @@ button.danger:hover {
   border-radius: 16px;
 }
 
+.input-experience {
+  display: grid;
+  gap: 7px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid rgba(139, 92, 246, 0.22);
+  background: rgba(7, 7, 17, 0.98);
+}
+
+.input-experience[hidden],
+.input-composer[hidden] {
+  display: none;
+}
+
+.input-mode-switch {
+  display: flex;
+  gap: 6px;
+}
+
+.input-mode-switch button {
+  min-height: 28px;
+  padding: 4px 9px;
+  border-color: rgba(148, 163, 184, 0.2);
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 11px;
+}
+
+.input-mode-switch button.active {
+  border-color: rgba(34, 211, 238, 0.48);
+  color: var(--text);
+  background: rgba(34, 211, 238, 0.11);
+}
+
+.input-composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.input-composer textarea {
+  width: 100%;
+  min-height: 42px;
+  max-height: 144px;
+  padding: 10px 12px;
+  resize: vertical;
+  overflow-y: auto;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 12px;
+  outline: none;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.055);
+  font: 13.5px/1.55 "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  text-align: start;
+  unicode-bidi: plaintext;
+  white-space: pre-wrap;
+}
+
+.input-composer textarea:focus {
+  border-color: rgba(34, 211, 238, 0.7);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.11);
+}
+
+.input-composer textarea:disabled {
+  opacity: 0.52;
+}
+
+.input-composer button {
+  min-width: 72px;
+  min-height: 42px;
+}
+
+.input-experience > small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .mobile-terminal-keys {
   display: none;
   gap: 6px;
@@ -630,6 +718,25 @@ footer {
 
   .terminal-card {
     min-height: 0;
+  }
+
+  .input-experience {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .input-experience > small {
+    display: none;
+  }
+
+  .input-mode-switch button {
+    min-height: 24px;
+    padding: 3px 8px;
+  }
+
+  .input-composer textarea,
+  .input-composer button {
+    min-height: 38px;
   }
 
   .mobile-terminal-keys {

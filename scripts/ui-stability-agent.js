@@ -147,7 +147,11 @@ assert(quick.cwd === os.homedir(), 'quick create did not start in Home', quick);
 assert(quick.profile === 'default' && quick.private === false, 'quick create did not use default/normal settings', quick);
 assert(quick.doubleClickCreatedCount === 1 && quick.postCount === 1, 'double-click created duplicate sessions or requests', quick);
 assert(JSON.stringify(quick.postBody) === '{}' && quick.regularButtonOpenedDialog === false, 'quick create did not POST {} without a dialog', quick);
-assert(minimal.rawXterm === true && minimal.removedSelectorsPresent.length === 0, 'removed UI is present or raw xterm is missing', minimal);
+assert(minimal.rawXterm === true
+  && minimal.removedSelectorsPresent.length === 0
+  && minimal.inputExperienceHidden === true
+  && minimal.inputExperienceEnabled === false,
+  'removed UI is present, raw xterm is missing, or Composer V2 is no longer opt-in', minimal);
 assert(minimal.remainingDialogs.length === 1 && minimal.remainingDialogs[0] === 'pasteDialog', 'a removed creation/options dialog remains', minimal);
 assert(activity.running?.text === 'command running…'
   && activity.running?.ariaBusy === 'true'
@@ -189,6 +193,7 @@ assert(minimal.xtermDirection?.rowDirection === 'ltr'
 
 if (!process.env.WARPISH_BROWSER_ONLY) {
   const required = [
+    'inputComposerV2',
     'individualSessionClose',
     'rawXtermResume',
     'wheelScrollback',
@@ -203,6 +208,30 @@ if (!process.env.WARPISH_BROWSER_ONLY) {
   for (const name of required) {
     assert(regressions[name], `full UI stability suite is missing ${name}`, Object.keys(regressions));
   }
+}
+
+if (regressions.inputComposerV2) {
+  const check = regressions.inputComposerV2;
+  assert(check.enabled?.enabled === true
+    && check.enabled?.mode === 'composer'
+    && check.nativeEditing?.value === 'سلام دنیا khari تو به '
+    && check.nativeEditing?.direction === 'rtl'
+    && check.nativeEditing?.unicodeBidi === 'plaintext'
+    && check.expectedHex === check.receivedHex
+    && check.clearedAfterSubmit
+    && check.secondSessionStartedEmpty
+    && check.restoredDraft === 'پیش‌نویس session one'
+    && check.rawState?.terminalFocused
+    && check.composerRestored?.draft === 'پیش‌نویس session one'
+    && check.mobileLayout?.documentScrollWidth <= check.mobileLayout?.innerWidth + 1
+    && check.mobileLayout?.terminalHeight > 100
+    && check.mobileLayout?.noOverlap
+    && check.mobileLayout?.composerContained
+    && check.mobileLayout?.textareaContained
+    && check.reloadRollback?.mode === 'raw'
+    && check.defaultRaw?.enabled === false
+    && check.defaultRaw?.rootHidden === true,
+    'Composer V2 lost logical RTL input, session affinity, exact bytes, or its raw rollback path', check);
 }
 
 if (regressions.individualSessionClose) {

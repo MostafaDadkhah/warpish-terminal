@@ -680,6 +680,8 @@ async function testMinimalUi(page) {
       dialogs,
       rawXterm: Boolean(document.querySelector('#terminal .xterm .xterm-helper-textarea')),
       terminalChildren: [...(card?.children || [])].map((child) => child.id || child.className),
+      inputExperienceHidden: document.querySelector('#inputExperience')?.hidden,
+      inputExperienceEnabled: inputComposerController?.enabled,
       newSessionType: document.querySelector('#newSession')?.type || '',
       mobileKeyCount: document.querySelectorAll('.mobile-terminal-keys button').length,
       xtermDirection: {
@@ -696,8 +698,11 @@ async function testMinimalUi(page) {
   assert(state.rawXterm, 'raw xterm input surface is missing', state);
   assert(creationDialogs.length === 0, 'a removed creation/options dialog is still present', state.dialogs);
   assert(state.dialogs.length === 1 && state.dialogs[0].id === 'pasteDialog' && !state.dialogs[0].open, 'only the paste-safety dialog should remain', state.dialogs);
-  assert(state.terminalChildren.length === 2
+  assert(state.terminalChildren.length === 3
     && state.terminalChildren.includes('terminal')
+    && state.terminalChildren.includes('inputExperience')
+    && state.inputExperienceHidden === true
+    && state.inputExperienceEnabled === false
     && state.terminalChildren.includes('mobile-terminal-keys'), 'terminal card contains a legacy overlay or action surface', state.terminalChildren);
   assert(state.newSessionType === 'button' && state.mobileKeyCount === 8, 'minimal core controls are incomplete', state);
   assert(state.xtermDirection.rowDirection === 'ltr'
@@ -710,6 +715,8 @@ async function testMinimalUi(page) {
     remainingDialogs: state.dialogs.map((dialog) => dialog.id),
     rawXterm: state.rawXterm,
     terminalChildren: state.terminalChildren,
+    inputExperienceHidden: state.inputExperienceHidden,
+    inputExperienceEnabled: state.inputExperienceEnabled,
     mobileKeyCount: state.mobileKeyCount,
     xtermDirection: state.xtermDirection,
   };
@@ -1233,6 +1240,241 @@ async function testCommandActivityIndicator(page, sessionId) {
   };
 }
 
+async function testInputComposerV2(page) {
+  const session = await createDefaultSession({});
+  const draftSession = await createDefaultSession({});
+  const mixedDraft = 'سلام دنیا khari تو به ';
+  const expectedBytes = Buffer.from(`${mixedDraft}\r`, 'utf8');
+  const outputFile = path.join(runtimeRoot, `composer-v2-${Date.now()}.bin`);
+  const readyMarker = `__COMPOSER_V2_READY_${Date.now()}__`;
+  const doneMarker = `__COMPOSER_V2_DONE_${Date.now()}__`;
+
+  await page.navigate(`${tokenUrl}&input=v2&case=composer-v2`);
+  await selectLiveSession(page, session.id);
+  const enabled = await page.waitFor(`(() => {
+    const root = document.querySelector('#inputExperience');
+    const textarea = document.querySelector('#inputComposerText');
+    if (!root || root.hidden || !textarea || inputComposerController?.mode !== 'composer') return false;
+    return {
+      enabled: inputComposerController.enabled,
+      mode: inputComposerController.mode,
+      rootHidden: root.hidden,
+      formHidden: document.querySelector('#inputComposer')?.hidden,
+      activeElementId: document.activeElement?.id || '',
+      search: location.search,
+      tokenPresent: new URLSearchParams(location.search).has('token'),
+    };
+  })()`, 15_000, 'Composer V2 opt-in surface');
+  assert(enabled.enabled
+    && enabled.mode === 'composer'
+    && enabled.rootHidden === false
+    && enabled.formHidden === false
+    && enabled.search.includes('input=v2')
+    && enabled.tokenPresent === false,
+    'Composer V2 did not remain opt-in while stripping the bootstrap token', enabled);
+
+  respawnPane(session.id, rawInputFixtureCommand({
+    byteCount: expectedBytes.length,
+    outputFile,
+    readyMarker,
+    doneMarker,
+  }));
+  await page.waitFor(terminalContainsExpression(readyMarker), 20_000, 'Composer V2 raw-input fixture readiness');
+
+  await page.eval(`(() => {
+    const textarea = document.querySelector('#inputComposerText');
+    textarea.value = '';
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.focus();
+    return true;
+  })()`);
+  await page.send('Input.insertText', { text: mixedDraft });
+  const nativeEditing = await page.waitFor(`(() => {
+    const textarea = document.querySelector('#inputComposerText');
+    if (textarea?.value !== ${JSON.stringify(mixedDraft)}) return false;
+    return {
+      value: textarea.value,
+      direction: getComputedStyle(textarea).direction,
+      unicodeBidi: getComputedStyle(textarea).unicodeBidi,
+      selectionStart: textarea.selectionStart,
+      selectionEnd: textarea.selectionEnd,
+      activeElementId: document.activeElement?.id || '',
+    };
+  })()`, 10_000, 'native mixed-script composer editing');
+  assert(nativeEditing.value === mixedDraft
+    && nativeEditing.direction === 'rtl'
+    && nativeEditing.unicodeBidi === 'plaintext'
+    && nativeEditing.selectionStart === mixedDraft.length
+    && nativeEditing.selectionEnd === mixedDraft.length
+    && nativeEditing.activeElementId === 'inputComposerText',
+    'Composer V2 did not preserve native logical RTL editing', nativeEditing);
+
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'keyDown',
+    key: 'Enter',
+    code: 'Enter',
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13,
+  });
+  await page.send('Input.dispatchKeyEvent', {
+    type: 'keyUp',
+    key: 'Enter',
+    code: 'Enter',
+    windowsVirtualKeyCode: 13,
+    nativeVirtualKeyCode: 13,
+  });
+  const received = await waitForFile(
+    outputFile,
+    (data) => data.length === expectedBytes.length,
+    15_000,
+    'Composer V2 exact logical UTF-8 input',
+  );
+  assert(received.equals(expectedBytes), 'Composer V2 changed, duplicated, or reordered the submitted bytes', {
+    expectedHex: expectedBytes.toString('hex'),
+    receivedHex: received.toString('hex'),
+  });
+  const clearedAfterSubmit = await page.waitFor(`document.querySelector('#inputComposerText')?.value === ''`,
+    10_000, 'Composer V2 clear after acknowledged queueing');
+
+  const firstSessionDraft = 'پیش‌نویس session one';
+  const secondSessionDraft = 'draft session two';
+  await page.eval(`(() => {
+    const textarea = document.querySelector('#inputComposerText');
+    textarea.value = ${JSON.stringify(firstSessionDraft)};
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  await selectLiveSession(page, draftSession.id);
+  const secondSessionStartedEmpty = await page.eval(`document.querySelector('#inputComposerText')?.value === ''`);
+  await page.eval(`(() => {
+    const textarea = document.querySelector('#inputComposerText');
+    textarea.value = ${JSON.stringify(secondSessionDraft)};
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  })()`);
+  await selectLiveSession(page, session.id);
+  const restoredDraft = await page.eval(`document.querySelector('#inputComposerText')?.value || ''`);
+  assert(secondSessionStartedEmpty && restoredDraft === firstSessionDraft,
+    'Composer draft crossed sessions or was lost during a session switch', {
+      secondSessionStartedEmpty,
+      restoredDraft,
+    });
+
+  const rawMode = await page.eval(`(() => {
+    document.querySelector('[data-input-mode="raw"]')?.click();
+    return true;
+  })()`);
+  assert(rawMode, 'Composer V2 raw rollback button is missing');
+  const rawState = await page.waitFor(`(() => inputComposerController?.mode === 'raw'
+    && document.querySelector('#inputComposer')?.hidden
+    && document.activeElement?.classList?.contains('xterm-helper-textarea')
+    ? {
+      mode: inputComposerController.mode,
+      formHidden: document.querySelector('#inputComposer').hidden,
+      terminalFocused: true,
+    }
+    : false)()`, 10_000, 'Composer V2 raw-key rollback');
+  await page.eval(`document.querySelector('[data-input-mode="composer"]')?.click()`);
+  const composerRestored = await page.waitFor(`(() => inputComposerController?.mode === 'composer'
+    && document.querySelector('#inputComposerText')?.value === ${JSON.stringify(firstSessionDraft)}
+    ? { mode: inputComposerController.mode, draft: document.querySelector('#inputComposerText').value }
+    : false)()`, 10_000, 'Composer V2 return from raw keys');
+
+  let mobileLayout;
+  try {
+    await page.send('Emulation.setDeviceMetricsOverride', {
+      width: 390,
+      height: 844,
+      deviceScaleFactor: 2,
+      mobile: true,
+    });
+    mobileLayout = await page.waitFor(`(() => {
+      const card = document.querySelector('.terminal-card');
+      const terminal = document.querySelector('#terminal');
+      const composer = document.querySelector('#inputExperience');
+      const textarea = document.querySelector('#inputComposerText');
+      const keyStrip = document.querySelector('.mobile-terminal-keys');
+      if (!card || !terminal || !composer || !textarea || composer.hidden
+        || getComputedStyle(keyStrip).display === 'none') return false;
+      const cardRect = card.getBoundingClientRect();
+      const terminalRect = terminal.getBoundingClientRect();
+      const composerRect = composer.getBoundingClientRect();
+      const textareaRect = textarea.getBoundingClientRect();
+      return {
+        innerWidth,
+        documentScrollWidth: document.documentElement.scrollWidth,
+        cardHeight: cardRect.height,
+        terminalHeight: terminalRect.height,
+        composerHeight: composerRect.height,
+        noOverlap: terminalRect.bottom <= composerRect.top + 1,
+        composerContained: composerRect.left >= cardRect.left
+          && composerRect.right <= cardRect.right
+          && composerRect.bottom <= cardRect.bottom + 1,
+        textareaContained: textareaRect.left >= composerRect.left
+          && textareaRect.right <= composerRect.right,
+      };
+    })()`, 10_000, 'Composer V2 mobile layout');
+    assert(mobileLayout.documentScrollWidth <= mobileLayout.innerWidth + 1
+      && mobileLayout.terminalHeight > 100
+      && mobileLayout.noOverlap
+      && mobileLayout.composerContained
+      && mobileLayout.textareaContained,
+      'Composer V2 overflowed or collapsed the mobile terminal', mobileLayout);
+  } finally {
+    await page.send('Emulation.setDeviceMetricsOverride', {
+      width: 1280,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+  }
+
+  await page.navigate(`${tokenUrl}&input=v2-raw&case=composer-v2-raw`);
+  await selectLiveSession(page, draftSession.id);
+  const reloadRollback = await page.waitFor(`(() => inputComposerController?.enabled
+    && inputComposerController?.mode === 'raw'
+    && document.querySelector('#inputExperience')?.hidden === false
+    && document.querySelector('#inputComposer')?.hidden === true
+    ? {
+      enabled: inputComposerController.enabled,
+      mode: inputComposerController.mode,
+      rootHidden: document.querySelector('#inputExperience').hidden,
+      formHidden: document.querySelector('#inputComposer').hidden,
+    }
+    : false)()`, 10_000, 'Composer V2 reload rollback');
+
+  await page.navigate(`${tokenUrl}&case=composer-default-raw`);
+  await selectLiveSession(page, draftSession.id);
+  const defaultRaw = await page.waitFor(`(() => inputComposerController?.enabled === false
+    && document.querySelector('#inputExperience')?.hidden === true
+    && document.documentElement.dataset.inputExperience === 'raw'
+    ? {
+      enabled: inputComposerController.enabled,
+      rootHidden: document.querySelector('#inputExperience').hidden,
+      experience: document.documentElement.dataset.inputExperience,
+      terminalFocused: document.activeElement?.classList?.contains('xterm-helper-textarea') || false,
+    }
+    : false)()`, 10_000, 'raw xterm default after Composer V2 rollback');
+
+  return {
+    sessionId: session.id,
+    draftSessionId: draftSession.id,
+    enabled,
+    nativeEditing,
+    submittedLogicalText: mixedDraft,
+    expectedHex: expectedBytes.toString('hex'),
+    receivedHex: received.toString('hex'),
+    clearedAfterSubmit: Boolean(clearedAfterSubmit),
+    secondSessionStartedEmpty,
+    restoredDraft,
+    rawState,
+    composerRestored,
+    mobileLayout,
+    reloadRollback,
+    defaultRaw,
+  };
+}
+
 async function testRawXtermResume(page, sessionId) {
   await selectLiveSession(page, sessionId);
   const marker = `__WARPISH_RAW_${process.pid}_${Date.now()}__`;
@@ -1470,23 +1712,25 @@ async function testNativeFocusReports(page) {
   await page.waitFor(`pendingTerminalInputs.filter((item) => item.sessionId === ${JSON.stringify(session.id)}).length === 0`, 10_000, 'focus-report input acknowledgements');
   await delay(200);
 
-  const inputFrames = page.events.slice(eventCursor)
+  const allInputFrames = page.events.slice(eventCursor)
     .filter((event) => event.method === 'Network.webSocketFrameSent'
       && event.params?.requestId === socketRequestId
       && event.params?.response?.opcode === 1)
     .flatMap((event) => {
       try {
         const message = JSON.parse(event.params.response.payloadData);
-        return message.type === 'input' && ['\x1b[O', '\x1b[I'].includes(message.data) ? [message] : [];
+        return message.type === 'input' ? [message] : [];
       } catch {
         return [];
       }
     });
+  const inputFrames = allInputFrames.filter((message) => /^(?:\x1b\[(?:I|O))+$/u.test(message.data));
   const reports = inputFrames.map((message) => message.data).join('');
   const expected = observedFocusSequence;
   assert(reports === expected, 'native xterm focus reports were filtered, lost, duplicated, or reordered before WebSocket transport', {
     reportsHex: Buffer.from(reports, 'binary').toString('hex'),
     inputFrames,
+    allInputFrames,
     focusState,
   });
   assert(inputFrames.every((message) => message.allowFocusReports === true && typeof message.inputId === 'string' && message.inputId.length > 0), 'focus-report input frames lost their explicit protocol metadata', inputFrames);
@@ -1972,7 +2216,7 @@ async function testMobileLayoutAndKeys(page, sessionId) {
 }
 
 function requestedCases() {
-  const all = ['individual-close', 'raw-resume', 'wheel-scrollback', 'large-input', 'focus-reports', 'runtime-epoch', 'output-isolation', 'api-surface', 'paste-history', 'mobile'];
+  const all = ['composer-v2', 'individual-close', 'raw-resume', 'wheel-scrollback', 'large-input', 'focus-reports', 'runtime-epoch', 'output-isolation', 'api-surface', 'paste-history', 'mobile'];
   if (!browserOnly || browserOnly === 'high-value') return new Set(all);
   const requested = new Set(browserOnly.split(',').map((value) => value.trim()).filter(Boolean));
   const known = new Set(['quick-create', 'minimal-ui', ...all]);
@@ -2008,6 +2252,9 @@ async function main() {
     page,
     regressions.quickCreateDefaults.sessionId,
   );
+  if (selected.has('composer-v2')) {
+    regressions.inputComposerV2 = await testInputComposerV2(page);
+  }
   if (selected.has('individual-close')) {
     regressions.individualSessionClose = await testIndividualSessionClose(
       page,

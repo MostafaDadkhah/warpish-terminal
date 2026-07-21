@@ -12,11 +12,18 @@ const clearStoppedSessionsButton = document.getElementById('clearStoppedSessions
 const pasteDialog = document.getElementById('pasteDialog');
 const pastePreview = document.getElementById('pastePreview');
 const mobileTerminalKeys = document.querySelector('.mobile-terminal-keys');
+const inputExperienceEl = document.getElementById('inputExperience');
+const inputComposerForm = document.getElementById('inputComposer');
+const inputComposerText = document.getElementById('inputComposerText');
+const inputComposerSend = document.getElementById('inputComposerSend');
+const inputComposerStatus = document.getElementById('inputComposerStatus');
+const inputModeButtons = [...document.querySelectorAll('[data-input-mode]')];
 
 const TerminalCtor = window.Terminal;
 const FitAddonCtor = window.FitAddon?.FitAddon;
 const WebLinksAddonCtor = window.WebLinksAddon?.WebLinksAddon;
 const terminalInputApi = window.WarpishTerminalInput;
+const inputComposerApi = window.WarpishInputComposer;
 const rtlTerminalApi = window.WarpishRtlTerminal;
 const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
 
@@ -122,6 +129,7 @@ let terminalRuntimeEpoch = null;
 let controllerFocusReported = false;
 let commandActivity = null;
 let commandCompletionTimer = null;
+let inputComposerController = null;
 
 const intentionallyClosedSockets = new WeakSet();
 const terminalInputClientId = window.crypto?.randomUUID?.()
@@ -129,7 +137,21 @@ const terminalInputClientId = window.crypto?.randomUUID?.()
 
 const initialParams = new URLSearchParams(window.location.search);
 const initialToken = initialParams.get('token');
-if (initialToken) window.history.replaceState({}, document.title, window.location.pathname);
+const inputExperienceConfig = inputComposerApi?.resolveInputExperience?.(window.location.search)
+  || { enabled: false, initialMode: 'raw', flag: 'raw' };
+if (initialToken) {
+  const safeParams = new URLSearchParams(initialParams);
+  safeParams.delete('token');
+  const safeQuery = safeParams.toString();
+  window.history.replaceState(
+    {},
+    document.title,
+    window.location.pathname + (safeQuery ? '?' + safeQuery : ''),
+  );
+}
+document.documentElement.dataset.inputExperience = inputExperienceConfig.enabled
+  ? inputExperienceConfig.flag
+  : 'raw';
 
 function authHeaders(options = {}) {
   return {
@@ -318,11 +340,23 @@ function selectedSessionAcceptsInput(sessionId = currentSessionId) {
   );
 }
 
+function syncInputComposerSession() {
+  inputComposerController?.setSession(currentSessionId, selectedSessionAcceptsInput());
+}
+
+function focusPreferredInput() {
+  if (inputComposerController?.enabled && inputComposerController.mode === 'composer') {
+    if (inputComposerController.focus()) return;
+  }
+  focusTerminal();
+}
+
 function updateHeader() {
   const session = activeSession();
   if (!session) {
     sessionTitle.textContent = 'No terminal selected';
     sessionMeta.textContent = 'Create a new terminal or choose a session from the sidebar.';
+    syncInputComposerSession();
     return;
   }
   const state = session.alive ? 'Live tmux session' : 'Stopped history';
@@ -336,6 +370,7 @@ function updateHeader() {
     + ' • ' + (session.cwd || '~')
     + privacy
     + ' • ' + formatRelative(session.lastOpenedAt || session.createdAt);
+  syncInputComposerSession();
 }
 
 function updateSessionHistoryActions() {
@@ -1071,6 +1106,7 @@ function applyTerminalControlRole(role, title = activeSession()?.title || 'termi
     renderConnectionStatus(title);
     if (pendingInputBytes(currentSessionId) > 0) claimTerminalControl();
   }
+  syncInputComposerSession();
 }
 
 function connectToSession(sessionId, { reconnecting = false } = {}) {
@@ -1095,7 +1131,7 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
   lastSentTerminalSize = '';
   resetTerminalSurface();
   renderSessions();
-  focusTerminal();
+  focusPreferredInput();
   setStatus('warn', 'attaching…', session.title);
 
   const socket = new WebSocket(socketUrl(sessionId));
@@ -1106,7 +1142,7 @@ function connectToSession(sessionId, { reconnecting = false } = {}) {
     if (serial !== connectionSerial || ws !== socket) return;
     reconnectAttempts = 0;
     setStatus('warn', 'connected', session.title + ' • negotiating control');
-    focusTerminal();
+    focusPreferredInput();
   });
 
   socket.addEventListener('message', (event) => {
@@ -1272,6 +1308,20 @@ function handleTerminalInput(data) {
   return queued;
 }
 
+inputComposerController = inputComposerApi?.createController?.({
+  rootElement: inputExperienceEl,
+  form: inputComposerForm,
+  textarea: inputComposerText,
+  submitButton: inputComposerSend,
+  modeButtons: inputModeButtons,
+  statusElement: inputComposerStatus,
+  enabled: inputExperienceConfig.enabled,
+  initialMode: inputExperienceConfig.initialMode,
+  send: (data, { sessionId }) => sendRaw(data, { sessionId }),
+  focusRaw: focusTerminal,
+}) || null;
+syncInputComposerSession();
+
 function isTerminalKeyTarget(event) {
   const target = event?.target;
   if (!target || !terminalCard?.contains(target)) return false;
@@ -1395,10 +1445,13 @@ resizeObserver.observe(terminalEl);
 
 terminalEl.addEventListener('pointerdown', () => {
   claimTerminalControl();
-  focusTerminal();
+  if (inputComposerController?.mode !== 'composer') focusTerminal();
 });
 terminalCard.addEventListener('click', (event) => {
-  if (!event.target.closest?.('button, input, textarea, select, a')) focusTerminal();
+  if (
+    inputComposerController?.mode !== 'composer'
+    && !event.target.closest?.('button, input, textarea, select, a')
+  ) focusTerminal();
 });
 terminalCard.addEventListener('paste', handleTerminalPaste, { capture: true });
 
@@ -1455,7 +1508,7 @@ window.addEventListener('keydown', (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
     event.preventDefault();
     event.stopPropagation();
-    focusTerminal();
+    focusPreferredInput();
   }
 }, { capture: true });
 
@@ -1481,6 +1534,7 @@ window.addEventListener('beforeunload', () => {
   if (refreshTimer) window.clearInterval(refreshTimer);
   if (authRefreshTimer) window.clearInterval(authRefreshTimer);
   rtlTerminalRenderer?.dispose?.();
+  inputComposerController?.dispose?.();
   clearReconnectTimer();
   disconnectCurrent({ quiet: true });
   window.visualViewport?.removeEventListener('resize', syncVisualViewportHeight);

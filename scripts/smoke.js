@@ -671,6 +671,7 @@ try {
   const appJs = await httpText('/app.js', { token });
   const pasteSafetyJs = await httpText('/paste-safety.js', { token });
   const terminalInputJs = await httpText('/terminal-input.js', { token });
+  const inputComposerJs = await httpText('/input-composer.js', { token });
   const rtlTerminalRendererJs = await httpText('/rtl-terminal-renderer.js', { token });
   const serverJs = fs.readFileSync(path.join(projectRoot, 'server.js'), 'utf8');
   const storageJs = fs.readFileSync(path.join(projectRoot, 'storage.js'), 'utf8');
@@ -703,9 +704,10 @@ try {
     ['minimal one-click terminal UI exists', indexHtml.includes('id="newSession"') && indexHtml.includes('id="terminal"') && indexHtml.includes('data-terminal-key="Escape"') && indexHtml.includes('data-terminal-key="Tab"')],
     ['removed toolbar and Options UI stays absent', removedUiIdentifiers.every((identifier) => !`${indexHtml}\n${appJs}`.includes(identifier))],
     ['removed search and preferences assets are not loaded', !indexHtml.includes('/vendor/search.js') && !indexHtml.includes('/terminal-preferences.js')],
-    ['core local xterm assets are loaded', ['/vendor/xterm.js', '/vendor/fit.js', '/vendor/web-links.js', '/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js', '/rtl-terminal-renderer.js', '/app.js'].every((asset) => indexHtml.includes(asset))],
+    ['core local xterm assets are loaded', ['/vendor/xterm.js', '/vendor/fit.js', '/vendor/web-links.js', '/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js', '/input-composer.js', '/rtl-terminal-renderer.js', '/app.js'].every((asset) => indexHtml.includes(asset))],
     ['terminal input, WebSocket send, and API response handlers exist', /function\s+handleTerminalInput\s*\(/.test(appJs) && /function\s+sendRaw\s*\(\s*data\b/.test(appJs) && /function\s+parseApiResponse\s*\(/.test(appJs)],
     ['browser terminal input is byte-bounded', terminalInputJs.includes('WarpishTerminalInput') && terminalInputJs.includes('MAX_MESSAGE_BYTES = 64 * 1024') && terminalInputJs.includes('MAX_PENDING_BYTES = 1024 * 1024')],
+    ['Composer V2 is opt-in with raw rollback and logical mixed-script payloads', inputComposerJs.includes('WarpishInputComposer') && inputComposerJs.includes("flag || 'raw'") && indexHtml.includes('id="inputComposerText"') && appJs.includes('send: (data, { sessionId }) => sendRaw(data, { sessionId })')],
     ['Persian typing uses the dedicated middle-cursor RTL renderer', rtlTerminalRendererJs.includes('WarpishRtlTerminal') && rtlTerminalRendererJs.includes('visualCursorColumn') && appJs.includes('rtlTerminalApi?.createRenderer?.(term, terminalEl)')],
     ['terminal output reaches generation-guarded xterm writes in text and binary modes', appJs.includes("socket.binaryType = 'arraybuffer'") && /function\s+writeTerminalOutput\s*\(/.test(appJs) && appJs.includes('writeTerminalOutput(new Uint8Array(event.data))') && appJs.includes('writeTerminalOutput(event.data)')],
     ['wheel scroll uses tmux history and cannot fall back to shell history arrows', appJs.includes('term.attachCustomWheelEventHandler(') && appJs.includes("term.modes?.mouseTrackingMode !== 'none'") && serverJs.includes("runTmux(['set-option', '-t', session.id, 'mouse', 'on'])")],

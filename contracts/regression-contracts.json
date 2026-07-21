@@ -1,0 +1,166 @@
+[
+  {
+    "id": "service.authenticated-readiness",
+    "behavior": "The installed service answers authenticated /readyz before a release is accepted.",
+    "gate": "smoke",
+    "evidenceFile": "scripts/smoke.js",
+    "sentinel": "readinessOk"
+  },
+  {
+    "id": "session.restart-resume",
+    "behavior": "A server restart preserves the tmux session, snapshot, and ability to run the next command.",
+    "gate": "smoke",
+    "evidenceFile": "scripts/smoke.js",
+    "sentinel": "serverRestartResumeVerified"
+  },
+  {
+    "id": "session.close-exactly-one",
+    "behavior": "Closing a terminal requires confirmation, removes exactly that tmux session, and preserves adjacent sessions on cancel or failure.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "liveCloseConfirmed",
+    "resultKey": "individualSessionClose"
+  },
+  {
+    "id": "session.reload-resume",
+    "behavior": "Raw terminal input reaches the PTY and survives reload, reconnect, and runtime snapshot restoration.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "rawInputReachedPty",
+    "resultKey": "rawXtermResume"
+  },
+  {
+    "id": "input.large-ordered-utf8",
+    "behavior": "UTF-8 input larger than one WebSocket message arrives once, in order, and byte-exact.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "orderedExactMatch",
+    "resultKey": "largeOrderedUtf8"
+  },
+  {
+    "id": "input.runtime-epoch-no-replay",
+    "behavior": "Unacknowledged input is not replayed after a terminal runtime epoch change.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "uncertainInputNotRetried",
+    "resultKey": "runtimeEpochInputSafety"
+  },
+  {
+    "id": "input.stale-output-isolation",
+    "behavior": "Output and terminal protocol replies from a previous session cannot cross into the selected session.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "staleDeviceResponsesSent",
+    "resultKey": "staleOutputIsolation"
+  },
+  {
+    "id": "input.native-focus-reports",
+    "behavior": "Native focus reports stay ordered, acknowledged, scoped to the controller, and blocked for spectators.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "spectatorProtocolRepliesBlocked",
+    "resultKey": "nativeFocusReports"
+  },
+  {
+    "id": "paste.session-affinity",
+    "behavior": "A pending multiline paste remains bound to its source session and is cancelled after a session switch.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "crossSessionPasteCancelled",
+    "resultKey": "pasteAndStoppedHistory"
+  },
+  {
+    "id": "history.stopped-read-only",
+    "behavior": "Stopped history never accepts input and starting from it creates a separate live terminal.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "stoppedRole",
+    "resultKey": "pasteAndStoppedHistory"
+  },
+  {
+    "id": "wheel.scrollback-not-shell-history",
+    "behavior": "Wheel and trackpad gestures move tmux scrollback and never synthesize shell-history arrow keys.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "shellHistoryArrowsSent",
+    "resultKey": "wheelScrollback"
+  },
+  {
+    "id": "ui.mobile-viewport-and-keys",
+    "behavior": "The mobile viewport does not overflow or collapse and all eight terminal keys retain their byte mappings.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "visualViewportAware",
+    "resultKey": "mobileLayoutAndKeys"
+  },
+  {
+    "id": "ui.one-click-default-terminal",
+    "behavior": "One click creates exactly one normal Home-directory terminal without reopening removed option dialogs.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "doubleClickCreatedCount",
+    "resultKey": "quickCreateDefaults"
+  },
+  {
+    "id": "ui.raw-xterm-baseline",
+    "behavior": "Raw xterm remains the default surface and removed toolbar, preferences, and creation controls stay absent.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "minimal.rawXterm",
+    "resultKey": "minimalUi"
+  },
+  {
+    "id": "activity.running-and-finished",
+    "behavior": "Commands and supported interactive programs expose running, finished, and ready states without marking an idle draft busy.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "idleDraft",
+    "resultKey": "commandActivityIndicator"
+  },
+  {
+    "id": "rtl.persian-end-cursor",
+    "behavior": "An ordinary Persian draft is joined and its cursor is reconciled at the visual RTL edge.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "activity.persianInput",
+    "resultKey": "commandActivityIndicator"
+  },
+  {
+    "id": "rtl.persian-middle-cursor",
+    "behavior": "Moving inside a Persian draft preserves logical text and maps the caret to the mirrored visual column.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "activity.persianMiddleCursor",
+    "resultKey": "commandActivityIndicator"
+  },
+  {
+    "id": "rtl.mixed-trailing-space",
+    "behavior": "Mixed Persian and Latin input with a trailing blank cell retains RTL shaping and cursor alignment.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "persianMixedTrailingSpace",
+    "resultKey": "commandActivityIndicator"
+  },
+  {
+    "id": "privacy.legacy-private-quarantine",
+    "behavior": "A legacy private pane with retained history is quarantined and cannot be attached, captured, or written.",
+    "gate": "smoke",
+    "evidenceFile": "scripts/smoke.js",
+    "sentinel": "privateQuarantineVerified"
+  },
+  {
+    "id": "composer.v2-flag-and-logical-payload",
+    "behavior": "Composer V2 is opt-in, raw xterm remains the rollback default, and mixed-script text is sent in logical order exactly once.",
+    "gate": "browser",
+    "evidenceFile": "scripts/ui-stability-agent.js",
+    "sentinel": "check.nativeEditing?.value === 'سلام دنیا khari تو به '",
+    "resultKey": "inputComposerV2"
+  },
+  {
+    "id": "composer.v2-multiline-safe",
+    "behavior": "Composer draft line breaks and terminal control characters cannot bypass the existing single-command paste-safety policy.",
+    "gate": "check",
+    "evidenceFile": "scripts/input-composer.test.js",
+    "sentinel": "multiline or control characters bypassed"
+  }
+]

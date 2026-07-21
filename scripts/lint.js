@@ -18,6 +18,7 @@ const indexHtml = read('public/index.html');
 const pasteSafetyJs = read('public/paste-safety.js');
 const terminalKeyDataJs = read('public/terminal-key-data.js');
 const terminalInputJs = read('public/terminal-input.js');
+const inputComposerJs = read('public/input-composer.js');
 const rtlTerminalRendererJs = read('public/rtl-terminal-renderer.js');
 const serverJs = read('server.js');
 const storageJs = read('storage.js');
@@ -151,7 +152,7 @@ if (packageJson.scripts?.regression !== 'node scripts/ui-stability-agent.js') {
 }
 
 const appScriptIndex = indexHtml.indexOf('<script src="/app.js"></script>');
-for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js', '/rtl-terminal-renderer.js']) {
+for (const clientScript of ['/paste-safety.js', '/terminal-key-data.js', '/terminal-input.js', '/input-composer.js', '/rtl-terminal-renderer.js']) {
   const scriptIndex = indexHtml.indexOf(`<script src="${clientScript}"></script>`);
   if (scriptIndex < 0 || appScriptIndex < 0 || scriptIndex > appScriptIndex) {
     fail(`${clientScript} must be loaded before /app.js.`);
@@ -163,6 +164,19 @@ if (!terminalKeyDataJs.includes('WarpishTerminalKeys')
   || !terminalInputJs.includes('WarpishTerminalInput')
   || !terminalInputJs.includes('MAX_MESSAGE_BYTES')) {
   fail('Terminal key mapping and byte-bounded input modules must expose their stable browser APIs.');
+}
+
+if (!indexHtml.includes('id="inputExperience"')
+  || !indexHtml.includes('id="inputComposerText"')
+  || !indexHtml.includes('dir="auto"')
+  || !inputComposerJs.includes('WarpishInputComposer')
+  || !inputComposerJs.includes("flag || 'raw'")
+  || !inputComposerJs.includes("initialMode: flag === 'v2-raw' ? 'raw' : 'composer'")
+  || !appJs.includes('inputComposerController = inputComposerApi?.createController?.(')
+  || !appJs.includes('send: (data, { sessionId }) => sendRaw(data, { sessionId })')
+  || !stylesCss.includes('.input-composer textarea')
+  || !browserRegressionJs.includes('testInputComposerV2')) {
+  fail('Composer V2 must remain opt-in, native-bidi, session-affine, browser-tested, and immediately reversible to raw xterm.');
 }
 
 if (!rtlTerminalRendererJs.includes('WarpishRtlTerminal')

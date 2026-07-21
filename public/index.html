@@ -57,6 +57,29 @@
         <section class="terminal-grid">
           <section class="terminal-card">
             <div id="terminal" aria-label="Terminal display"></div>
+            <section id="inputExperience" class="input-experience" aria-label="Terminal input mode" hidden>
+              <div class="input-mode-switch" role="group" aria-label="Choose terminal input mode">
+                <button type="button" data-input-mode="composer" aria-pressed="true">Text input</button>
+                <button type="button" data-input-mode="raw" aria-pressed="false">Raw keys</button>
+              </div>
+              <form id="inputComposer" class="input-composer" autocomplete="off">
+                <label class="sr-only" for="inputComposerText">Command or message</label>
+                <textarea
+                  id="inputComposerText"
+                  rows="1"
+                  dir="auto"
+                  inputmode="text"
+                  enterkeyhint="send"
+                  autocapitalize="off"
+                  autocomplete="off"
+                  autocorrect="off"
+                  spellcheck="false"
+                  placeholder="Type Persian, English, or a command…"
+                ></textarea>
+                <button id="inputComposerSend" type="submit">Send</button>
+              </form>
+              <small id="inputComposerStatus">Enter sends • draft line breaks are joined safely</small>
+            </section>
             <div class="mobile-terminal-keys" aria-label="Terminal modifier keys">
               <button data-terminal-key="Escape">Esc</button>
               <button data-terminal-key="Tab">Tab</button>
@@ -92,6 +115,7 @@
     <script src="/paste-safety.js"></script>
     <script src="/terminal-key-data.js"></script>
     <script src="/terminal-input.js"></script>
+    <script src="/input-composer.js"></script>
     <script src="/rtl-terminal-renderer.js"></script>
     <script src="/app.js"></script>
   </body>
