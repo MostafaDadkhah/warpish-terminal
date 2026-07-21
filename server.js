@@ -143,6 +143,23 @@ function cookieOptions(req) {
   };
 }
 
+function isTrustedLoopbackRequestHost(req) {
+  try {
+    const hostname = new URL(`http://${req.headers.host || ''}`).hostname;
+    return isLoopbackHost(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isDirectLocalBootstrap(req) {
+  return isLoopbackHost(HOST)
+    && req.method === 'GET'
+    && req.path === '/'
+    && !req.headers.origin
+    && isTrustedLoopbackRequestHost(req);
+}
+
 function limitText(value, maxChars = MAX_CAPTURE_CHARS) {
   const text = String(value || '');
   return text.length > maxChars ? text.slice(-maxChars) : text;
@@ -1603,7 +1620,11 @@ app.use((req, res, next) => {
   if (!isAllowedOrigin(req)) return forbidden(res);
   if (req.path === '/healthz') return next();
   const token = tokenFromReq(req);
-  if (!safeToken(token)) return unauthorized(res);
+  if (!safeToken(token)) {
+    if (!isDirectLocalBootstrap(req)) return unauthorized(res);
+    res.cookie('warpish_token', TOKEN, cookieOptions(req));
+    return next();
+  }
   if (req.query.token) {
     res.cookie('warpish_token', token, cookieOptions(req));
   }

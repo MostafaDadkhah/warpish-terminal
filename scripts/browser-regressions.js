@@ -458,6 +458,7 @@ async function selectLiveSession(page, sessionId) {
   return page.waitFor(`(() => currentSessionId === ${JSON.stringify(sessionId)}
     && ws?.readyState === WebSocket.OPEN
     && terminalControlRole === 'controller'
+    && terminalSurfaceTransitioning === false
     ? { id: currentSessionId, role: terminalControlRole, readyState: ws.readyState }
     : false)()`, 20_000, `live session ${sessionId} attachment`);
 }
@@ -1570,16 +1571,26 @@ async function testPasteAffinityAndStoppedHistory(page, sourceSessionId, targetS
     && dispatch.pendingSessionId === sourceSessionId, 'multiline paste was not bound to its source session', dispatch);
 
   await selectLiveSession(page, targetSessionId);
-  await page.eval(`document.querySelector('#pasteDialog button[value="preserve"]')?.click()`);
-  const cancelled = await page.waitFor(`(() => !pendingMultilinePaste
-    && !document.querySelector('#pasteDialog')?.open
-    && statusText.textContent === 'paste cancelled'
-    ? {
+  const cancelled = await page.eval(`new Promise((resolve) => {
+    const dialog = document.querySelector('#pasteDialog');
+    const button = dialog?.querySelector('button[value="preserve"]');
+    const state = (timedOut = false) => ({
+      timedOut,
+      pending: Boolean(pendingMultilinePaste),
+      dialogOpen: Boolean(dialog?.open),
       status: statusText.textContent,
       pendingCount: pendingTerminalInputs.length,
       currentSessionId,
-    }
-    : false)()`, 10_000, 'cross-session paste cancellation');
+    });
+    if (!dialog || !button) return resolve({ ...state(), missingControl: true });
+    dialog.addEventListener('close', () => resolve(state()), { once: true });
+    button.click();
+    window.setTimeout(() => resolve(state(true)), 2000);
+  })`);
+  assert(!cancelled.timedOut
+    && !cancelled.pending
+    && !cancelled.dialogOpen
+    && cancelled.status === 'paste cancelled', 'cross-session paste was not cancelled after the dialog closed', cancelled);
   await delay(250);
   const sourceText = tmuxCaptureText(sourceSessionId);
   const targetText = tmuxCaptureText(targetSessionId);

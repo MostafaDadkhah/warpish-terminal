@@ -243,6 +243,20 @@ async function verifyHttpAndWebSocketSecurity(token) {
   assert(hostileOrigin.status === 403, 'cross-origin HTTP request was not rejected', hostileOrigin);
   assert(acceptedOrigin.status === 200, 'same-origin HTTP request was rejected', acceptedOrigin);
 
+  const directBootstrap = await httpResponse('/');
+  assert(directBootstrap.status === 200, 'direct loopback page did not bootstrap authentication', directBootstrap);
+  const directSetCookie = (directBootstrap.headers['set-cookie'] || [])
+    .find((value) => value.startsWith('warpish_token='));
+  assert(directSetCookie, 'direct loopback bootstrap did not set the auth cookie', directBootstrap.headers);
+  assert(/;\s*HttpOnly(?:;|$)/i.test(directSetCookie)
+    && /;\s*SameSite=Strict(?:;|$)/i.test(directSetCookie)
+    && /;\s*Max-Age=2592000(?:;|$)/i.test(directSetCookie), 'direct loopback cookie lost its security or lifetime attributes', directSetCookie);
+  const directCookie = directSetCookie.split(';', 1)[0];
+  const directCookieAuth = await httpResponse('/readyz', { headers: { Cookie: directCookie } });
+  assert(directCookieAuth.status === 200, 'direct loopback cookie did not authenticate a follow-up request', directCookieAuth);
+  const untrustedHostBootstrap = await httpResponse('/', { headers: { Host: 'attacker.invalid' } });
+  assert(untrustedHostBootstrap.status === 401, 'an untrusted Host header received direct local bootstrap auth', untrustedHostBootstrap);
+
   const bootstrap = await httpResponse(`/?token=${encodeURIComponent(token)}`);
   assert(bootstrap.status === 200, 'token bootstrap request failed', bootstrap);
   const setCookie = (bootstrap.headers['set-cookie'] || []).find((value) => value.startsWith('warpish_token='));
@@ -277,6 +291,9 @@ async function verifyHttpAndWebSocketSecurity(token) {
     wrongTokenStatus: wrongToken.status,
     hostileOriginStatus: hostileOrigin.status,
     sameOriginStatus: acceptedOrigin.status,
+    directBootstrapStatus: directBootstrap.status,
+    directCookieAuthStatus: directCookieAuth.status,
+    untrustedHostBootstrapStatus: untrustedHostBootstrap.status,
     cookieFlagsVerified: true,
     cookieLifetimeDays: 30,
     cookieAuthStatus: cookieAuth.status,

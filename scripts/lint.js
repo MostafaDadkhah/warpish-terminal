@@ -21,6 +21,7 @@ const terminalInputJs = read('public/terminal-input.js');
 const serverJs = read('server.js');
 const storageJs = read('storage.js');
 const shellIntegrationZsh = read('scripts/warpish-shell-integration.zsh');
+const installLaunchAgentSh = read('scripts/install-launch-agent.sh');
 const stylesCss = read('public/styles.css');
 const smokeJs = read('scripts/smoke.js');
 const browserRegressionJs = read('scripts/browser-regressions.js');
@@ -41,6 +42,17 @@ if (/httpOnly:\s*false/.test(serverJs)) {
 
 if (!serverJs.includes('WARPISH_ALLOW_REMOTE') || !serverJs.includes('isAllowedOrigin')) {
   fail('server.js must preserve non-loopback bind guard and Origin checks.');
+}
+
+if (!serverJs.includes('function isDirectLocalBootstrap(req)')
+  || !serverJs.includes('isTrustedLoopbackRequestHost(req)')
+  || !smokeJs.includes('untrustedHostBootstrap')) {
+  fail('Direct localhost access must bootstrap securely while rejecting untrusted Host headers.');
+}
+
+if (!installLaunchAgentSh.includes('Timed out waiting for ${LABEL} to unload.')
+  || !installLaunchAgentSh.includes('BOOTSTRAPPED=0')) {
+  fail('LaunchAgent reinstall must wait for asynchronous bootout and retry bootstrap safely.');
 }
 
 if (!packageJson.dependencies?.['better-sqlite3']

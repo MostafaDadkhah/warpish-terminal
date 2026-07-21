@@ -71,12 +71,34 @@ plutil -lint "$TEMP_PLIST" >/dev/null
 
 if launchctl print "$TARGET" >/dev/null 2>&1; then
   launchctl bootout "$TARGET"
+  for _ in {1..100}; do
+    if ! launchctl print "$TARGET" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+  if launchctl print "$TARGET" >/dev/null 2>&1; then
+    echo "Timed out waiting for ${LABEL} to unload." >&2
+    exit 1
+  fi
 fi
 
 "${PROJECT_ROOT}/stop.sh"
 install -m 600 "$TEMP_PLIST" "$PLIST_FILE"
 launchctl enable "$TARGET"
-launchctl bootstrap "$DOMAIN" "$PLIST_FILE"
+BOOTSTRAPPED=0
+BOOTSTRAP_ERROR=""
+for _ in {1..100}; do
+  if BOOTSTRAP_ERROR="$(launchctl bootstrap "$DOMAIN" "$PLIST_FILE" 2>&1)"; then
+    BOOTSTRAPPED=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$BOOTSTRAPPED" != "1" ]]; then
+  echo "Could not load ${LABEL}: ${BOOTSTRAP_ERROR}" >&2
+  exit 1
+fi
 launchctl kickstart -k "$TARGET"
 
 for _ in {1..120}; do

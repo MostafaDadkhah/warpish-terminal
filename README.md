@@ -18,7 +18,7 @@ What it does:
 - Stores sessions, previews, and backend-only command/event compatibility records in the standalone `.warpish/warpish.sqlite3` database; runtime state is no longer persisted in JSON or per-session event files.
 - Normal xterm input and output stay on the real PTY path. State-aware fallback keys cover application-cursor mode, modifiers, function keys, Alt/Ctrl, and binary input without introducing a separate composer or display layer.
 - WebSocket heartbeat, byte-bounded UTF-8/binary chunking and browser/Node/Python input queues, payload limits, tmux command timeouts, and idle attach-PTY teardown keep stalled clients from growing memory while the tmux shell remains resumable. The current CWD is updated live after each prompt.
-- Binds to `127.0.0.1` and requires a random token stored in `.auth-token`.
+- Binds to `127.0.0.1`; opening `http://localhost:8765` or `http://127.0.0.1:8765` directly bootstraps a protected local browser session from the random token stored in `.auth-token`.
 
 Requirements:
 - macOS
@@ -39,6 +39,8 @@ npm run service:install
 ```
 
 `service:install` creates a per-user macOS LaunchAgent named `com.warpish.terminal`. It starts Warpish Terminal automatically whenever you log in and restarts the Node process if it exits unexpectedly. The service stays local at `127.0.0.1:8765`; its logs are stored in `~/Library/Logs/Warpish Terminal/`.
+
+After installation, open `http://localhost:8765` at any time. You do not need to run `start.sh` again or copy a tokenized URL.
 
 For a one-off/manual run without installing the LaunchAgent, omit `npm run service:install` and use `./start.sh` directly.
 
@@ -79,4 +81,4 @@ npm test
 Security notes:
 - This is equivalent to Terminal.app access. Commands can modify or delete files.
 - Default host is `127.0.0.1`; the server refuses non-loopback binds unless `WARPISH_ALLOW_REMOTE=1` is explicitly set. Do not use that flag unless you add stronger auth/TLS/network allowlisting.
-- Bootstrap URLs include a token, but the browser switches to a same-site HttpOnly cookie for normal API/WebSocket use. The cookie lasts 30 days and is renewed while the app stays open, so long-running terminal tabs do not silently lose close/input access. If you want phone/remote access later, put it behind Tailscale/Funnel or a proper authenticated gateway, not raw public HTTP.
+- A direct top-level visit to the loopback page securely bootstraps a same-site HttpOnly cookie; API and WebSocket requests without that cookie remain unauthorized, and untrusted Host/Origin values do not receive bootstrap access. Tokenized bootstrap URLs remain supported. The cookie lasts 30 days and is renewed while the app stays open, so long-running terminal tabs do not silently lose close/input access. If you want phone/remote access later, put it behind Tailscale/Funnel or a proper authenticated gateway, not raw public HTTP.
