@@ -174,6 +174,14 @@ assert(activity.persianInput?.joinedElementCount === 1
   && activity.persianMiddleCursor?.nativeCursorHidden === true
   && activity.persianMiddleCursor?.sourceHiddenCount > 1,
   'Persian typing or middle-of-line cursor editing regressed to isolated LTR terminal cells', activity);
+assert(activity.persianMixedTrailingSpace?.logicalText === 'سلام دنیا khari تو به'
+  && Math.abs(activity.persianMixedTrailingSpace?.cursorLeft - activity.persianMixedTrailingSpace?.joinedLeft) <= 1
+  && activity.persianMixedTrailingSpace?.cursorTransform !== 'none'
+  && activity.persianMixedTrailingSpace?.joinedDirection === 'rtl'
+  && activity.persianMixedTrailingSpace?.joinedUnicodeBidi === 'plaintext'
+  && activity.persianMixedTrailingSpace?.trailingBlankSpanCount >= 1
+  && activity.persianMixedTrailingSpace?.nonblankInterveningCount === 0,
+  'Mixed Persian input with trailing whitespace regressed to the screenshot failure', activity);
 assert(minimal.xtermDirection?.rowDirection === 'ltr'
   && minimal.xtermDirection?.helperDirection === 'ltr'
   && minimal.xtermDirection?.rowUnicodeBidi !== 'plaintext'

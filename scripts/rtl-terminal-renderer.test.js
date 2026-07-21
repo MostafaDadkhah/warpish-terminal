@@ -35,6 +35,24 @@ const mixedRun = rtl.activeRtlRun(cells(mixed), mixed.length - 4);
 assert(mixedRun?.text === 'سلام rtl ۱۲۳.'
   && mixedRun.visualCursorColumn === 4, 'mixed Persian/LTR/numeric draft lost its logical text or cursor mapping', mixedRun);
 
+const trailingMixed = '❯ سلام دنیا khari تو به ';
+const trailingMixedCells = cells(trailingMixed);
+trailingMixedCells[trailingMixedCells.length - 1] = { chars: '', width: 1 };
+const trailingMixedRun = rtl.activeRtlRun(trailingMixedCells, trailingMixed.length);
+assert(trailingMixedRun?.text === 'سلام دنیا khari تو به'
+  && trailingMixedRun.end === trailingMixed.length
+  && trailingMixedRun.visualCursorColumn === 0,
+  'trailing whitespace disabled end-of-line mixed RTL cursor mapping', trailingMixedRun);
+
+const joinedSpan = { textContent: 'سلام دنیا khari تو به', previousElementSibling: null };
+const trailingBlankSpan = { textContent: ' ', previousElementSibling: joinedSpan };
+const cursorAfterBlank = { previousElementSibling: trailingBlankSpan };
+assert(rtl.joinedRtlSpanBeforeCursor(cursorAfterBlank, trailingMixedRun.text) === joinedSpan,
+  'a trailing blank span hid the joined RTL text from cursor reconciliation');
+const interveningLtrSpan = { textContent: 'x', previousElementSibling: joinedSpan };
+assert(rtl.joinedRtlSpanBeforeCursor({ previousElementSibling: interveningLtrSpan }, trailingMixedRun.text) === null,
+  'cursor reconciliation crossed a nonblank LTR span');
+
 const widePromptCells = [
   { chars: '🙂', width: 2 },
   { chars: '', width: 0 },

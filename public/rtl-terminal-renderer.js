@@ -24,6 +24,12 @@
     }
 
     const cursor = Number(cursorColumn);
+    if (start >= 0 && Number.isFinite(cursor) && cursor > end) {
+      const blankToCursor = normalized
+        .slice(end, cursor)
+        .every((cell) => !String(cell?.chars || '').trim());
+      if (blankToCursor) end = cursor;
+    }
     if (start < 0 || end <= start || !Number.isFinite(cursor) || cursor < start || cursor > end) return null;
 
     const text = normalized
@@ -53,6 +59,17 @@
       });
     }
     return cells;
+  }
+
+  function joinedRtlSpanBeforeCursor(cursor, expectedText) {
+    let candidate = cursor?.previousElementSibling || null;
+    while (candidate && !RTL_SCRIPT_CHARACTER.test(candidate.textContent || '')) {
+      if ((candidate.textContent || '').trim()) return null;
+      candidate = candidate.previousElementSibling;
+    }
+    return candidate?.textContent?.trimEnd() === String(expectedText || '').trimEnd()
+      ? candidate
+      : null;
   }
 
   function createRenderer(term, terminalElement) {
@@ -101,15 +118,16 @@
       const run = activeRtlRun(lineCells(line, term.cols || 0), buffer.cursorX);
       if (!run) return;
 
-      const joinedSpan = cursor.previousElementSibling;
+      const joinedSpan = joinedRtlSpanBeforeCursor(cursor, run.text);
       if (run.cursor === run.end
-        && joinedSpan?.textContent === run.text
+        && joinedSpan
         && RTL_SCRIPT_CHARACTER.test(joinedSpan.textContent || '')) {
         const cursorRect = cursor.getBoundingClientRect();
         const joinedRect = joinedSpan.getBoundingClientRect();
-        if (cursorRect.width && joinedRect.width > cursorRect.width) {
+        const visualDistance = cursorRect.left - joinedRect.left;
+        if (cursorRect.width && visualDistance > cursorRect.width) {
           joinedSpan.classList.add(JOINED_RUN_CLASS);
-          cursor.style.setProperty('--warpish-rtl-cursor-shift', `-${joinedRect.width}px`);
+          cursor.style.setProperty('--warpish-rtl-cursor-shift', `-${visualDistance}px`);
           cursor.classList.add(RECONCILED_CURSOR_CLASS);
           return;
         }
@@ -207,6 +225,7 @@
     RTL_SCRIPT_CHARACTER,
     activeRtlRun,
     createRenderer,
+    joinedRtlSpanBeforeCursor,
     lineCells,
     rtlCharacterJoinRanges,
   });

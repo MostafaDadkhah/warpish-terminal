@@ -1100,6 +1100,113 @@ async function testCommandActivityIndicator(page, sessionId) {
   await page.waitFor(`(() => !commandActivity
     && (statusText.textContent === 'command finished' || statusText.textContent === 'connected'))()`, 10_000, 'interactive fixture exit');
 
+  const mixedPersianDraftText = 'سلام دنیا khari تو به ';
+  await page.eval(`new Promise((resolve) => {
+    const previous = window.__warpishMixedRtlFixture;
+    previous?.renderer?.dispose?.();
+    previous?.term?.dispose?.();
+    previous?.host?.remove?.();
+
+    const host = document.createElement('div');
+    host.id = 'warpish-mixed-rtl-fixture';
+    host.setAttribute('aria-hidden', 'true');
+    Object.assign(host.style, {
+      position: 'fixed',
+      left: '0',
+      top: '0',
+      width: '900px',
+      height: '120px',
+      opacity: '0',
+      pointerEvents: 'none',
+    });
+    document.body.append(host);
+
+    const fixtureTerm = new window.Terminal({
+      cols: 80,
+      rows: 3,
+      allowProposedApi: true,
+      cursorBlink: false,
+      cursorStyle: 'bar',
+      fontFamily: '\"SF Mono\", Menlo, Monaco, Consolas, monospace',
+      fontSize: 13.5,
+      lineHeight: 1.16,
+      theme: { foreground: '#f4f1ff', background: '#070711', cursor: '#22d3ee' },
+    });
+    fixtureTerm.open(host);
+    const renderer = window.WarpishRtlTerminal.createRenderer(fixtureTerm, host);
+    fixtureTerm.focus();
+    window.__warpishMixedRtlFixture = { host, term: fixtureTerm, renderer };
+    fixtureTerm.write(${JSON.stringify(`\x1b[?1049h\x1b[?1049l❯ ${mixedPersianDraftText.trimEnd()}\x1b[C`)}, () => {
+      fixtureTerm.focus();
+      fixtureTerm.refresh(0, fixtureTerm.rows - 1);
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        renderer.render();
+        resolve(true);
+      }));
+    });
+  })`);
+  await page.eval('new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  const mixedFixtureReady = await page.eval(`(() => {
+    const fixture = window.__warpishMixedRtlFixture;
+    const cursor = fixture?.host?.querySelector('.xterm-rows .xterm-cursor');
+    return {
+      ready: Boolean(cursor?.parentElement?.textContent?.includes(${JSON.stringify(mixedPersianDraftText.trimEnd())})),
+      cursorX: fixture?.term?.buffer?.active?.cursorX ?? null,
+      cursorY: fixture?.term?.buffer?.active?.cursorY ?? null,
+      rowTexts: [...(fixture?.host?.querySelectorAll('.xterm-rows > div') || [])]
+        .map((row) => row.textContent),
+      cursorCount: fixture?.host?.querySelectorAll('.xterm-cursor')?.length ?? 0,
+      activeElementClass: document.activeElement?.className || '',
+    };
+  })()`);
+  assert(mixedFixtureReady.ready, 'isolated xterm fixture did not render mixed Persian draft text', mixedFixtureReady);
+  const persianMixedTrailingSpace = await page.eval(`(() => {
+    const cursor = document.querySelector('#warpish-mixed-rtl-fixture .xterm-rows .xterm-cursor');
+    const row = cursor?.parentElement;
+    const joinedSpan = row
+      ? [...row.children].find((element) => element.textContent?.trimEnd() === ${JSON.stringify(mixedPersianDraftText.trimEnd())})
+      : null;
+    const cursorRect = cursor.getBoundingClientRect();
+    const joinedRect = joinedSpan?.getBoundingClientRect();
+    const children = [...row.children];
+    const joinedIndex = children.indexOf(joinedSpan);
+    const cursorIndex = children.indexOf(cursor);
+    const intervening = children.slice(joinedIndex + 1, cursorIndex);
+    return {
+      logicalText: joinedSpan?.textContent ?? null,
+      rowText: row.textContent,
+      rowChildren: children.map((element) => ({ text: element.textContent, className: element.className })),
+      cursorClass: cursor.className,
+      joinedClass: joinedSpan?.className || '',
+      cursorLeft: cursorRect.left,
+      joinedLeft: joinedRect?.left ?? null,
+      cursorTransform: getComputedStyle(cursor).transform,
+      joinedDirection: joinedSpan ? getComputedStyle(joinedSpan).direction : null,
+      joinedUnicodeBidi: joinedSpan ? getComputedStyle(joinedSpan).unicodeBidi : null,
+      trailingBlankSpanCount: intervening.filter((element) => !(element.textContent || '').trim()).length,
+      nonblankInterveningCount: intervening.filter((element) => (element.textContent || '').trim()).length,
+    };
+  })()`);
+  assert(persianMixedTrailingSpace.logicalText === mixedPersianDraftText.trimEnd()
+    && persianMixedTrailingSpace.cursorClass.includes('warpish-rtl-cursor')
+    && persianMixedTrailingSpace.joinedClass.includes('warpish-rtl-joined-run')
+    && Math.abs(persianMixedTrailingSpace.cursorLeft - persianMixedTrailingSpace.joinedLeft) <= 1
+    && persianMixedTrailingSpace.cursorTransform !== 'none'
+    && persianMixedTrailingSpace.joinedDirection === 'rtl'
+    && persianMixedTrailingSpace.joinedUnicodeBidi === 'plaintext'
+    && persianMixedTrailingSpace.trailingBlankSpanCount >= 1
+    && persianMixedTrailingSpace.nonblankInterveningCount === 0,
+    'mixed Persian input with a trailing space disabled RTL cursor reconciliation', persianMixedTrailingSpace);
+  await page.eval(`(() => {
+    const fixture = window.__warpishMixedRtlFixture;
+    fixture?.renderer?.dispose?.();
+    fixture?.term?.dispose?.();
+    fixture?.host?.remove?.();
+    delete window.__warpishMixedRtlFixture;
+    term.focus();
+    return true;
+  })()`);
+
   return {
     sessionId,
     running,
@@ -1122,6 +1229,7 @@ async function testCommandActivityIndicator(page, sessionId) {
     },
     persianInput: rtlDraft,
     persianMiddleCursor,
+    persianMixedTrailingSpace,
   };
 }
 

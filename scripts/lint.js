@@ -169,7 +169,8 @@ if (!rtlTerminalRendererJs.includes('WarpishRtlTerminal')
   || !rtlTerminalRendererJs.includes('function activeRtlRun(')
   || !rtlTerminalRendererJs.includes('function createRenderer(')
   || !appJs.includes('rtlTerminalApi?.createRenderer?.(term, terminalEl)')
-  || !browserRegressionJs.includes('persianMiddleCursor')) {
+  || !browserRegressionJs.includes('persianMiddleCursor')
+  || !browserRegressionJs.includes('persianMixedTrailingSpace')) {
   fail('Persian typing must use the dedicated RTL renderer with a browser regression for middle-of-line cursor editing.');
 }
 
